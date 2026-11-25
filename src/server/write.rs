@@ -87,25 +87,36 @@ pub fn write_response<W: Write>(
 /// `server` 头是常量：没必要每响应 `format!` 一次
 const SERVER: &str = concat!("rsboot/", env!("CARGO_PKG_VERSION"));
 
-/// 秒级缓存的 `Date` 头。
+/// 秒级缓存的 `Date` 头，**每线程一份**。
 ///
 /// HTTP 的 `Date` 精度就是秒，同一个秒内所有请求的响应头一模一样。
 /// 用 `Arc<str>` 而不是 `String`：返回时只做一次原子自增，没有分配。
+///
+/// 为什么是 thread_local 而不是全局 `Mutex`：worker 是线程-per-core，每个
+/// 响应都要取一次 Date。全局锁会让 2 个 worker 在热路径上互挤同一把锁；
+/// 每线程各存一份，连"无竞争时的原子操作"都省了。缓存错位最多一个时钟
+/// 刻度，对 HTTP 语义没有影响。
 fn http_date_cached() -> std::sync::Arc<str> {
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::Arc;
 
-    static CACHE: OnceLock<Mutex<(u64, Arc<str>)>> = OnceLock::new();
+    thread_local! {
+        static CACHE: std::cell::RefCell<(u64, Option<Arc<str>>)> =
+            const { std::cell::RefCell::new((0, None)) };
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let m = CACHE.get_or_init(|| Mutex::new((0, Arc::from(""))));
-    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
-    if g.0 != now || g.1.is_empty() {
-        g.0 = now;
-        g.1 = Arc::from(http_date_at(now as i64));
-    }
-    Arc::clone(&g.1)
+    CACHE.with(|c| {
+        let mut g = c.borrow_mut();
+        if g.0 != now || g.1.is_none() {
+            g.0 = now;
+            g.1 = Some(Arc::from(http_date_at(now as i64)));
+        }
+        // `is_none` 已排除上面的分支，这里必然有值
+        Arc::clone(g.1.as_ref().expect("Date 缓存刚被填充"))
+    })
 }
 
 /// RFC 1123 日期，用于 `Date` 头。
