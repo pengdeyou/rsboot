@@ -163,6 +163,13 @@ impl Context {
     }
 
     /// 取共享值。返回 `Ref`：借用期间持读锁，可以同时有多个读者。
+    /// 按名字取下游服务。没注册过返回 `None`（不是错误：可能只是这个 handler 用不上）。
+    pub fn service(&self, name: &str) -> Option<std::sync::Arc<crate::service::Service>> {
+        self.state::<crate::service::ServiceRegistry>()
+            .ok()
+            .and_then(|r| r.get(name))
+    }
+
     pub fn state<T: Any>(&self) -> Result<Ref<'_, T>> {
         if !self.has_state::<T>() {
             return Err(Error::Missing(format!(

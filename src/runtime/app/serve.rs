@@ -123,6 +123,7 @@ impl App {
 
         let modules = Arc::new(self.modules.clone());
         let status = self.status.clone();
+        let services = self.services.clone();
 
         Arc::new(move || {
             let sessions = databases::open(urls.clone())?;
@@ -135,6 +136,9 @@ impl App {
             // 每个 worker 的 Context 里放同一个状态句柄：
             // handler 读到的 Draining/Closing 就是主线程此刻的真实状态。
             ctx.insert_state(status.clone());
+            if !services.is_empty() {
+                ctx.insert_state(services.clone());
+            }
             // 模块的 worker 钩子：正序启动。失败就让这个 worker 退出，
             // 其余 worker 继续服务（一个 worker 起不来 ≠ 整个服务起不来）。
             for m in modules.iter() {

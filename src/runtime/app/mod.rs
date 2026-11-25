@@ -44,6 +44,9 @@ pub struct App {
     pub(crate) reload: Option<ReloadPlan>,
     /// 活了就代表热加载线程在跑；`stop()` 先 drop 它
     pub(crate) watcher: Option<Watcher>,
+    /// 下游服务表。和每个 worker 的 `Context` 里那份是同一批 `Arc`，
+    /// 所以连接池与熔断状态在多 worker 间共享（各熔断各的等于没熔断）。
+    pub(crate) services: crate::service::ServiceRegistry,
     /// 对外服务状态。和每个 worker 的 `Context` 里那一个是同一个 `Arc`，
     /// 所以 handler 读到的是主线程 accept 循环写的值。
     pub(crate) status: crate::server::ServeStatus,

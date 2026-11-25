@@ -25,6 +25,8 @@ pub struct Builder {
     modules: Vec<Arc<dyn Module>>,
     migrations: Vec<String>,
     migrate_on_start: bool,
+    /// 代码里注册的下游服务（名字，base_url）
+    services: Vec<(String, String)>,
     /// 允许热生效的键模式
     hot: Vec<String>,
     reload_interval: Duration,
@@ -46,6 +48,7 @@ impl Builder {
             modules: Vec::new(),
             migrations: Vec::new(),
             migrate_on_start: false,
+            services: Vec::new(),
             hot: Vec::new(),
             reload_interval: Duration::from_secs(1),
         }
@@ -86,6 +89,15 @@ impl Builder {
     }
 
     /// 注册模块。启动顺序 = 注册顺序，关闭顺序相反。
+    /// 注册一个下游服务（微服务调用）。
+    ///
+    /// 名字用来在 handler 里取：`ctx.service("user")`。只支持 `http://`——
+    /// https 需要 TLS 栈，rsboot 不引。base_url 里的 path 会当作前缀。
+    pub fn service(mut self, name: impl Into<String>, base_url: impl Into<String>) -> Self {
+        self.services.push((name.into(), base_url.into()));
+        self
+    }
+
     pub fn module<M: Module + 'static>(mut self, m: M) -> Self {
         self.modules.push(Arc::new(m));
         self
@@ -167,8 +179,21 @@ impl Builder {
             _ => None,
         };
 
+        // 下游服务在这里一次性建好：base_url 写错属于启动期错误，
+        // 不该等到第一个请求进来才发现
+        let mut registry = crate::service::ServiceRegistry::new();
+        for (name, url) in self.services {
+            let svc = crate::service::Service::from_url(&name, &url)?;
+            registry.insert(svc);
+        }
+
+        let ctx = Context::new(config, sessions, default_db.clone(), env);
+        if !registry.is_empty() {
+            ctx.insert_state(registry.clone());
+        }
+
         Ok(App {
-            ctx: Context::new(config, sessions, default_db.clone(), env),
+            ctx,
             database_urls: urls,
             modules: self.modules,
             started: Vec::new(),
@@ -177,6 +202,7 @@ impl Builder {
             reload,
             watcher: None,
             status: crate::server::ServeStatus::new(),
+            services: registry,
         })
     }
 }

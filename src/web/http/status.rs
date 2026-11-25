@@ -25,6 +25,10 @@ impl Status {
     pub const TOO_MANY_REQUESTS: Status = Status(429);
     pub const INTERNAL_SERVER_ERROR: Status = Status(500);
     pub const NOT_IMPLEMENTED: Status = Status(501);
+    /// 网关/代理从下游收到非法响应
+    pub const BAD_GATEWAY: Status = Status(502);
+    /// 网关/代理等下游超时
+    pub const GATEWAY_TIMEOUT: Status = Status(504);
     pub const SERVICE_UNAVAILABLE: Status = Status(503);
 
     pub fn is_success(self) -> bool {
