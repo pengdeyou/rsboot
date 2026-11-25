@@ -34,6 +34,7 @@ use crate::server::conn::{Conn, ConnOutcome, Limits};
 use crate::web::route::Router;
 
 pub mod conn;
+pub mod mn;
 pub mod parse;
 pub mod poll;
 pub mod signal;
@@ -266,6 +267,10 @@ impl Server {
             );
         }
         let senders = Arc::new(senders);
+        // 协程运行时随这次服务走，不是进程级全局：同进程起第二个 Server
+        // 时两者的 worker id 会撞车（踩过，表现为偶发请求挂死）。
+        let rt = mn::sched::Runtime::new();
+        rt.start_timer();
         let wakers = Arc::new(wakers);
         // 每 worker 的累计处理请求数，用于连接借调
         let rebalance_stats = self.rebalance_stats.clone();
@@ -288,6 +293,7 @@ impl Server {
             let ready = ready_tx.clone();
             let my_waker = wakers[i].clone();
             let rebalance_stats = rebalance_stats.clone();
+            let rt = Arc::clone(&rt);
             let all_senders = Arc::clone(&senders);
             let all_wakers = Arc::clone(&wakers);
             let served = Arc::clone(&served);
@@ -310,6 +316,12 @@ impl Server {
                         }
                         return;
                     }
+                    // 接上协程调度器：这个 worker 线程从此可以在 I/O 等待处让出。
+                    // 定时器线程只有一个（进程级），`start_timer` 内部做了幂等。
+                    mn::sched::init(rt, i, mn::sched::Shared::new(my_waker.clone()));
+                    // 处理完、仍可 keep-alive 的连接由协程投回这里，主循环统一收回
+                    let rets: Arc<std::sync::Mutex<Vec<Conn>>> =
+                        Arc::new(std::sync::Mutex::new(Vec::new()));
                     // 任一来源要求关闭都算：外部编排，或 drain 期满的内部关闭
                     let should_stop = || stop.load(Ordering::Relaxed) || close.load(Ordering::Relaxed);
                     // 本 worker 负责的连接表。worker 不是"拿到一条连接读到死"，
@@ -341,6 +353,16 @@ impl Server {
                                 let _ = c.serve_once(&router, &ctx, &limits, &should_stop);
                             }
                             break;
+                        }
+
+                        // 推进协程：让出的请求在这里接着跑。worker 只有这一处会切进
+                        // 协程栈，别的地方都是纯事件循环。
+                        mn::sched::pump(4096);
+                        {
+                            let mut g = rets.lock().unwrap();
+                            if !g.is_empty() {
+                                conns.extend(g.drain(..));
+                            }
                         }
 
                         // 先把新派来的连接收进本地表
@@ -411,7 +433,9 @@ impl Server {
                         // 兜底超时只防"唤醒漏了"，正常路径由 `Waker` 立刻叫醒：
                         // 派发方 push 进队列之后才 notify，所以醒来必能 try_recv 到。
                         ps.reset_conns(conns.iter().filter_map(|c| c.raw_fd()));
-                        if let Err(e) = ps.wait(WORKER_IDLE_MS) {
+                        // 队列里还有待跑的协程就立刻回来继续推进，别在 poll 里等
+                        let idle = if mn::sched::pending() > 0 { 0 } else { WORKER_IDLE_MS };
+                        if let Err(e) = ps.wait(idle) {
                             eprintln!("[rsboot] worker poll 失败：{e}");
                             std::thread::sleep(std::time::Duration::from_millis(5));
                             continue;
@@ -436,7 +460,27 @@ impl Server {
                             }
                             let mut c = conns.swap_remove(idx);
                             served[i].fetch_add(1, Ordering::Relaxed);
-                            if let Ok(ConnOutcome::KeepAlive) =
+                            // 请求处理放进协程：handler 里凡是要等 I/O 的地方
+                            // （框架的 sleep / DB / 下游调用）都能让出，worker 立刻
+                            // 回去处理别的连接。同步 handler 的签名和借用规则不变。
+                            if mn::sched::ready() {
+                                let rp: *const Router = &*router;
+                                let cp: *const crate::runtime::context::Context = &ctx;
+                                let s2 = Arc::clone(&stop);
+                                let c2 = Arc::clone(&close);
+                                let lim = limits;
+                                let rets2 = Arc::clone(&rets);
+                                mn::sched::spawn(move || {
+                                    let stop_fn =
+                                        || s2.load(Ordering::Relaxed) || c2.load(Ordering::Relaxed);
+                                    // SAFETY: 同线程；router/ctx 活到 worker 退出
+                                    let outcome =
+                                        unsafe { c.serve_once(&*rp, &*cp, &lim, &stop_fn) };
+                                    if let Ok(ConnOutcome::KeepAlive) = outcome {
+                                        rets2.lock().unwrap().push(c);
+                                    }
+                                });
+                            } else if let Ok(ConnOutcome::KeepAlive) =
                                 c.serve_once(&router, &ctx, &limits, &should_stop)
                             {
                                 conns.push(c);

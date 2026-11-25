@@ -30,6 +30,20 @@ pub use config::{Config, Environment};
 pub use error::{Error, Result};
 pub use runtime::{App, Builder, Context, DbHealth, Module};
 pub use server::{ConnLimits, ServeState, ServeStatus, Server};
+
+/// 睡一段时间。**在请求处理里请用它，不要用 `std::thread::sleep`**。
+///
+/// 在 worker 的协程里调用时，这 20ms 不占用线程：worker 会立刻回去处理
+/// 别的连接，到点再把你接回来。`std::thread::sleep` 会把整条 worker 焊死，
+/// 一次下游慢调用就能让吞吐从 9900 QPS 掉到 `worker 数 / 延迟`（实测 100）。
+pub fn sleep(d: std::time::Duration) {
+    crate::server::mn::sleep(d);
+}
+
+/// 让出 CPU，让同一 worker 上的其他请求先跑。协程外调用是空操作。
+pub fn yield_now() {
+    crate::server::mn::yield_now();
+}
 pub use service::{
     Answer, Call, Service, ServiceConfig, ServiceError, ServiceRegistry,
 };
