@@ -1,0 +1,11 @@
+[package]
+name = "rsboot"
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.80"
+description = "Planned CLI for the rsbatis ecosystem (scaffold / generate / migrate). Name reserved; no API yet."
+license = "MIT OR Apache-2.0"
+keywords = ["orm", "sql", "cli", "scaffold", "database"]
+categories = ["database", "command-line-utilities"]
+readme = "README.md"
+documentation = "https://docs.rs/rsboot"
