@@ -431,6 +431,34 @@ mod tests {
         assert_eq!(call(&r, Method::Get, "/ok").body, b"ok");
     }
 
+    /// 这条盯着一个关键事实：panic 在持有 `&mut Session` 期间发生时，
+    /// `RefMut` 的析构会在栈展开时跑，借用标志正常释放。
+    /// 如果它不成立，一次 panic 就会让该库永久报"正在被外层使用"，
+    /// 等于整库卡死——比 panic 本身严重得多。
+    #[test]
+    fn panic_does_not_poison_db_session() {
+        use crate::error::Error as CrateError;
+
+        let c = ctx();
+        let r = Router::new()
+            .get("/boom", |_, ctx| {
+                let _ = ctx.with_db(|_db| -> crate::error::Result<()> {
+                    panic!("持有 &mut Session 时 panic");
+                });
+                Response::text("不可达")
+            })
+            .unwrap();
+
+        let resp = call(&r, Method::Get, "/boom");
+        assert_eq!(resp.status, Status::INTERNAL_SERVER_ERROR);
+
+        // 同一 Context 的同一个库仍可正常使用
+        let ok = c
+            .with_db(|db| Ok::<_, CrateError>(db.execute_batch("CREATE TABLE t (a INTEGER)")?))
+            .is_ok();
+        assert!(ok, "panic 之后会话必须仍可用，不能永久占用");
+    }
+
     #[test]
     #[allow(clippy::result_large_err)]
     fn handler_may_return_result() {
