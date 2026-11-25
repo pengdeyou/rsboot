@@ -70,6 +70,22 @@ impl Response {
         r
     }
 
+    /// HTML 响应。`/docs` 这类内置页面用；业务要回 HTML 也走它。
+    ///
+    /// 不设 `content-security-policy`：文档页要在浏览器里 fetch 自己的
+    /// `/openapi.json` 并执行内联脚本，任何严格 CSP 都会把它锁死。
+    pub fn html(body: impl Into<String>) -> Self {
+        let s = body.into();
+        let mut r = Self {
+            status: Status::OK,
+            headers: Headers::new(),
+            body: s.into_bytes(),
+            api_error: None,
+        };
+        r.headers.insert("content-type", "text/html; charset=utf-8");
+        r
+    }
+
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         // 非法名/值静默丢弃是有意的：构造期的头来自代码而非用户输入，
         // 但值里可能拼进了用户数据，此时"不写入"比"panic"安全。

@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rsboot::{
-    Api, ApiError, App, Config, Context, FromRequest, Path, Query, Response, Router, Status,
+    Api, ApiError, App, Config, Context, FromRequest, ParamDoc, Path, Query, Response, RouteDoc,
+    Router, Status,
 };
 
 #[derive(serde::Deserialize)]
@@ -32,7 +33,9 @@ fn main() -> rsboot::Result<()> {
     let config = Config::new()
         .set("app.env", "dev")
         .set("http.bind", "127.0.0.1:8000")
-        .set("http.envelope", "true"); // 打开统一响应体
+        .set("http.envelope", "true")        // 打开统一响应体
+        .set("http.docs", "true")            // 打开 /docs 与 /openapi.json
+        .set("http.cors.allow_origin", "http://localhost:5173"); // 前端 dev server
 
     let mut app = App::builder()
         .config(config)
@@ -49,6 +52,18 @@ fn main() -> rsboot::Result<()> {
             let Path(name) = Path::<String>::from_request(req)?;
             Ok(format!("hello, {name}"))
         })
+        .unwrap()
+        // 给这条路由挂文档：/docs 里会出现参数说明，/openapi.json 里会有 schema
+        .describe(
+            rsboot::Method::Get,
+            "/api/hello/{name}",
+            RouteDoc::new("打招呼")
+                .tag("示例")
+                .describe("返回一句问候，用来验证路径参数提取")
+                .param(ParamDoc::path("name", serde_json::json!({ "type": "string" })))
+                .response(serde_json::json!({ "type": "string" }))
+                .error(400, "路径参数不合法"),
+        )
         .unwrap()
         // 查询参数：`Query<T>` 反序列化到结构体，缺字段会得到 422
         .get("/api/search", |req, _| -> Result<Response, ApiError> {

@@ -23,6 +23,7 @@ use crate::runtime::context::Context;
 use crate::web::error::ApiError;
 use crate::web::envelope::{self, Envelope};
 use crate::web::exception;
+use crate::web::middleware::Middleware;
 use crate::web::http::{Method, Status};
 use crate::web::path::PathTemplate;
 use crate::web::request::Request;
@@ -37,6 +38,9 @@ pub struct Route {
     pub method: Method,
     pub template: PathTemplate,
     handler: HandlerFn,
+    /// OpenAPI 描述。`None` 的路由仍会被列出来（只是没有 summary/参数说明），
+    /// 因为"路由存在但没写文档"应该是可见的，而不是从文档里凭空消失。
+    pub doc: Option<crate::web::openapi::RouteDoc>,
 }
 
 impl Route {
@@ -51,6 +55,8 @@ pub struct Router {
     /// 首段字面量 → 路由下标。空串这个桶放"首段是参数"的路由。
     bucket: HashMap<String, Vec<usize>>,
     fallback: Option<HandlerFn>,
+    /// 中间件。注册顺序 = 外层到内层；`after` 逆序执行。
+    pub(crate) middlewares: Vec<Box<dyn Middleware>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -74,6 +80,7 @@ impl Router {
             routes: Vec::new(),
             bucket: HashMap::new(),
             fallback: None,
+            middlewares: Vec::new(),
         }
     }
 
@@ -103,6 +110,7 @@ impl Router {
         self.routes.push(Route {
             method,
             template,
+            doc: None,
             // 在这里就把 `IntoResponse` 收成 `Response`：
             // 存储层只有一种类型，分派时不用再泛型化
             handler: Box::new(move |req, ctx| handler(req, ctx).into_response()),
@@ -161,9 +169,64 @@ impl Router {
         self
     }
 
+    /// 装一个中间件。先装的在外面：它的 `before` 先跑，`after` 最后跑。
+    ///
+    /// 顺序自己定，框架不预设——"认证要在日志之前还是之后"取决于你想不想
+    /// 让日志记录被拒绝的请求，这没有普适答案。
+    pub fn middleware<M: Middleware + 'static>(mut self, m: M) -> Self {
+        self.middlewares.push(Box::new(m));
+        self
+    }
+
+    /// 给已注册的路由挂 OpenAPI 描述。
+    ///
+    /// 描述找不到路由就**报错**：静默丢弃会让 `/openapi.json` 少一条，
+    /// 而少的那条正是使用者以为写好了的那条。
+    pub fn describe(
+        mut self,
+        method: Method,
+        path: &str,
+        doc: crate::web::openapi::RouteDoc,
+    ) -> Result<Self> {
+        let normalized = PathTemplate::parse(path).map_err(Error::Config)?;
+        let Some(idx) = self
+            .routes
+            .iter()
+            .position(|r| r.method == method && r.template.raw == normalized.raw)
+        else {
+            return Err(Error::Config(format!(
+                "没有 {} {} 这条路由，无法挂文档。先 `.route(...)` 注册，再 `.describe(...)`",
+                method.as_str(),
+                normalized.raw
+            )));
+        };
+        self.routes[idx].doc = Some(doc);
+        Ok(self)
+    }
+
+    pub fn middleware_names(&self) -> Vec<&'static str> {
+        self.middlewares.iter().map(|m| m.name()).collect()
+    }
+
     /// 已注册的路由（OpenAPI 生成用，按注册顺序）。
     pub fn list(&self) -> impl Iterator<Item = (&Method, &str)> {
         self.routes.iter().map(|r| (&r.method, r.template.raw.as_str()))
+    }
+
+    /// 带描述的路由视图。
+    pub fn routes(&self) -> impl Iterator<Item = &Route> {
+        self.routes.iter()
+    }
+
+    /// 这个"方法 + 路径"是否已注册（自动挂 `/docs` 时用来避免重复注册）。
+    pub fn contains(&self, method: Method, path: &str) -> bool {
+        let normalized = match PathTemplate::parse(path) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        self.routes
+            .iter()
+            .any(|r| r.method == method && r.template.raw == normalized.raw)
     }
 
     pub fn len(&self) -> usize {
@@ -176,8 +239,30 @@ impl Router {
 
     /// 分派。
     pub fn handle(&self, req: &mut Request, ctx: &Context) -> Response {
-        let resp = self.dispatch(req, ctx);
+        // before：顺序执行，任一个返回 Some 就短路（后续中间件与 handler 都不跑）
+        //
+        // `entered` 记录"实际进入过"的层数：没进入的层不该在 after 里改一个
+        // 它没参与过的响应。这是洋葱语义——只 unwind 已经进栈的那些。
+        let mut entered = 0;
+        let mut short = None;
+        for m in &self.middlewares {
+            entered += 1;
+            if let Some(r) = m.before(req, ctx) {
+                short = Some(r);
+                break;
+            }
+        }
+        let resp = match short {
+            Some(r) => r,
+            None => self.dispatch(req, ctx),
+        };
         let mut resp = self.finalize(resp, req, ctx);
+
+        // after：逆序（外层最后跑）。4xx/5xx 也过一遍——
+        // CORS 头加不到错误响应上，浏览器里就只剩一句"请求失败"。
+        for m in self.middlewares.iter().take(entered).rev() {
+            resp = m.after(req, ctx, resp);
+        }
 
         if req.method == Method::Head {
             // HEAD 的语义是"和 GET 一样的头，但没有 body"。放在最外层，

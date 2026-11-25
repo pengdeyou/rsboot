@@ -126,3 +126,129 @@ fn workers_can_be_configured_and_are_capped() {
     let err = app.serve_on("127.0.0.1:0", Router::new()).unwrap_err();
     assert!(err.to_string().contains("http.workers"), "{err}");
 }
+
+#[test]
+fn docs_cors_and_security_headers_are_wired() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = Arc::clone(&stop);
+    let a2 = addr.clone();
+
+    let handle = std::thread::spawn(move || {
+        let mut app = App::builder()
+            .config(
+                Config::new()
+                    .set("app.env", "dev")
+                    .set("http.docs", "true")
+                    .set("http.cors.allow_origin", "http://localhost:5173"),
+            )
+            .database("default", "sqlite://:memory:")
+            .build()
+            .unwrap();
+
+        let router = Router::new()
+            .get("/users/{id}", |_, _| Response::text("u"))
+            .unwrap()
+            .describe(
+                rsboot::Method::Get,
+                "/users/{id}",
+                rsboot::RouteDoc::new("查用户")
+                    .param(rsboot::ParamDoc::path("id", serde_json::json!({"type":"integer"}))),
+            )
+            .unwrap();
+
+        app.serve_with(&a2, router, s2).unwrap();
+    });
+
+    // /docs 与 /openapi.json 自动挂载
+    let mut s = wait_ready(&addr);
+    let r = request(&mut s, "GET /docs HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 200 OK"), "{r}");
+    assert!(r.contains("text/html"), "{r}");
+
+    let mut s = wait_ready(&addr);
+    let r = request(&mut s, "GET /openapi.json HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    assert!(r.contains("\"openapi\""), "{r}");
+    assert!(r.contains("/users/{id}"), "{r}");
+    assert!(r.contains("查用户"), "describe 的内容要进文档：{r}");
+
+    // CORS：命中的来源回显 + Vary，未命中的什么都不给
+    let mut s = wait_ready(&addr);
+    let r = request(
+        &mut s,
+        "GET /users/7 HTTP/1.1\r\nHost: a\r\nOrigin: http://localhost:5173\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        r.to_lowercase().contains("access-control-allow-origin: http://localhost:5173"),
+        "{r}"
+    );
+    assert!(r.to_lowercase().contains("vary: origin"), "{r}");
+
+    let mut s = wait_ready(&addr);
+    let r = request(
+        &mut s,
+        "GET /users/7 HTTP/1.1\r\nHost: a\r\nOrigin: https://evil.com\r\nConnection: close\r\n\r\n",
+    );
+    assert!(!r.to_lowercase().contains("access-control-allow-origin"), "{r}");
+
+    // 安全头
+    let mut s = wait_ready(&addr);
+    let r = request(&mut s, "GET /users/7 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    let low = r.to_lowercase();
+    assert!(low.contains("x-content-type-options: nosniff"), "{r}");
+    assert!(low.contains("x-frame-options: deny"), "{r}");
+
+    // 预检短路，不进 handler
+    let mut s = wait_ready(&addr);
+    let r = request(
+        &mut s,
+        "OPTIONS /users/7 HTTP/1.1\r\nHost: a\r\nOrigin: http://localhost:5173\r\n\
+         Access-Control-Request-Method: DELETE\r\nConnection: close\r\n\r\n",
+    );
+    assert!(r.starts_with("HTTP/1.1 204"), "预检应短路成 204：{r}");
+    assert!(r.to_lowercase().contains("access-control-allow-methods"), "{r}");
+
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+}
+
+#[test]
+fn rate_limit_returns_429_with_retry_after() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = Arc::clone(&stop);
+    let a2 = addr.clone();
+
+    let handle = std::thread::spawn(move || {
+        let mut app = App::builder()
+            .config(
+                Config::new()
+                    .set("app.env", "dev")
+                    .set("http.log.requests", "false")
+                    // 每秒 0.001 个令牌、突发 1：第二条请求必然被拒
+                    .set("http.rate.rate", "0.001")
+                    .set("http.rate.burst", "1"),
+            )
+            .database("default", "sqlite://:memory:")
+            .build()
+            .unwrap();
+        app.serve_with(
+            &a2,
+            Router::new().get("/p", |_, _| Response::text("p")).unwrap(),
+            s2,
+        )
+        .unwrap();
+    });
+
+    let mut s = wait_ready(&addr);
+    let first = request(&mut s, "GET /p HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    assert!(first.contains("200 OK"), "{first}");
+
+    let mut s = wait_ready(&addr);
+    let second = request(&mut s, "GET /p HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    assert!(second.contains("429"), "{second}");
+    assert!(second.to_lowercase().contains("retry-after"), "{second}");
+
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+}

@@ -19,3 +19,6 @@ serde_json = "1"
 # 查询串反序列化。引它而不是手搓：重复键、% 编码、`+` 当空格这些细节
 # 自己实现必然出错，而它只有几十行代码
 serde_urlencoded = "0.7"
+# 从 Rust 类型生成 JSON Schema（`JsonSchema` derive）。OpenAPI 的 request/response
+# 结构靠它——Rust 没有运行时反射，FastAPI 靠 pydantic 做的是同一件事
+schemars = "1"

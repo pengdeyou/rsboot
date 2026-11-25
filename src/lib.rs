@@ -32,7 +32,7 @@ pub use server::{ConnLimits, Server};
 pub use web::{
     Api, ApiError, ApiKey, ApiResult, Bearer, Envelope, FromRequest, IntoApiError, IntoResponse, Json,
     Method, Path, Query, Request,
-    Response, Router, Status,
+    ParamDoc, Response, RouteDoc, Router, Status,
 };
 
 /// 版本号来自 Cargo.toml，供 `/health` 与启动日志展示。

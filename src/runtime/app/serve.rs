@@ -70,6 +70,24 @@ impl App {
         let limits = self.limits_from_config()?;
         let workers = self.workers_from_config()?;
         let factory = self.context_factory();
+
+        // 中间件按配置装（cors / rate / security / log），使用者自己加的排在外层
+        let cfg = self.ctx.config();
+        let router = match crate::web::middleware::install_defaults(router, &cfg) {
+            Ok(r) => r,
+            Err(e) => return Err(self.unwind(e)),
+        };
+
+        // 文档页与 `/openapi.json`（`http.docs`，dev 默认开、prod 默认关）
+        let docs_on = match cfg.get_bool("http.docs") {
+            Ok(v) => v.unwrap_or(false),
+            Err(e) => return Err(self.unwind(e)),
+        };
+        let router = if docs_on {
+            crate::web::openapi::attach(router, crate::web::openapi::OpenApi::from_config(&cfg))
+        } else {
+            router
+        };
         let router = Arc::new(router);
 
         // 端口被占之类的失败也要把已启动的模块收干净，不能带着半启动状态退出
