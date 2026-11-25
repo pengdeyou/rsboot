@@ -86,51 +86,130 @@ fn write_closing<W: Write>(out: &mut W) -> std::io::Result<()> {
     write::write_response(out, &resp, true, false)
 }
 
-/// 处理一条连接，直到它结束。返回 `Ok` 不代表"成功"，只代表"正常收尾"。
+/// 一条连接的全部状态：socket、读缓冲、已处理请求数。
 ///
-/// `should_stop` 是闭包而不是 `&AtomicBool`：关闭决策有两个来源——
-/// 外部编排的 shutdown **或** drain 期满后的内部关闭。闭包让调用方决定
-/// 怎么合并，`conn` 层不需要理解"跛鸭期"这种概念。
-pub fn serve_conn<F: Fn() -> bool>(
+/// 为什么把 `BufReader` 一起放进来：无缓冲的话每次处理都要重新
+/// `try_clone`（一次 `dup(2)`）。把连接做成"可以被搬来搬去的对象"后，
+/// worker 能在多条连接之间轮转而不用每次付这个成本。
+pub struct Conn {
     stream: TcpStream,
-    router: &Router,
-    ctx: &Context,
-    limits: &Limits,
-    should_stop: F,
-) -> std::io::Result<()> {
-    // 读超时 = 轮询间隔；真正的空闲上限在 read_head 里按 elapsed 判定
-    let _ = stream.set_read_timeout(Some(POLL_INTERVAL));
-    let _ = stream.set_write_timeout(Some(limits.io_timeout));
-    let _ = stream.set_nodelay(true);
+    reader: BufReader<TcpStream>,
+    served: usize,
+}
 
-    let peer = stream.peer_addr().ok().map(|a| a.to_string());
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
+/// 处理完一个请求之后的去向。
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnOutcome {
+    /// 还能继续接请求，把它放回队列让别人也有机会
+    KeepAlive,
+    /// 该关了（对端要求 close、出错、或达到 `max_requests`）
+    Closed,
+}
 
-    for _ in 0..limits.max_requests {
+const CLOSED: std::result::Result<ConnOutcome, std::io::Error> = Ok(ConnOutcome::Closed);
+const KEEP: std::result::Result<ConnOutcome, std::io::Error> = Ok(ConnOutcome::KeepAlive);
+
+impl Conn {
+    pub fn new(stream: TcpStream, limits: &Limits) -> std::io::Result<Self> {
+        // 读超时 = 轮询间隔；真正的空闲上限在 read_head 里按 elapsed 判定
+        let _ = stream.set_read_timeout(Some(POLL_INTERVAL));
+        let _ = stream.set_write_timeout(Some(limits.io_timeout));
+        let _ = stream.set_nodelay(true);
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Self {
+            stream,
+            reader,
+            served: 0,
+        })
+    }
+
+    pub fn peer(&self) -> Option<String> {
+        self.stream.peer_addr().ok().map(|a| a.to_string())
+    }
+
+    /// 原始 fd，给 worker 的 `poll` 用。
+    pub fn raw_fd(&self) -> Option<std::os::raw::c_int> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            Some(self.stream.as_raw_fd())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// 这条连接此刻有没有待处理输入（0ms `poll`）。
+    ///
+    /// worker 用它来决定"该不该现在服务这条连接"：不可读的连接直接放回队列，
+    /// 否则 worker 会卡在 read 上等它的下一个请求，把后面排队的连接全饿住。
+    #[cfg(unix)]
+    pub fn has_pending_input(&self) -> std::io::Result<bool> {
+        use std::os::unix::io::AsRawFd;
+        crate::server::poll::wait_readable(self.stream.as_raw_fd(), 0)
+    }
+
+    #[cfg(not(unix))]
+    pub fn has_pending_input(&self) -> std::io::Result<bool> {
+        Ok(true)
+    }
+
+    pub fn into_stream(self) -> TcpStream {
+        self.stream
+    }
+
+    /// 处理**一个**请求就返回。
+    ///
+    /// ## 为什么不是"一条连接循环到底"
+    ///
+    /// 早先版本 worker 拿到一条连接就 `for 0..max_requests` 一直读。看着省事，
+    /// 但 keep-alive 客户端的连接会**长期占住 worker**：2 个 worker 遇上 20 条
+    /// 长连接，18 条在队列里干等到前面的空闲超时（5s）。基准里表现为
+    /// "P99 = 47µs 但 max = 5004ms"——平均值很好看，尾部全是饥饿。
+    ///
+    /// 现在每处理完一个请求就交回队列，由 worker 取下一条连接。这等于在
+    /// 线程模型里做了协作式轮转：代价是一次 `mpsc` 传递，换来连接公平。
+    pub fn serve_once<F: Fn() -> bool>(
+        &mut self,
+        router: &Router,
+        ctx: &Context,
+        limits: &Limits,
+        should_stop: &F,
+    ) -> std::io::Result<ConnOutcome> {
+        // 单连接处理上限：防止一个连接永久占着一个 worker 的队列位
+        if self.served >= limits.max_requests {
+            return CLOSED;
+        }
+
         // 每个请求开头看一眼：正在关闭就不再接新请求，但**要给个明确答复**。
         // 直接断连时客户端只看到 "empty reply"，重试逻辑差一点的会当故障；
         // 回 503 + `retry-after` + `connection: close` 它才知道该换实例重试。
-        // 已经处理完的那条不受影响——不打断在途请求是这个顺序的全部意义。
         if should_stop() {
-            let _ = write_closing(&mut writer);
-            return Ok(());
+            let _ = write_closing(&mut self.stream);
+            return CLOSED;
         }
-        let head = match read_head(&mut reader, &should_stop, limits.io_timeout) {
+
+        let peer = self.peer();
+        let head = match read_head(&mut self.reader, should_stop, limits.io_timeout) {
             Ok(h) => h,
-            Err(HeadError::Eof) | Err(HeadError::Timeout) => return Ok(()),
+            Err(HeadError::Eof) | Err(HeadError::Timeout) => return CLOSED,
             Err(HeadError::Stopped) => {
                 // 正在关闭：给明确答复再走
-                let _ = write_closing(&mut writer);
-                return Ok(());
+                let _ = write_closing(&mut self.stream);
+                return CLOSED;
             }
             Err(HeadError::TooLarge) => {
-                let _ = write_error(&mut writer, ApiError::new(Status(431), "请求头过大"), true);
-                return Ok(());
+                let _ = write_error(
+                    &mut self.stream,
+                    ApiError::new(Status(431), "请求头过大"),
+                    true,
+                );
+                return CLOSED;
             }
             Err(HeadError::Malformed(m)) => {
-                let _ = write_error(&mut writer, ApiError::new(Status::BAD_REQUEST, m), true);
-                return Ok(());
+                let _ = write_error(&mut self.stream, ApiError::new(Status::BAD_REQUEST, m), true);
+                return CLOSED;
             }
         };
 
@@ -138,8 +217,8 @@ pub fn serve_conn<F: Fn() -> bool>(
             Ok(p) => p,
             Err(ParseError { status, message }) => {
                 // 解析层拒绝一律断开：边界已不可信
-                let _ = write_error(&mut writer, ApiError::new(status, message), true);
-                return Ok(());
+                let _ = write_error(&mut self.stream, ApiError::new(status, message), true);
+                return CLOSED;
             }
         };
 
@@ -147,14 +226,14 @@ pub fn serve_conn<F: Fn() -> bool>(
             BodyLen::None => Vec::new(),
             BodyLen::Length(n) => {
                 let mut buf = vec![0u8; n];
-                if reader.read_exact(&mut buf).is_err() {
+                if self.reader.read_exact(&mut buf).is_err() {
                     // body 没读全：断开，绝不把半截数据交给 handler
                     let _ = write_error(
-                        &mut writer,
+                        &mut self.stream,
                         ApiError::new(Status::BAD_REQUEST, "请求体不完整"),
                         true,
                     );
-                    return Ok(());
+                    return CLOSED;
                 }
                 buf
             }
@@ -164,7 +243,7 @@ pub fn serve_conn<F: Fn() -> bool>(
             .with_query(parsed.target.query.clone())
             .with_body(body);
         req.headers = parsed.headers;
-        req.peer = peer.clone();
+        req.peer = peer;
 
         // trace id：优先客户端给的
         let trace = req
@@ -178,12 +257,13 @@ pub fn serve_conn<F: Fn() -> bool>(
         resp.headers.insert("x-request-id", &trace);
 
         let head_only = matches!(parsed.method, Method::Head);
-        write::write_response(&mut writer, &resp, parsed.close, head_only)?;
+        write::write_response(&mut self.stream, &resp, parsed.close, head_only)?;
+        self.served += 1;
         if parsed.close {
-            return Ok(());
+            return CLOSED;
         }
+        KEEP
     }
-    Ok(())
 }
 
 fn write_error<W: Write>(out: &mut W, err: ApiError, close: bool) -> std::io::Result<()> {

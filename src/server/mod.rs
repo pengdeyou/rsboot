@@ -24,21 +24,30 @@
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::runtime::context::Context;
-use crate::server::conn::Limits;
+use crate::server::conn::{Conn, ConnOutcome, Limits};
 use crate::web::route::Router;
 
 pub mod conn;
 pub mod parse;
+pub mod poll;
 pub mod signal;
 pub mod write;
 
 pub use conn::Limits as ConnLimits;
+
+/// `poll` 的单个超时上限：决定关闭/跛鸭判定的精度，也决定空闲时醒来的频率。
+/// 5ms 对关闭响应足够快，对 CPU 几乎等于零成本（poll 不占 CPU，只在超时后醒一次）。
+const ACCEPT_POLL_MS: i32 = 5;
+/// 一次可读最多排空多少条连接：突发流量下别让 poll 和 accept 来回打转。
+const MAX_ACCEPT_PER_WAIT: usize = 64;
+/// worker 等连接就绪的超时：决定"新连接/关闭信号"的感知粒度，不决定吞吐。
+const WORKER_POLL_MS: i32 = 1;
 
 const ST_SERVING: u8 = 0;
 const ST_DRAINING: u8 = 1;
@@ -204,7 +213,7 @@ impl Server {
     /// 等 worker 把手上这条连接处理完 → join。进行中的请求不会被粗暴切断。
     pub fn run(self, shutdown: Arc<AtomicBool>) -> Result<()> {
         let workers = self.workers;
-        let mut senders: Vec<SyncSender<TcpStream>> = Vec::with_capacity(workers);
+        let mut senders: Vec<SyncSender<Conn>> = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
         // worker 启动握手：全部就绪才开始 accept。
         // 不让"半残服务"上线——两个 worker 里只起来一个，比直接启动失败更难查。
@@ -214,7 +223,7 @@ impl Server {
         let closing = Arc::new(AtomicBool::new(false));
 
         for i in 0..workers {
-            let (tx, rx) = sync_channel::<TcpStream>(256);
+            let (tx, rx) = sync_channel::<Conn>(256);
             senders.push(tx);
 
             let router = Arc::clone(&self.router);
@@ -245,10 +254,87 @@ impl Server {
                     }
                     // 任一来源要求关闭都算：外部编排，或 drain 期满的内部关闭
                     let should_stop = || stop.load(Ordering::Relaxed) || close.load(Ordering::Relaxed);
-                    while let Ok(stream) = rx.recv() {
-                        // 单连接出错不影响 worker 继续服务
-                        let _ = conn::serve_conn(stream, &router, &ctx, &limits, should_stop);
+                    // 本 worker 负责的连接表。worker 不是"拿到一条连接读到死"，
+                    // 而是**同时持有它队列里的所有连接**，用 `poll` 等任意一条就绪。
+                    //
+                    // 这一层是必须的：线程-per-worker 的模型下，"一条连接读到死"
+                    // 会让空闲的 keep-alive 连接长期占住 worker，后面的连接全部饿死
+                    // （基准里 max = 5004ms 就是这个）。多路复用把这个问题从根上去掉，
+                    // 而且不需要为每条连接开线程。
+                    let mut conns: Vec<Conn> = Vec::new();
+                    let mut idle_spins = 0u32;
+                    loop {
+                        // 关闭必须能立刻生效：worker 自己握着 sender，
+                        // 光靠 "主线程 drop senders" 永远收不到 Disconnected。
+                        if should_stop() {
+                            // 手上和队列里的连接都得给明确答复（503 + close），
+                            // 不能静默断——否则客户端只看到 "empty reply"。
+                            for mut c in conns.drain(..) {
+                                let _ = c.serve_once(&router, &ctx, &limits, &should_stop);
+                            }
+                            while let Ok(mut c) = rx.try_recv() {
+                                let _ = c.serve_once(&router, &ctx, &limits, &should_stop);
+                            }
+                            break;
+                        }
+
+                        // 先把新派来的连接收进本地表
+                        loop {
+                            match rx.try_recv() {
+                                Ok(c) => conns.push(c),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
+
+                        if conns.is_empty() {
+                            // 手上没连接：等新连接（50ms 只是为了能及时看到关闭标志）
+                            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                                Ok(c) => conns.push(c),
+                                Err(RecvTimeoutError::Timeout) => continue,
+                                Err(RecvTimeoutError::Disconnected) => break,
+                            }
+                            continue;
+                        }
+
+                        // 等任意一条连接可读。1ms 超时让"刚派进来的新连接"也能
+                        // 很快被感知，同时空闲时几乎不耗 CPU（poll 阻塞，不空转）。
+                        let fds: Vec<i32> = conns.iter().filter_map(|c| c.raw_fd()).collect();
+                        let ready = match poll::wait_multi(&fds, WORKER_POLL_MS) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("[rsboot] worker poll 失败：{e}");
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                continue;
+                            }
+                        };
+
+                        if ready.is_empty() {
+                            idle_spins += 1;
+                            if idle_spins >= 8 {
+                                idle_spins = 0;
+                                // 长时间没有流量：让出一个调度片，别在 poll 里磨 CPU
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            continue;
+                        }
+                        idle_spins = 0;
+
+                        // 只处理就绪的连接。`swap_remove` + 处理 + 放回：O(1)
+                        for idx in ready {
+                            if idx >= conns.len() {
+                                continue;
+                            }
+                            let mut c = conns.swap_remove(idx);
+                            if let Ok(ConnOutcome::KeepAlive) =
+                                c.serve_once(&router, &ctx, &limits, &should_stop)
+                            {
+                                conns.push(c);
+                            }
+                            // 关闭/出错/对端要 close 的一律直接丢
+                        }
                     }
+
                     // worker 收尾：模块在这里释放线程局部资源（连接、缓冲）
                     if let Some(hook) = &on_exit {
                         hook(&ctx);
@@ -313,24 +399,56 @@ impl Server {
                     break;
                 }
             }
-            match self.listener.accept() {
-                Ok((stream, _peer)) => {
-                    let tx = &senders[rr % workers];
-                    rr = rr.wrapping_add(1);
-                    match tx.try_send(stream) {
-                        Ok(()) => {}
-                        // 队列满或 worker 已死 → 当场 503，不进内核 backlog 继续堆
-                        Err(std::sync::mpsc::TrySendError::Full(s)) => reject_overloaded(s),
-                        Err(std::sync::mpsc::TrySendError::Disconnected(s)) => reject_overloaded(s),
+            // 睡到"有连接"为止，而不是 sleep 轮询。轮询会让每条短连接
+            // 白等最多一个轮询周期（原来是 20ms，基准里直接把 QPS 打到 116）。
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                match poll::wait_readable(self.listener.as_raw_fd(), ACCEPT_POLL_MS) {
+                    Ok(true) => {}
+                    Ok(false) => continue, // 超时：回到循环头检查关闭/drain
+                    Err(e) => {
+                        eprintln!("[rsboot] poll 失败：{e}");
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => {
-                    // 文件描述符耗尽之类的临时错误：退避后重试，不让整个服务退出
-                    eprintln!("[rsboot] accept 失败：{e}");
-                    std::thread::sleep(Duration::from_millis(100));
+            }
+            #[cfg(not(unix))]
+            {
+                std::thread::sleep(Duration::from_millis(ACCEPT_POLL_MS as u64));
+            }
+
+            // 一次可读往往意味着 backlog 里不止一条：排空它，别让突发连接
+            // 排队等下一轮 poll。上限 64 免得一条线程被 accept 独占。
+            for _ in 0..MAX_ACCEPT_PER_WAIT {
+                match self.listener.accept() {
+                    Ok((stream, _peer)) => {
+                        let tx = &senders[rr % workers];
+                        rr = rr.wrapping_add(1);
+                        // 每条连接只在这里 dup 一次 fd（读缓冲跟着连接走）
+                        let c = match Conn::new(stream, &self.limits) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        match tx.try_send(c) {
+                            Ok(()) => {}
+                            // 队列满或 worker 已死 → 当场 503，不进内核 backlog 继续堆
+                            Err(std::sync::mpsc::TrySendError::Full(c)) => {
+                                reject_overloaded(c.into_stream())
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(c)) => {
+                                reject_overloaded(c.into_stream())
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        // 文件描述符耗尽之类的临时错误：退避后重试，不让整个服务退出
+                        eprintln!("[rsboot] accept 失败：{e}");
+                        std::thread::sleep(Duration::from_millis(100));
+                        break;
+                    }
                 }
             }
         }

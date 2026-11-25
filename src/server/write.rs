@@ -12,10 +12,18 @@
 
 use std::io::{self, Write};
 
-use crate::web::http::Headers;
 use crate::web::response::Response;
 
 /// 写完整响应。`head_only` 为真时不写 body（HEAD 请求）。
+///
+/// ## 一次系统调用
+///
+/// 早先版本对 `out`（就是 `TcpStream`）连着 `write!` 好几次：状态行一次、
+/// 自动头几次、业务头每个一次、body 一次。每条响应 5~8 个 `write(2)`
+/// 系统调用，在基准里是纯粹的白送开销。
+///
+/// 现在先在内存 `Vec` 里拼整条响应，最后 `write_all` 一次。这也是所有成熟
+/// HTTP 服务端的做法（缓冲写出，`flush` 只发生在该发的时刻）。
 pub fn write_response<W: Write>(
     out: &mut W,
     resp: &Response,
@@ -25,20 +33,31 @@ pub fn write_response<W: Write>(
     let status = resp.status;
     let body_forbidden = status.0 == 204 || status.0 == 304;
 
+    let mut buf: Vec<u8> = Vec::with_capacity(96 + resp.headers.len() * 32 + resp.body.len());
+
     // 状态行
-    write!(out, "HTTP/1.1 {} {}\r\n", status.0, status.reason())?;
+    buf.extend_from_slice(b"HTTP/1.1 ");
+    let _ = write!(&mut buf, "{}", status.0);
+    buf.push(b' ');
+    buf.extend_from_slice(status.reason().as_bytes());
+    buf.extend_from_slice(b"\r\n");
 
     // 自动头。业务头里已经有同名的，以业务头为准（下面会跳过重复写入）。
-    let mut headers = Headers::new();
-    headers.insert("date", &http_date());
-    headers.insert("server", &format!("rsboot/{}", crate::VERSION));
+    // date 走秒级缓存：每响应重算一遍 RFC 1123 是纯浪费（actix 也是这么做）
+    buf.extend_from_slice(b"date: ");
+    buf.extend_from_slice(http_date_cached().as_bytes());
+    buf.extend_from_slice(b"\r\nserver: ");
+    buf.extend_from_slice(SERVER.as_bytes());
+    buf.extend_from_slice(b"\r\n");
     if !body_forbidden {
-        headers.insert("content-length", &resp.body.len().to_string());
+        buf.extend_from_slice(b"content-length: ");
+        let _ = write!(&mut buf, "{}", resp.body.len());
+        buf.extend_from_slice(b"\r\n");
     }
     if close {
-        headers.insert("connection", "close");
+        buf.extend_from_slice(b"connection: close\r\n");
     } else {
-        headers.insert("connection", "keep-alive");
+        buf.extend_from_slice(b"connection: keep-alive\r\n");
     }
 
     for (name, value) in resp.headers.iter() {
@@ -46,22 +65,47 @@ pub fn write_response<W: Write>(
         if matches!(name, "content-length" | "connection" | "date" | "server") {
             continue;
         }
-        headers.insert(name, value);
-    }
-
-    for (name, value) in headers.iter() {
-        // 再过一遍 insert 的校验：value 里若混进 CRLF（比如来自用户数据）就丢弃
+        // 再过一遍校验：value 里若混进 CRLF（比如来自用户数据）就丢弃
         if name.is_empty() || value.contains('\r') || value.contains('\n') {
             continue;
         }
-        write!(out, "{name}: {value}\r\n")?;
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
     }
-    write!(out, "\r\n")?;
+    buf.extend_from_slice(b"\r\n");
 
     if !head_only && !body_forbidden {
-        out.write_all(&resp.body)?;
+        buf.extend_from_slice(&resp.body);
     }
+
+    out.write_all(&buf)?;
     out.flush()
+}
+
+/// `server` 头是常量：没必要每响应 `format!` 一次
+const SERVER: &str = concat!("rsboot/", env!("CARGO_PKG_VERSION"));
+
+/// 秒级缓存的 `Date` 头。
+///
+/// HTTP 的 `Date` 精度就是秒，同一个秒内所有请求的响应头一模一样。
+/// 用 `Arc<str>` 而不是 `String`：返回时只做一次原子自增，没有分配。
+fn http_date_cached() -> std::sync::Arc<str> {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<(u64, Arc<str>)>> = OnceLock::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let m = CACHE.get_or_init(|| Mutex::new((0, Arc::from(""))));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    if g.0 != now || g.1.is_empty() {
+        g.0 = now;
+        g.1 = Arc::from(http_date_at(now as i64));
+    }
+    Arc::clone(&g.1)
 }
 
 /// RFC 1123 日期，用于 `Date` 头。
@@ -73,6 +117,11 @@ pub fn http_date() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    http_date_at(secs)
+}
+
+/// 给定 unix 秒数算 RFC 1123 日期字符串。
+fn http_date_at(secs: i64) -> String {
     let days = secs / 86400;
     let sod = secs % 86400;
     let (y, m, d) = civil_from_days(days);
