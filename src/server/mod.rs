@@ -321,6 +321,14 @@ impl Server {
                         idle_spins = 0;
 
                         // 只处理就绪的连接。`swap_remove` + 处理 + 放回：O(1)
+                        //
+                        // 必须**按下标降序**处理。`swap_remove(i)` 会把尾部元素搬到 i，
+                        // `push` 又会改变长度；若按升序处理，后续的 `ready[j]`（j > i）
+                        // 就指向了别的连接——表现为"同一条连接被处理两次、另一条就绪的
+                        // 连接延后一轮"。更糟的是被重复处理的那条此刻可能已无数据，
+                        // `serve_once` 会阻塞到读超时，把 worker 整条卡住。
+                        let mut ready = ready;
+                        ready.sort_unstable_by(|a, b| b.cmp(a));
                         for idx in ready {
                             if idx >= conns.len() {
                                 continue;

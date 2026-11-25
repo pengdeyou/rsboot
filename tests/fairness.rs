@@ -100,3 +100,76 @@ fn two_keep_alive_connections_do_not_starve() {
         assert!(d < Duration::from_millis(300), "第 {i} 轮 B 被饿住：{d:?}");
     }
 }
+
+// 第二个坑（S9 复查时发现）：worker 用 `swap_remove(ready_idx)` 逐个摘连接处理，
+// 但 `poll` 返回的是**多个下标**。按升序处理时，`swap_remove(i)` 会把尾部元素搬到
+// i，`push` 又会改变长度，于是后续 `ready[j]`（j > i）指向的已经不是原来那条连接：
+// 一条被处理两次、另一条就绪的延后一轮。被重复处理的那条此刻多半已无数据，
+// `serve_once` 会阻塞到读超时，把整个 worker 卡住。
+//
+// 所以必须按下标降序处理。这条测试用 3 条同时就绪的连接把它钉住。
+
+#[test]
+fn three_connections_ready_at_once_each_get_their_own_response() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let a2 = addr.clone();
+
+    std::thread::spawn(move || {
+        let cfg = Config::new()
+            .set("app.env", "dev")
+            .set("http.workers", "1")
+            .set("http.log.requests", "false");
+        let mut app = App::builder()
+            .config(cfg)
+            .database("default", "sqlite://:memory:")
+            .build()
+            .unwrap();
+        let router = Router::new()
+            .get("/a", |_, _| Response::json(br#"{"v":"a"}"#))
+            .unwrap()
+            .get("/b", |_, _| Response::json(br#"{"v":"b"}"#))
+            .unwrap()
+            .get("/c", |_, _| Response::json(br#"{"v":"c"}"#))
+            .unwrap();
+        let _ = app.serve_with(&a2, router, Arc::new(AtomicBool::new(false)));
+    });
+    wait_ready(&addr);
+
+    let cl = [client(&addr), client(&addr), client(&addr)];
+
+    // 先把三条连接都"建立"起来（各自发一个请求，让连接进入 keep-alive 空闲态）
+    for c in &cl {
+        assert_eq!(c.get("/a").send().unwrap().status, 200);
+    }
+
+    // 然后几乎同时让三条连接各发一个**不同路径**的请求。
+    // 若下标错位，就会出现响应错位（拿到别人的路径结果）或某条被卡到读超时。
+    let paths = ["/a", "/b", "/c"];
+    let expect = [r#"{"v":"a"}"#, r#"{"v":"b"}"#, r#"{"v":"c"}"#];
+    for round in 0..3 {
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut hs = Vec::new();
+        for (i, c) in cl.iter().enumerate() {
+            let c = Arc::clone(c);
+            let b = Arc::clone(&barrier);
+            let p = paths[i];
+            let want = expect[i];
+            hs.push(std::thread::spawn(move || {
+                b.wait();
+                let t = Instant::now();
+                let resp = c.get(p).send().unwrap();
+                let d = t.elapsed();
+                assert_eq!(resp.status, 200, "round {round} {p}");
+                let body = String::from_utf8_lossy(&resp.body).to_string();
+                assert!(
+                    body.contains(want),
+                    "round {round} 连接 {i} 拿到了别人的响应：{body}"
+                );
+                assert!(d < Duration::from_millis(500), "round {round} {p} 慢了：{d:?}");
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+    }
+}
