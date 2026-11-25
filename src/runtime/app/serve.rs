@@ -71,6 +71,7 @@ impl App {
         let limits = self.limits_from_config()?;
         let workers = self.workers_from_config()?;
         let grace = self.grace_from_config()?;
+        let drain = self.drain_from_config()?;
         let factory = self.context_factory();
         // worker 退出钩子：模块的 stop_worker。逆序释放，与启动相反。
         let exit = self.worker_exit_hook();
@@ -96,7 +97,11 @@ impl App {
 
         // 端口被占之类的失败也要把已启动的模块收干净，不能带着半启动状态退出
         let server = match Server::bind(addr, Arc::clone(&router), factory, limits, workers) {
-            Ok(s) => s.on_worker_exit(exit).grace(grace),
+            Ok(s) => s
+                .on_worker_exit(exit)
+                .grace(grace)
+                .drain(drain)
+                .status(self.status.clone()),
             Err(e) => return Err(self.unwind(e)),
         };
 
@@ -117,6 +122,7 @@ impl App {
         let env = self.ctx.env();
 
         let modules = Arc::new(self.modules.clone());
+        let status = self.status.clone();
 
         Arc::new(move || {
             let sessions = databases::open(urls.clone())?;
@@ -126,6 +132,9 @@ impl App {
                 default_db.clone(),
                 env,
             );
+            // 每个 worker 的 Context 里放同一个状态句柄：
+            // handler 读到的 Draining/Closing 就是主线程此刻的真实状态。
+            ctx.insert_state(status.clone());
             // 模块的 worker 钩子：正序启动。失败就让这个 worker 退出，
             // 其余 worker 继续服务（一个 worker 起不来 ≠ 整个服务起不来）。
             for m in modules.iter() {
@@ -159,6 +168,22 @@ impl App {
         if secs < 0 {
             return Err(Error::Config(format!(
                 "`http.shutdown_grace_secs` 不能是负数，当前 {secs}"
+            )));
+        }
+        Ok(std::time::Duration::from_secs(secs as u64))
+    }
+
+    /// 跛鸭期。prod 默认 5 秒：K8s 删 Pod 时从 endpoints 摘掉到真正断流
+    /// 有个滞后，立刻停 accept 会把正在被派过来的请求打空。
+    fn drain_from_config(&self) -> Result<std::time::Duration> {
+        let secs = self
+            .ctx
+            .config()
+            .get_int("http.drain_secs")?
+            .unwrap_or(0);
+        if secs < 0 {
+            return Err(Error::Config(format!(
+                "`http.drain_secs` 不能是负数，当前 {secs}"
             )));
         }
         Ok(std::time::Duration::from_secs(secs as u64))

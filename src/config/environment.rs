@@ -98,6 +98,9 @@ impl Environment {
                 ("http.max_body_bytes", "1048576"),
                 ("reload.enabled", "false"),
                 ("http.envelope", "false"),
+                // 跛鸭期：K8s 删 Pod 到 endpoints 真正摘掉有滞后，
+                // 立刻停 accept 会把仍在被派过来的请求打空
+                ("http.drain_secs", "5"),
                 // 刻意不填 http.bind：默认绑 0.0.0.0 是事故之源，必须由使用者写出来
             ],
         }

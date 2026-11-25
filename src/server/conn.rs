@@ -19,7 +19,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -61,19 +61,42 @@ impl Default for Limits {
 
 #[derive(Debug)]
 enum HeadError {
+    /// 对端关了
     Eof,
+    /// 服务端自己要关（`should_stop` 为真）
+    ///
+    /// 必须与 `Eof` 分开：同样都是"读不到请求了"，但一个该静默退出，
+    /// 另一个该回 503——否则关闭期客户端只看到"连接被断"，不知道能重试。
+    Stopped,
     Timeout,
     TooLarge,
     Malformed(&'static str),
 }
 
+/// 关闭期给老连接的答复：503 + `retry-after` + 关连接。
+///
+/// 客户端拿到这个才知道"换实例重试"，而不是把空连接当成故障。
+fn write_closing<W: Write>(out: &mut W) -> std::io::Result<()> {
+    let mut resp = ApiError::new(
+        Status::SERVICE_UNAVAILABLE,
+        "服务正在重启，请稍后重试或换一个实例",
+    )
+    .to_response();
+    resp.headers.insert("retry-after", "1");
+    write::write_response(out, &resp, true, false)
+}
+
 /// 处理一条连接，直到它结束。返回 `Ok` 不代表"成功"，只代表"正常收尾"。
-pub fn serve_conn(
+///
+/// `should_stop` 是闭包而不是 `&AtomicBool`：关闭决策有两个来源——
+/// 外部编排的 shutdown **或** drain 期满后的内部关闭。闭包让调用方决定
+/// 怎么合并，`conn` 层不需要理解"跛鸭期"这种概念。
+pub fn serve_conn<F: Fn() -> bool>(
     stream: TcpStream,
     router: &Router,
     ctx: &Context,
     limits: &Limits,
-    shutdown: &AtomicBool,
+    should_stop: F,
 ) -> std::io::Result<()> {
     // 读超时 = 轮询间隔；真正的空闲上限在 read_head 里按 elapsed 判定
     let _ = stream.set_read_timeout(Some(POLL_INTERVAL));
@@ -85,13 +108,22 @@ pub fn serve_conn(
     let mut writer = stream;
 
     for _ in 0..limits.max_requests {
-        // 每个请求开头看一眼：正在关闭就不接新请求了（已处理完的那条不受影响）
-        if shutdown.load(Ordering::Relaxed) {
+        // 每个请求开头看一眼：正在关闭就不再接新请求，但**要给个明确答复**。
+        // 直接断连时客户端只看到 "empty reply"，重试逻辑差一点的会当故障；
+        // 回 503 + `retry-after` + `connection: close` 它才知道该换实例重试。
+        // 已经处理完的那条不受影响——不打断在途请求是这个顺序的全部意义。
+        if should_stop() {
+            let _ = write_closing(&mut writer);
             return Ok(());
         }
-        let head = match read_head(&mut reader, shutdown, limits.io_timeout) {
+        let head = match read_head(&mut reader, &should_stop, limits.io_timeout) {
             Ok(h) => h,
             Err(HeadError::Eof) | Err(HeadError::Timeout) => return Ok(()),
+            Err(HeadError::Stopped) => {
+                // 正在关闭：给明确答复再走
+                let _ = write_closing(&mut writer);
+                return Ok(());
+            }
             Err(HeadError::TooLarge) => {
                 let _ = write_error(&mut writer, ApiError::new(Status(431), "请求头过大"), true);
                 return Ok(());
@@ -162,9 +194,9 @@ fn write_error<W: Write>(out: &mut W, err: ApiError, close: bool) -> std::io::Re
 ///
 /// 逐行读而不是"读到 `\r\n\r\n`"：逐行能在超限时立刻停手，
 /// 不会为了找结束标记而把一个 8 KiB 上限的读取变成无界读取。
-fn read_head<R: BufRead>(
+fn read_head<R: BufRead, F: Fn() -> bool>(
     reader: &mut R,
-    shutdown: &AtomicBool,
+    should_stop: &F,
     idle: Duration,
 ) -> Result<String, HeadError> {
     let mut head = String::new();
@@ -175,8 +207,8 @@ fn read_head<R: BufRead>(
     let started = Instant::now();
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Err(HeadError::Eof);
+        if should_stop() {
+            return Err(HeadError::Stopped);
         }
         line.clear();
         let n = match reader.read_until(b'\n', &mut line) {
@@ -239,8 +271,19 @@ mod tests {
 
     fn read_head_from(bytes: &[u8]) -> Result<String, HeadError> {
         let mut r = BufReader::new(std::io::Cursor::new(bytes.to_vec()));
-        let stop = AtomicBool::new(false);
-        read_head(&mut r, &stop, Duration::from_secs(5))
+        read_head(&mut r, &|| false, Duration::from_secs(5))
+    }
+
+    #[test]
+    fn stop_during_read_is_distinguishable_from_eof() {
+        // 同样是"读不到请求"，服务端主动关必须能被上层识别出来，
+        // 否则关闭期只能静默断连、给不出 503
+        let mut r = BufReader::new(std::io::Cursor::new(b"GET / HTT".to_vec()));
+        let stop = || true;
+        assert!(matches!(
+            read_head(&mut r, &stop, Duration::from_secs(5)),
+            Err(HeadError::Stopped)
+        ));
     }
 
     #[test]

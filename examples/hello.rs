@@ -32,7 +32,10 @@ fn main() -> rsboot::Result<()> {
         .set("http.bind", "127.0.0.1:8000")
         .set("http.envelope", "true")        // 打开统一响应体
         .set("http.docs", "true")            // 打开 /docs 与 /openapi.json
-        .set("http.cors.allow_origin", "http://localhost:5173"); // 前端 dev server
+        .set("http.cors.allow_origin", "http://localhost:5173") // 前端 dev server
+        // 收到 SIGTERM 后再当 1 秒"跛鸭"（prod 默认 5 秒），
+        // 这段时间 /ready 已经返回 503，可以从容摘流量
+        .set("http.drain_secs", "1");
 
     let mut app = App::builder()
         .config(config)
@@ -41,6 +44,19 @@ fn main() -> rsboot::Result<()> {
 
     let router = Router::new()
         .get("/", |_, _| Response::text("rsboot is running\n"))
+        .unwrap()
+        // readiness 探针：收到 SIGTERM 后在跛鸭期返回 503，
+        // 让 LB / K8s 先把流量摘走，而不是等连接被硬断
+        .get("/ready", |_, ctx: &Context| {
+            let st = match ctx.state::<rsboot::ServeStatus>() {
+                Ok(g) => g.state(),
+                Err(_) => return Response::new(Status::SERVICE_UNAVAILABLE),
+            };
+            match st {
+                rsboot::ServeState::Serving => Response::text("serving\n"),
+                _ => Response::new(Status::SERVICE_UNAVAILABLE),
+            }
+        })
         .unwrap()
         // 路径参数：`Path<String>` 直接拿到 {name}
         // 提取失败用 `?` 交给统一异常层（400/422），绝不要 unwrap：

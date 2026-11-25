@@ -44,6 +44,9 @@ pub struct App {
     pub(crate) reload: Option<ReloadPlan>,
     /// 活了就代表热加载线程在跑；`stop()` 先 drop 它
     pub(crate) watcher: Option<Watcher>,
+    /// 对外服务状态。和每个 worker 的 `Context` 里那一个是同一个 `Arc`，
+    /// 所以 handler 读到的是主线程 accept 循环写的值。
+    pub(crate) status: crate::server::ServeStatus,
 }
 
 /// 热加载所需的一切输入。放在这里而不是 Builder：它是运行期行为。

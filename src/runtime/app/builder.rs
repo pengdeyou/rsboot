@@ -176,6 +176,7 @@ impl Builder {
             migrate_on_start: self.migrate_on_start,
             reload,
             watcher: None,
+            status: crate::server::ServeStatus::new(),
         })
     }
 }

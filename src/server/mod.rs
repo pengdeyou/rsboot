@@ -23,7 +23,7 @@
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,6 +39,67 @@ pub mod signal;
 pub mod write;
 
 pub use conn::Limits as ConnLimits;
+
+const ST_SERVING: u8 = 0;
+const ST_DRAINING: u8 = 1;
+const ST_CLOSING: u8 = 2;
+
+/// 服务对外状态。业务侧拿它做 readiness 探针：
+/// 收到 SIGTERM 后先 `Draining`（还能正常服务，LB 趁这段时间摘流量），
+/// 过了 drain 预算才 `Closing`（新请求开始被 503）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeState {
+    Serving,
+    Draining,
+    Closing,
+}
+
+/// 可共享的状态句柄。放在 `Context` 里给 handler 读。
+#[derive(Debug, Clone)]
+pub struct ServeStatus(Arc<AtomicU8>);
+
+impl ServeStatus {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(ST_SERVING)))
+    }
+
+    pub fn state(&self) -> ServeState {
+        match self.0.load(Ordering::Acquire) {
+            ST_DRAINING => ServeState::Draining,
+            ST_CLOSING => ServeState::Closing,
+            _ => ServeState::Serving,
+        }
+    }
+
+    pub fn is_serving(&self) -> bool {
+        self.state() == ServeState::Serving
+    }
+
+    /// 正在摘流量：能服务，但不该再被派新流量。
+    pub fn is_draining(&self) -> bool {
+        self.state() == ServeState::Draining
+    }
+
+    /// 已在关闭：新请求会拿到 503。
+    pub fn is_closing(&self) -> bool {
+        self.state() == ServeState::Closing
+    }
+
+    pub fn set(&self, st: ServeState) {
+        let v = match st {
+            ServeState::Serving => ST_SERVING,
+            ServeState::Draining => ST_DRAINING,
+            ServeState::Closing => ST_CLOSING,
+        };
+        self.0.store(v, Ordering::Release);
+    }
+}
+
+impl Default for ServeStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// 每个 worker 建自己 Context 的工厂。
 pub type ContextFactory = Arc<dyn Fn() -> Result<Context> + Send + Sync>;
@@ -58,6 +119,11 @@ pub struct Server {
     on_worker_exit: Option<WorkerExitHook>,
     /// 关闭时等 worker 收尾的预算。超时就放弃等待并记日志，绝不无限挂住。
     grace: Duration,
+    /// 收到关闭信号后先当"跛鸭"服务多久。这段时间里照常接客，
+    /// 给 LB / k8s 摘流量的时间。0 表示立刻停 accept。
+    drain: Duration,
+    /// 对外可见的服务状态
+    status: ServeStatus,
     /// 是否把 SIGINT/SIGTERM 也当作关闭信号
     watch_signal: bool,
 }
@@ -92,6 +158,8 @@ impl Server {
             workers: workers.max(1),
             on_worker_exit: None,
             grace: Duration::from_secs(10),
+            drain: Duration::ZERO,
+            status: ServeStatus::new(),
             watch_signal: true,
         })
     }
@@ -112,6 +180,18 @@ impl Server {
         self
     }
 
+    /// 跛鸭期：收到信号后仍正常服务多久再停 accept。默认 0。
+    pub fn drain(mut self, d: Duration) -> Self {
+        self.drain = d;
+        self
+    }
+
+    /// 共享状态句柄。handler 从 `Context` 里取到的是同一个对象。
+    pub fn status(mut self, s: ServeStatus) -> Self {
+        self.status = s;
+        self
+    }
+
     /// 是否响应 SIGINT/SIGTERM。测试里关掉，避免全局标志互相干扰。
     pub fn watch_signal(mut self, yes: bool) -> Self {
         self.watch_signal = yes;
@@ -129,6 +209,9 @@ impl Server {
         // worker 启动握手：全部就绪才开始 accept。
         // 不让"半残服务"上线——两个 worker 里只起来一个，比直接启动失败更难查。
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        // 内部关闭标志：drain 期满后置位。它让**已建立的连接**知道
+        // "别再给我派新请求了"，而不是只靠主线程停 accept。
+        let closing = Arc::new(AtomicBool::new(false));
 
         for i in 0..workers {
             let (tx, rx) = sync_channel::<TcpStream>(256);
@@ -138,6 +221,7 @@ impl Server {
             let factory = Arc::clone(&self.factory);
             let limits = self.limits;
             let stop = Arc::clone(&shutdown);
+            let close = Arc::clone(&closing);
             let on_exit = self.on_worker_exit.clone();
             let ready = ready_tx.clone();
             let handle = std::thread::Builder::new()
@@ -159,9 +243,11 @@ impl Server {
                         }
                         return;
                     }
+                    // 任一来源要求关闭都算：外部编排，或 drain 期满的内部关闭
+                    let should_stop = || stop.load(Ordering::Relaxed) || close.load(Ordering::Relaxed);
                     while let Ok(stream) = rx.recv() {
                         // 单连接出错不影响 worker 继续服务
-                        let _ = conn::serve_conn(stream, &router, &ctx, &limits, &stop);
+                        let _ = conn::serve_conn(stream, &router, &ctx, &limits, should_stop);
                     }
                     // worker 收尾：模块在这里释放线程局部资源（连接、缓冲）
                     if let Some(hook) = &on_exit {
@@ -202,8 +288,31 @@ impl Server {
 
         let watch_signal = self.watch_signal;
         let grace = self.grace;
+        let drain = self.drain;
+        let status = self.status.clone();
         let mut rr = 0usize;
-        while !shutdown.load(Ordering::Relaxed) && !(watch_signal && signal::received()) {
+        // 跛鸭期的截止时刻。`None` = 还没开始关。
+        let mut drain_deadline: Option<Instant> = None;
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                status.set(ServeState::Closing);
+                closing.store(true, Ordering::Relaxed);
+                break;
+            }
+            // 第一次看到信号：进入跛鸭期。此间照常接客，过了预算才真停。
+            if drain_deadline.is_none() && watch_signal && signal::received() {
+                status.set(ServeState::Draining);
+                drain_deadline = Some(Instant::now() + drain);
+            }
+            if let Some(d) = drain_deadline {
+                if Instant::now() >= d {
+                    status.set(ServeState::Closing);
+                    // 让 worker 里**已建立的连接**开始礼貌拒绝，
+                    // 不然它们会一路 keep-alive 到 idle 超时才停
+                    closing.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
             match self.listener.accept() {
                 Ok((stream, _peer)) => {
                     let tx = &senders[rr % workers];
@@ -227,6 +336,7 @@ impl Server {
         }
 
         // 关闭 sender → worker 的 recv 结束 → 处理完手上连接后退出
+        status.set(ServeState::Closing);
         drop(senders);
 
         // 等 worker 收尾，但有预算。某个 worker卡在一条慢请求上不该让整个进程
