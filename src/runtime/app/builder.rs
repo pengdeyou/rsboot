@@ -4,6 +4,7 @@
 //! 不知道别的设置会怎么配（"热更白名单指向不存在的键"这种问题只有最后才看得出来）。
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ pub struct Builder {
     env_prefix: Option<String>,
     /// 代码里显式注册的库（覆盖配置文件同名项）
     databases: Vec<(String, String)>,
-    modules: Vec<Box<dyn Module>>,
+    modules: Vec<Arc<dyn Module>>,
     migrations: Vec<String>,
     migrate_on_start: bool,
     /// 允许热生效的键模式
@@ -86,12 +87,12 @@ impl Builder {
 
     /// 注册模块。启动顺序 = 注册顺序，关闭顺序相反。
     pub fn module<M: Module + 'static>(mut self, m: M) -> Self {
-        self.modules.push(Box::new(m));
+        self.modules.push(Arc::new(m));
         self
     }
 
-    /// 已装箱的模块（条件注册时用）。
-    pub fn module_boxed(mut self, m: Box<dyn Module>) -> Self {
+    /// 已装箱的模块（条件注册、或同一模块要在多个 App 间共享时用）。
+    pub fn module_boxed(mut self, m: Arc<dyn Module>) -> Self {
         self.modules.push(m);
         self
     }

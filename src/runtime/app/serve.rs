@@ -22,7 +22,7 @@ use crate::server::{ContextFactory, Server};
 use crate::web::route::Router;
 
 impl App {
-    /// 起服务，地址取配置 `http.bind`。
+    /// 起服务，地址取配置 `http.bind`。会响应 SIGINT/SIGTERM。
     ///
     /// 故意不提供默认地址：prod 的默认配置里没有 `http.bind`，缺了就报错。
     /// "忘了配就悄悄监听 0.0.0.0:8000" 在云上是安全事故。
@@ -51,9 +51,10 @@ impl App {
 
     /// 起服务，地址由调用方给。
     ///
-    /// **会永久阻塞**：内部没有 shutdown 句柄，只能靠进程收到信号结束。
-    /// 需要程序内部控制退出（测试、灰度下线、接 SIGTERM）请用 [`App::serve_with`]。
+    /// 阻塞运行，直到收到 `SIGINT`（Ctrl+C）/ `SIGTERM`（容器停止）并完成优雅关闭。
+    /// 需要程序内部控制退出（测试、灰度下线）请用 [`App::serve_with`]。
     pub fn serve_on(&mut self, addr: &str, router: Router) -> Result<()> {
+        crate::server::signal::install();
         self.serve_with(addr, router, Arc::new(AtomicBool::new(false)))
     }
 
@@ -69,7 +70,10 @@ impl App {
 
         let limits = self.limits_from_config()?;
         let workers = self.workers_from_config()?;
+        let grace = self.grace_from_config()?;
         let factory = self.context_factory();
+        // worker 退出钩子：模块的 stop_worker。逆序释放，与启动相反。
+        let exit = self.worker_exit_hook();
 
         // 中间件按配置装（cors / rate / security / log），使用者自己加的排在外层
         let cfg = self.ctx.config();
@@ -92,7 +96,7 @@ impl App {
 
         // 端口被占之类的失败也要把已启动的模块收干净，不能带着半启动状态退出
         let server = match Server::bind(addr, Arc::clone(&router), factory, limits, workers) {
-            Ok(s) => s,
+            Ok(s) => s.on_worker_exit(exit).grace(grace),
             Err(e) => return Err(self.unwind(e)),
         };
 
@@ -112,15 +116,52 @@ impl App {
         let slot = self.ctx.config_slot();
         let env = self.ctx.env();
 
+        let modules = Arc::new(self.modules.clone());
+
         Arc::new(move || {
             let sessions = databases::open(urls.clone())?;
-            Ok(Context::from_shared(
+            let ctx = Context::from_shared(
                 Arc::clone(&slot),
                 sessions,
                 default_db.clone(),
                 env,
-            ))
+            );
+            // 模块的 worker 钩子：正序启动。失败就让这个 worker 退出，
+            // 其余 worker 继续服务（一个 worker 起不来 ≠ 整个服务起不来）。
+            for m in modules.iter() {
+                m.start_worker(&ctx).map_err(|e| {
+                    Error::Lifecycle(format!("模块 `{}` 在 worker 启动失败：{e}", m.name()))
+                })?;
+            }
+            Ok(ctx)
         })
+    }
+
+    /// worker 退出前跑模块的 `stop_worker`，逆序。
+    fn worker_exit_hook(&self) -> crate::server::WorkerExitHook {
+        let modules = Arc::new(self.modules.clone());
+        Arc::new(move |ctx: &Context| {
+            for m in modules.iter().rev() {
+                if let Err(e) = m.stop_worker(ctx) {
+                    // 关闭阶段的错误只记日志：此时再返回错误也没有人能处理
+                    eprintln!("[rsboot] 模块 `{}` 在 worker 关闭时出错：{e}", m.name());
+                }
+            }
+        })
+    }
+
+    fn grace_from_config(&self) -> Result<std::time::Duration> {
+        let secs = self
+            .ctx
+            .config()
+            .get_int("http.shutdown_grace_secs")?
+            .unwrap_or(10);
+        if secs < 0 {
+            return Err(Error::Config(format!(
+                "`http.shutdown_grace_secs` 不能是负数，当前 {secs}"
+            )));
+        }
+        Ok(std::time::Duration::from_secs(secs as u64))
     }
 
     fn limits_from_config(&self) -> Result<Limits> {

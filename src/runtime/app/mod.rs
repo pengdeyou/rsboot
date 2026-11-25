@@ -12,6 +12,7 @@ mod migrate;
 pub use builder::Builder;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rsbatis::{Engine, Session};
@@ -31,7 +32,9 @@ pub struct App {
     /// 打开库用的 URL 列表。留存不是为了复用连接，而是为了让每个 server
     /// worker 能在自己的线程里**重建**一份 Context（`Session` 不跨线程）。
     pub(crate) database_urls: Vec<(String, String)>,
-    pub(crate) modules: Vec<Box<dyn Module>>,
+    /// 模块用 `Arc` 而不是 `Box`：除了 `App` 自己，每个 worker 也要引用它们
+    /// 来跑 `start_worker` / `stop_worker`。
+    pub(crate) modules: Vec<Arc<dyn Module>>,
     /// 已成功启动的模块下标（关闭时按它逆序）
     pub(crate) started: Vec<usize>,
     /// 迁移目录，可多个（模块各自带迁移，启动时聚合）

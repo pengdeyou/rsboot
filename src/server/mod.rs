@@ -26,7 +26,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::runtime::context::Context;
@@ -35,12 +35,17 @@ use crate::web::route::Router;
 
 pub mod conn;
 pub mod parse;
+pub mod signal;
 pub mod write;
 
 pub use conn::Limits as ConnLimits;
 
 /// 每个 worker 建自己 Context 的工厂。
 pub type ContextFactory = Arc<dyn Fn() -> Result<Context> + Send + Sync>;
+
+/// worker 退出前的钩子（跑模块的 `stop_worker`）。抽成类型别名是为了让
+/// `Server` 的字段一眼看得懂，而不是让 clippy 满意。
+pub type WorkerExitHook = Arc<dyn Fn(&Context) + Send + Sync>;
 
 pub struct Server {
     listener: TcpListener,
@@ -49,13 +54,21 @@ pub struct Server {
     factory: ContextFactory,
     limits: Limits,
     workers: usize,
+    /// worker 退出前调用（模块的 `stop_worker` 挂在这里）
+    on_worker_exit: Option<WorkerExitHook>,
+    /// 关闭时等 worker 收尾的预算。超时就放弃等待并记日志，绝不无限挂住。
+    grace: Duration,
+    /// 是否把 SIGINT/SIGTERM 也当作关闭信号
+    watch_signal: bool,
 }
 
 impl Server {
     /// 绑定端口。`":0"` 由系统分配（测试与本地开发常用）。
     ///
-    /// **工厂会被立刻调用一次**：与其等到第一个 worker 崩溃才发现配置错了，
-    /// 不如在 bind 阶段就失败。这一步需要真实的数据库连接。
+    /// **这里不调用工厂**。早先版本在 bind 里预检一次工厂，结果是
+    /// "绑定成功前就跑了模块的 `start_worker`，而那个 Context 之后被丢弃"——
+    /// 副作用（连接、线程、注册）全部泄漏，且没有对称的 `stop_worker`。
+    /// 真正的验证放在 `run` 里：等全部 worker 报告就绪再开始 accept。
     pub fn bind(
         addr: &str,
         router: Arc<Router>,
@@ -63,9 +76,6 @@ impl Server {
         limits: Limits,
         workers: usize,
     ) -> Result<Self> {
-        // 预检：配置错误、库连不上，现在就该炸
-        factory()?;
-
         let listener = TcpListener::bind(addr).map_err(|e| {
             Error::Config(format!("监听 {addr} 失败：{e}。端口被占用，或地址格式不对"))
         })?;
@@ -80,11 +90,32 @@ impl Server {
             factory,
             limits,
             workers: workers.max(1),
+            on_worker_exit: None,
+            grace: Duration::from_secs(10),
+            watch_signal: true,
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// worker 退出前的钩子（用来跑模块的 `stop_worker`）。
+    pub fn on_worker_exit(mut self, hook: WorkerExitHook) -> Self {
+        self.on_worker_exit = Some(hook);
+        self
+    }
+
+    /// 关闭时等 worker 收尾的预算。默认 10 秒。
+    pub fn grace(mut self, d: Duration) -> Self {
+        self.grace = d;
+        self
+    }
+
+    /// 是否响应 SIGINT/SIGTERM。测试里关掉，避免全局标志互相干扰。
+    pub fn watch_signal(mut self, yes: bool) -> Self {
+        self.watch_signal = yes;
+        self
     }
 
     /// 阻塞运行，直到 `shutdown` 置位。
@@ -95,6 +126,9 @@ impl Server {
         let workers = self.workers;
         let mut senders: Vec<SyncSender<TcpStream>> = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
+        // worker 启动握手：全部就绪才开始 accept。
+        // 不让"半残服务"上线——两个 worker 里只起来一个，比直接启动失败更难查。
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
 
         for i in 0..workers {
             let (tx, rx) = sync_channel::<TcpStream>(256);
@@ -104,31 +138,72 @@ impl Server {
             let factory = Arc::clone(&self.factory);
             let limits = self.limits;
             let stop = Arc::clone(&shutdown);
+            let on_exit = self.on_worker_exit.clone();
+            let ready = ready_tx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("rsboot-w{i}"))
                 .spawn(move || {
                     let ctx = match factory() {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("[rsboot] worker {i} 初始化失败，该 worker 退出：{e}");
+                            let msg = format!("worker {i} 初始化失败：{e}");
+                            eprintln!("[rsboot] {msg}");
+                            let _ = ready.send(Err(msg));
                             return;
                         }
                     };
+                    if ready.send(Ok(())).is_err() {
+                        // 主线程已经放弃等待（另一个 worker 失败了），这个也别干等了
+                        if let Some(hook) = &on_exit {
+                            hook(&ctx);
+                        }
+                        return;
+                    }
                     while let Ok(stream) = rx.recv() {
                         // 单连接出错不影响 worker 继续服务
                         let _ = conn::serve_conn(stream, &router, &ctx, &limits, &stop);
+                    }
+                    // worker 收尾：模块在这里释放线程局部资源（连接、缓冲）
+                    if let Some(hook) = &on_exit {
+                        hook(&ctx);
                     }
                 })
                 .map_err(|e| Error::Lifecycle(format!("启动 worker {i} 失败：{e}")))?;
             handles.push(handle);
         }
 
+        drop(ready_tx);
+        let mut ready_ok = 0usize;
+        let mut ready_failed: Option<String> = None;
+        for _ in 0..workers {
+            match ready_rx.recv() {
+                Ok(Ok(())) => ready_ok += 1,
+                Ok(Err(e)) => ready_failed = Some(e),
+                // 所有 sender 都 drop 了还没等齐：说明有 worker 在握手前就退了
+                Err(_) => break,
+            }
+        }
+        if let Some(e) = ready_failed {
+            drop(senders);
+            for h in handles {
+                let _ = h.join();
+            }
+            return Err(Error::Lifecycle(format!("启动失败：{e}")));
+        }
+        if ready_ok == 0 {
+            return Err(Error::Lifecycle(
+                "没有一个 worker 成功启动（检查数据库配置与模块的 start_worker）".into(),
+            ));
+        }
+
         self.listener
             .set_nonblocking(true)
             .map_err(|e| Error::Lifecycle(format!("设置非阻塞模式失败：{e}")))?;
 
+        let watch_signal = self.watch_signal;
+        let grace = self.grace;
         let mut rr = 0usize;
-        while !shutdown.load(Ordering::Relaxed) {
+        while !shutdown.load(Ordering::Relaxed) && !(watch_signal && signal::received()) {
             match self.listener.accept() {
                 Ok((stream, _peer)) => {
                     let tx = &senders[rr % workers];
@@ -153,8 +228,29 @@ impl Server {
 
         // 关闭 sender → worker 的 recv 结束 → 处理完手上连接后退出
         drop(senders);
+
+        // 等 worker 收尾，但有预算。某个 worker卡在一条慢请求上不该让整个进程
+        // 永远退不出去——超时就放弃等待（线程泄漏，但进程马上结束，无碍）。
+        let deadline = Instant::now() + grace;
+        let mut stragglers = 0usize;
         for h in handles {
-            let _ = h.join();
+            while !h.is_finished() {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                stragglers += 1;
+            }
+        }
+        if stragglers > 0 {
+            eprintln!(
+                "[rsboot] 关闭超过 {:?}，{stragglers} 个 worker 仍未退出（进行中的请求可能被硬切断）",
+                grace
+            );
         }
         Ok(())
     }

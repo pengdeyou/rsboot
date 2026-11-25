@@ -93,13 +93,12 @@ impl App {
 mod tests {
     use super::*;
     use crate::runtime::module::Module;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     /// 记录调用顺序的测试模块。
     struct Recorder {
         name: &'static str,
-        log: Rc<RefCell<Vec<String>>>,
+        log: Arc<Mutex<Vec<String>>>,
         fail_start: bool,
         fail_stop: bool,
     }
@@ -108,15 +107,15 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        fn start(&mut self, _ctx: &Context) -> Result<()> {
-            self.log.borrow_mut().push(format!("start:{}", self.name));
+        fn start(&self, _ctx: &Context) -> Result<()> {
+            self.log.lock().unwrap().push(format!("start:{}", self.name));
             if self.fail_start {
                 return Err(Error::Lifecycle("boom".into()));
             }
             Ok(())
         }
-        fn stop(&mut self, _ctx: &Context) -> Result<()> {
-            self.log.borrow_mut().push(format!("stop:{}", self.name));
+        fn stop(&self, _ctx: &Context) -> Result<()> {
+            self.log.lock().unwrap().push(format!("stop:{}", self.name));
             if self.fail_stop {
                 return Err(Error::Lifecycle("stop-boom".into()));
             }
@@ -124,7 +123,7 @@ mod tests {
         }
     }
 
-    fn app_with(modules: Vec<Box<dyn Module>>) -> App {
+    fn app_with(modules: Vec<Arc<dyn Module>>) -> App {
         let mut b = App::builder().database("default", "sqlite://:memory:");
         for m in modules {
             b = b.module_boxed(m);
@@ -134,17 +133,17 @@ mod tests {
 
     #[test]
     fn start_then_stop_is_reverse_order() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let app = app_with(vec![
-            Box::new(Recorder { name: "a", log: log.clone(), fail_start: false, fail_stop: false }),
-            Box::new(Recorder { name: "b", log: log.clone(), fail_start: false, fail_stop: false }),
+            Arc::new(Recorder { name: "a", log: Arc::clone(&log), fail_start: false, fail_stop: false }),
+            Arc::new(Recorder { name: "b", log: Arc::clone(&log), fail_start: false, fail_stop: false }),
         ]);
         let mut app = app;
         app.start().unwrap();
         assert_eq!(app.started_modules(), ["a", "b"]);
         app.stop().unwrap();
         assert_eq!(
-            *log.borrow(),
+            log.lock().unwrap().clone(),
             ["start:a", "start:b", "stop:b", "stop:a"],
             "关闭必须逆序"
         );
@@ -152,40 +151,40 @@ mod tests {
 
     #[test]
     fn failed_start_rolls_back_started_ones() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut app = app_with(vec![
-            Box::new(Recorder { name: "a", log: log.clone(), fail_start: false, fail_stop: false }),
-            Box::new(Recorder { name: "b", log: log.clone(), fail_start: true, fail_stop: false }),
-            Box::new(Recorder { name: "c", log: log.clone(), fail_start: false, fail_stop: false }),
+            Arc::new(Recorder { name: "a", log: Arc::clone(&log), fail_start: false, fail_stop: false }),
+            Arc::new(Recorder { name: "b", log: Arc::clone(&log), fail_start: true, fail_stop: false }),
+            Arc::new(Recorder { name: "c", log: Arc::clone(&log), fail_start: false, fail_stop: false }),
         ]);
         let e = app.start().unwrap_err();
         assert!(e.to_string().contains("模块 `b` 启动失败"), "{e}");
         // a 被启动过就必须被关闭；b 失败没进 started；c 根本没启动
-        assert_eq!(*log.borrow(), ["start:a", "start:b", "stop:a"]);
+        assert_eq!(log.lock().unwrap().clone(), ["start:a", "start:b", "stop:a"]);
         assert!(!app.is_running());
     }
 
     #[test]
     fn stop_collects_all_errors_instead_of_stopping_early() {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut app = app_with(vec![
-            Box::new(Recorder { name: "a", log: log.clone(), fail_start: false, fail_stop: true }),
-            Box::new(Recorder { name: "b", log: log.clone(), fail_start: false, fail_stop: true }),
+            Arc::new(Recorder { name: "a", log: Arc::clone(&log), fail_start: false, fail_stop: true }),
+            Arc::new(Recorder { name: "b", log: Arc::clone(&log), fail_start: false, fail_stop: true }),
         ]);
         app.start().unwrap();
         let e = app.stop().unwrap_err();
         let msg = e.to_string();
         assert!(msg.contains("`b`"), "必须报出 b：{msg}");
         assert!(msg.contains("`a`"), "也必须报出 a（不能因 b 失败就跳过）：{msg}");
-        assert_eq!(*log.borrow(), ["start:a", "start:b", "stop:b", "stop:a"]);
+        assert_eq!(log.lock().unwrap().clone(), ["start:a", "start:b", "stop:b", "stop:a"]);
     }
 
     #[test]
     fn run_until_stops_even_when_body_fails() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut app = app_with(vec![Box::new(Recorder {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut app = app_with(vec![Arc::new(Recorder {
             name: "a",
-            log: log.clone(),
+            log: Arc::clone(&log),
             fail_start: false,
             fail_stop: false,
         })]);
@@ -193,7 +192,7 @@ mod tests {
             .run_until(|_| Err(Error::Lifecycle("业务炸了".into())))
             .unwrap_err();
         assert!(e.to_string().contains("业务炸了"), "{e}");
-        assert_eq!(*log.borrow(), ["start:a", "stop:a"], "出错也要关闭");
+        assert_eq!(log.lock().unwrap().clone(), ["start:a", "stop:a"], "出错也要关闭");
         assert!(!app.is_running());
     }
 

@@ -15,9 +15,6 @@
 //! curl -i "http://127.0.0.1:8000/api/search?q=a"
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
 use rsboot::{
     Api, ApiError, App, Config, Context, FromRequest, ParamDoc, Path, Query, Response, RouteDoc,
     Router, Status,
@@ -90,11 +87,9 @@ fn main() -> rsboot::Result<()> {
         })
         .unwrap();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    println!("监听 http://127.0.0.1:8000，Ctrl+C 退出");
+    println!("监听 http://127.0.0.1:8000，Ctrl+C / SIGTERM 优雅退出");
 
-    // 这里没有接信号库：Ctrl+C 会直接结束进程（容器里 SIGTERM 也是）。
-    // 需要"先回 200 再退出"的灰度下线，请用自己的 SIGTERM 处理去置位 stop。
-    let _ = Ordering::Relaxed;
-    app.serve_with("127.0.0.1:8000", router, stop)
+    // `serve` 会装好 SIGINT/SIGTERM：收到信号后停止 accept、等 worker 收尾、
+    // 逆序关闭模块，然后再退出。不需要外部再加一套信号处理。
+    app.serve(router)
 }
