@@ -3,9 +3,16 @@ name = "rsboot"
 version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.80"
-description = "Planned CLI for the rsbatis ecosystem (scaffold / generate / migrate). Name reserved; no API yet."
+description = "A FastAPI-style application framework for rsbatis: declarative routes, typed path/query/body extraction, automatic OpenAPI docs and Swagger UI. Self-hosted HTTP/1.1 stack (no axum/hyper)."
 license = "MIT OR Apache-2.0"
-keywords = ["orm", "sql", "cli", "scaffold", "database"]
-categories = ["database", "command-line-utilities"]
+keywords = ["orm", "web", "framework", "fastapi", "openapi"]
+categories = ["web-programming::http-server", "database"]
 readme = "README.md"
 documentation = "https://docs.rs/rsboot"
+
+[dependencies]
+rsbatis = { version = "0.1.0-alpha.29", path = "../rsbatis", features = ["sqlite", "mysql", "migrate"] }
+# JSON 是 Web 框架的必需品，serde 生态无法替代
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 从类型生成 JSON Schema，OpenAPI 自动文档靠它（FastAPI 靠 pydantic 做同一件事）
