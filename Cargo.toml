@@ -16,3 +16,6 @@ rsbatis = { version = "0.1.0-alpha.29", path = "../rsbatis", features = ["sqlite
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 从类型生成 JSON Schema，OpenAPI 自动文档靠它（FastAPI 靠 pydantic 做同一件事）
+# 查询串反序列化。引它而不是手搓：重复键、% 编码、`+` 当空格这些细节
+# 自己实现必然出错，而它只有几十行代码
+serde_urlencoded = "0.7"

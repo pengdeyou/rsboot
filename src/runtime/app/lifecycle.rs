@@ -13,6 +13,8 @@ use crate::runtime::context::Context;
 impl App {
     /// 启动：先跑迁移（若开启），再按注册顺序启动模块。
     pub fn start(&mut self) -> Result<()> {
+        // panic hook 只装一次：日志里带上线程名与请求 trace
+        crate::web::exception::install_panic_hook();
         // 热加载先起：迁移/模块启动期间改配置也能被接住
         if let Some(plan) = &self.reload {
             match crate::config::watcher::Watcher::spawn(self.ctx.config_slot(), plan.to_spec())

@@ -89,6 +89,7 @@ impl Environment {
                 ("http.bind", "127.0.0.1:8000"),
                 ("http.cors.allow_origin", "http://localhost:*"),
                 ("reload.enabled", "true"),
+                ("http.envelope", "false"),
             ],
             Environment::Prod => vec![
                 ("log.format", "json"),
@@ -96,6 +97,7 @@ impl Environment {
                 ("http.docs", "false"),
                 ("http.max_body_bytes", "1048576"),
                 ("reload.enabled", "false"),
+                ("http.envelope", "false"),
                 // 刻意不填 http.bind：默认绑 0.0.0.0 是事故之源，必须由使用者写出来
             ],
         }

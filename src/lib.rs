@@ -27,7 +27,11 @@ pub mod web;
 pub use config::{Config, Environment};
 pub use error::{Error, Result};
 pub use runtime::{App, Builder, Context, DbHealth, Module};
-pub use web::{ApiError, IntoResponse, Method, Response, Status};
+pub use web::{
+    Api, ApiError, ApiKey, ApiResult, Bearer, Envelope, FromRequest, IntoApiError, IntoResponse, Json,
+    Method, Path, Query, Request,
+    Response, Router, Status,
+};
 
 /// 版本号来自 Cargo.toml，供 `/health` 与启动日志展示。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
