@@ -17,6 +17,7 @@
 //! "等待请用 `rsboot::sleep` 或框架提供的 I/O 原语"。
 
 pub mod co;
+pub mod net;
 pub mod sched;
 
 use std::time::Duration;

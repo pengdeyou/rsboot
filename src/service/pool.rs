@@ -41,6 +41,7 @@ impl Pool {
         if let Ok(mut q) = self.idle.lock() {
             if let Some(s) = q.pop_front() {
                 // 上一轮设过读超时，这里要按当前配置重置（配置可能热加载过）
+                let _ = s.set_nonblocking(false);
                 let _ = s.set_read_timeout(Some(read_timeout));
                 let _ = s.set_write_timeout(Some(read_timeout));
                 return Ok(s);
@@ -59,6 +60,7 @@ impl Pool {
         })?;
         let s = TcpStream::connect_timeout(&addr, self.connect_timeout)?;
         s.set_nodelay(true)?;
+        s.set_nonblocking(false)?;
         s.set_read_timeout(Some(read_timeout))?;
         s.set_write_timeout(Some(read_timeout))?;
         Ok(s)

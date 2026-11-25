@@ -22,7 +22,7 @@
 //! 自研 HTTP/1.1 栈里没有，也不会为了下游调用引进来——那等于把"零依赖"
 //! 这个最大的优点换掉。跨公网调用请走内网服务或网关。
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -290,14 +290,14 @@ impl Service {
     /// 发一次（不含重试）。
     fn once(&self, req: &wire::WireRequest) -> Attempt {
         // 熔断器在 send 里判，这里不再判：一次请求只查一次
-        let mut stream = match self.pool.take(self.cfg.timeout) {
+        let stream = match self.pool.take(self.cfg.timeout) {
             Ok(s) => s,
             Err(e) => {
                 return Attempt::Failed(ServiceError::Connect(format!("{}：{e}", self.cfg.host)), true)
             }
         };
         let bytes = req.serialize();
-        if let Err(e) = stream.write_all(&bytes) {
+        if let Err(e) = crate::server::mn::net::write_all(&stream, &bytes) {
             // 一个字节都没写出去才是"没送达"；write_all 失败无法区分，
             // 保守按"不确定"处理（非幂等方法因此不会重试）
             let _ = e;
@@ -306,13 +306,13 @@ impl Service {
                 false,
             );
         }
-        let mut reader = match stream.try_clone() {
-            Ok(s) => BufReader::new(s),
-            Err(e) => {
-                return Attempt::Failed(ServiceError::Transport(format!("{e}")), false);
-            }
+        // 借用而非 `try_clone`：省一次 fd dup，顺便让读走上协程链路。
+        // `BufReader` 在块结束时就 drop，之后 `stream` 才能移交给连接池。
+        let resp = {
+            let mut reader = BufReader::new(crate::server::mn::net::CoReader(&stream));
+            wire::read_response(&mut reader, self.cfg.max_body)
         };
-        match wire::read_response(&mut reader, self.cfg.max_body) {
+        match resp {
             Ok(r) => {
                 // 一问一答读完了，连接可以复用（残留数据会让下轮解析失败并触发重试）
                 self.pool.give(stream);

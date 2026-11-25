@@ -432,7 +432,17 @@ impl Server {
                         // 拼出本轮要等的 fd（唤醒器恒在 items[0]），然后真阻塞。
                         // 兜底超时只防"唤醒漏了"，正常路径由 `Waker` 立刻叫醒：
                         // 派发方 push 进队列之后才 notify，所以醒来必能 try_recv 到。
-                        ps.reset_conns(conns.iter().filter_map(|c| c.raw_fd()));
+                        // 协程在等哪个 socket，就把它一并交给 `poll`——这是让
+                        // "DB/下游调用"也能让出的全部机制。`n_conns` 记下分界点：
+                        // 就绪下标小于它是连接，大于等于它是等待表里的 fd。
+                        let n_conns = conns.len();
+                        let wait_fds = mn::sched::wait_fds();
+                        ps.reset_conns(
+                            conns
+                                .iter()
+                                .filter_map(|c| c.raw_fd())
+                                .chain(wait_fds),
+                        );
                         // 队列里还有待跑的协程就立刻回来继续推进，别在 poll 里等
                         let idle = if mn::sched::pending() > 0 { 0 } else { WORKER_IDLE_MS };
                         if let Err(e) = ps.wait(idle) {
@@ -455,6 +465,13 @@ impl Server {
                         // `ready` 天然升序，所以从后往前遍历即可，无需排序。
                         for k in (0..ps.ready_len()).rev() {
                             let idx = ps.ready_at(k);
+                            if idx >= n_conns {
+                                // 等待表里的 fd 就绪：把那个协程放回队列。
+                                // 必须降序（同下面的理由）：`wake_wait` 内部也
+                                // 用 `swap_remove`。
+                                mn::sched::wake_wait(idx - n_conns);
+                                continue;
+                            }
                             if idx >= conns.len() {
                                 continue;
                             }

@@ -172,6 +172,9 @@ struct Local {
     /// 交给汇编直接写——经由 `RefCell` 的 `&mut` 逃逸成裸指针会踩借用规则。
     sp: std::cell::Cell<*mut u8>,
     current: TaskPtr,
+    /// 正在等 fd 就绪的协程。worker 每轮会把它们的 fd 拼进 `poll`，
+    /// 就绪时把协程放回队列——这是"等 socket 也能让出"的全部机制。
+    waits: Vec<(std::os::raw::c_int, TaskPtr)>,
 }
 
 thread_local! {
@@ -188,6 +191,7 @@ pub fn init(runtime: Arc<Runtime>, id: usize, shared: Arc<Shared>) {
             runtime,
             sp: std::cell::Cell::new(std::ptr::null_mut()),
             current: TaskPtr(std::ptr::null_mut()),
+            waits: Vec::new(),
         });
     });
 }
@@ -241,6 +245,49 @@ pub fn pump(limit: usize) -> usize {
         done += 1;
     }
     done
+}
+
+/// 协程里调用：等 `fd` 可读/可写就绪，期间让出 worker。
+///
+/// 调用前应先用 0 超时的 `poll` 检查一次——已经就绪就别折腾调度器。
+pub fn wait_fd(fd: std::os::raw::c_int) {
+    let t = current_task();
+    if t.0.is_null() {
+        return;
+    }
+    with_local(|l| l.waits.push((fd, t)));
+    unsafe {
+        // deadline 留空：worker 看到 Blocked 但没 deadline 就不会去排定时器
+        t.get().deadline.set(None);
+        t.get().state.set(TaskState::Blocked);
+        t.get().suspend(my_sp());
+    }
+}
+
+/// worker 拼 `poll` 用的等待 fd 列表。
+pub fn wait_fds() -> Vec<std::os::raw::c_int> {
+    with_local(|l| l.waits.iter().map(|(fd, _)| *fd).collect()).unwrap_or_default()
+}
+
+/// 某个等待项就绪：把协程放回队列并移出等待表。
+///
+/// **调用方必须按下标降序处理**：`swap_remove` 会把尾部搬到当前位置，
+/// 升序会让后面的下标指向别人（这正是 S9 缺陷 D 的同款问题）。
+pub fn wake_wait(i: usize) {
+    let picked: Option<(Arc<Shared>, TaskPtr)> = with_local(|l| {
+        if i < l.waits.len() {
+            let (_, t) = l.waits.swap_remove(i);
+            Some((Arc::clone(&l.shared), t))
+        } else {
+            None
+        }
+    })
+    .flatten();
+    let Some((shared, t)) = picked else {
+        return;
+    };
+    unsafe { t.get().state.set(TaskState::Runnable) };
+    shared.queue.lock().unwrap().push_back(t);
 }
 
 /// 队列里还有多少待跑。

@@ -119,6 +119,11 @@ unsafe impl Send for TaskPtr {}
 unsafe impl Sync for TaskPtr {}
 
 impl TaskPtr {
+    /// 取任务引用。
+    ///
+    /// # Safety
+    ///
+    /// 指针必须指向一个仍然存活的任务，且调用者所在线程是它的属主 worker。
     pub unsafe fn get<'a>(self) -> &'a Task {
         unsafe { &*self.0 }
     }
