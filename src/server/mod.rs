@@ -50,6 +50,9 @@ const MAX_ACCEPT_PER_WAIT: usize = 64;
 /// 这个值只在"唤醒链路漏了一处"时兜底，防止 worker 永久卡在 `poll` 里关不掉。
 /// 它不再决定延迟，也不再决定空闲 CPU（那是 `Waker` 的活）。
 const WORKER_IDLE_MS: i32 = 500;
+/// listen backlog。std 硬编码 128，短连接突发下会丢 SYN（见 `raise_backlog`）。
+/// 实际生效值由 `net.core.somaxconn` 截断。
+const LISTEN_BACKLOG: i32 = 1024;
 
 const ST_SERVING: u8 = 0;
 const ST_DRAINING: u8 = 1;
@@ -156,6 +159,7 @@ impl Server {
         let listener = TcpListener::bind(addr).map_err(|e| {
             Error::Config(format!("监听 {addr} 失败：{e}。端口被占用，或地址格式不对"))
         })?;
+        raise_backlog(&listener);
         let addr = listener
             .local_addr()
             .map_err(|e| Error::Lifecycle(format!("读取监听地址失败：{e}")))?;
@@ -495,6 +499,40 @@ impl std::fmt::Debug for Server {
             .finish()
     }
 }
+
+/// 把 listen backlog 抬到 `LISTEN_BACKLOG`。
+///
+/// `std::net::TcpListener::bind` 内部把 backlog 硬编码成 **128**。短连接或突发
+/// 流量下这个值很容易被打满：内核开始丢 SYN，客户端按 RTO 重传，现象是
+/// "平均很快、偶尔几百毫秒"的尾部尖峰——只看均值完全查不出来。
+///
+/// 对**已经 listen** 的 socket 再调一次 `listen(fd, n)` 是 POSIX 允许的，
+/// 内核会更新 backlog 上限，不影响已排队的连接。所以不需要自己重写
+/// `socket/bind/listen` 那一套，也就不会引入地址解析与 IPv6 的坑。
+///
+/// 实际生效值会被 `net.core.somaxconn` 截断，设大了无害。
+#[cfg(unix)]
+fn raise_backlog(l: &TcpListener) {
+    use std::os::raw::c_int;
+    use std::os::unix::io::AsRawFd;
+
+    unsafe extern "C" {
+        fn listen(fd: c_int, backlog: c_int) -> c_int;
+    }
+
+    // SAFETY: fd 由 `l` 持有且此刻正在 listen，只调整 backlog 数值。
+    let rc = unsafe { listen(l.as_raw_fd(), LISTEN_BACKLOG) };
+    if rc != 0 {
+        // 抬不上去不该让服务起不来：留在系统默认值，记一行日志
+        eprintln!(
+            "[rsboot] 调整 listen backlog 失败（保持系统默认）：{}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_backlog(_l: &TcpListener) {}
 
 fn reject_overloaded(mut s: TcpStream) {
     let body = "{\"detail\":\"服务繁忙，worker 队列已满\"}";
