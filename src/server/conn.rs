@@ -257,6 +257,14 @@ impl Conn {
         resp.headers.insert("x-request-id", &trace);
 
         let head_only = matches!(parsed.method, Method::Head);
+        // 热路径走 fd 直写：大 body 用 `writev` 省一次 memcpy 与大块分配。
+        // 泛型版留给测试（它要能用 `Vec<u8>` 当输出）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            write::write_response_fd(self.stream.as_raw_fd(), &resp, parsed.close, head_only)?;
+        }
+        #[cfg(not(unix))]
         write::write_response(&mut self.stream, &resp, parsed.close, head_only)?;
         self.served += 1;
         if parsed.close {

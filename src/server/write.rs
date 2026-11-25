@@ -30,14 +30,32 @@ pub fn write_response<W: Write>(
     close: bool,
     head_only: bool,
 ) -> io::Result<()> {
-    let status = resp.status;
-    let body_forbidden = status.0 == 204 || status.0 == 304;
-
     let mut buf: Vec<u8> = Vec::with_capacity(96 + resp.headers.len() * 32 + resp.body.len());
+    fill_head(&mut buf, resp, close);
+    if body_forbidden(resp) || head_only {
+        // 不写 body
+    } else {
+        buf.extend_from_slice(&resp.body);
+    }
+    out.write_all(&buf)?;
+    out.flush()
+}
+
+/// `204/304` 一律不允许带 body（RFC 7230）。
+fn body_forbidden(resp: &Response) -> bool {
+    resp.status.0 == 204 || resp.status.0 == 304
+}
+
+/// 把状态行 + 全部头写进 `buf`（到结尾的 CRLF 为止）。
+///
+/// 抽出来是为了让"泛型写出"和"fd 直写（大 body 走 `writev`）"两条路径
+/// 拼出**完全相同**的头字节——两份实现迟早跑偏。
+fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool) {
+    let status = resp.status;
 
     // 状态行
     buf.extend_from_slice(b"HTTP/1.1 ");
-    let _ = write!(&mut buf, "{}", status.0);
+    let _ = write!(buf, "{}", status.0);
     buf.push(b' ');
     buf.extend_from_slice(status.reason().as_bytes());
     buf.extend_from_slice(b"\r\n");
@@ -49,9 +67,9 @@ pub fn write_response<W: Write>(
     buf.extend_from_slice(b"\r\nserver: ");
     buf.extend_from_slice(SERVER.as_bytes());
     buf.extend_from_slice(b"\r\n");
-    if !body_forbidden {
+    if !body_forbidden(resp) {
         buf.extend_from_slice(b"content-length: ");
-        let _ = write!(&mut buf, "{}", resp.body.len());
+        let _ = write!(buf, "{}", resp.body.len());
         buf.extend_from_slice(b"\r\n");
     }
     if close {
@@ -76,12 +94,126 @@ pub fn write_response<W: Write>(
     }
     buf.extend_from_slice(b"\r\n");
 
-    if !head_only && !body_forbidden {
-        buf.extend_from_slice(&resp.body);
+}
+
+/// 大 body 的阈值：超过它就改走 `writev`，body 不再拷进 head 缓冲。
+///
+/// 小响应（绝大多数 API）应该继续"拼一条 + 单次 write"：那是最省的形态，
+/// 退回两次 `write` 反而更慢。大响应才值得为省一次 memcpy 付一次 `writev`。
+#[cfg(unix)]
+const WRITEV_THRESHOLD: usize = 8 * 1024;
+
+/// 直接写 fd 的响应路径，供服务端热路径使用。
+///
+/// 与泛型版返回的字节**完全一致**（head 由同一个 `fill_head` 拼），区别只在
+/// 大 body 的写法：
+///
+/// - body 小于阈值：拼成一条再 `write_all`（一次系统调用，无额外 iovec 开销）
+/// - body 大于阈值：`head` 与 `body` 两段 iovec 一次 `writev`，**body 零拷贝**，
+///   也不再为它分配一块与 body 等大的缓冲（64KB 响应每请求省一次 64KB 分配）
+#[cfg(unix)]
+pub fn write_response_fd(
+    fd: std::os::raw::c_int,
+    resp: &Response,
+    close: bool,
+    head_only: bool,
+) -> io::Result<()> {
+    let mut head: Vec<u8> = Vec::with_capacity(96 + resp.headers.len() * 32);
+    fill_head(&mut head, resp, close);
+
+    let body: &[u8] = if head_only || body_forbidden(resp) {
+        &[]
+    } else {
+        &resp.body
+    };
+
+    if body.len() <= WRITEV_THRESHOLD {
+        head.extend_from_slice(body);
+        return write_all_fd(fd, &head);
+    }
+    writev_all(fd, &head, body)
+}
+
+#[cfg(unix)]
+fn write_all_fd(fd: std::os::raw::c_int, mut buf: &[u8]) -> io::Result<()> {
+    use std::os::raw::{c_int, c_void};
+    unsafe extern "C" {
+        fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
+    }
+    while !buf.is_empty() {
+        // SAFETY: fd 由调用方保证有效，buf 是有效切片。
+        let n = unsafe { write(fd, buf.as_ptr().cast::<c_void>(), buf.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            // EINTR：被信号打断，重试
+            if e.raw_os_error() == Some(4) {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        buf = &buf[n as usize..];
+    }
+    Ok(())
+}
+
+/// `writev` 一次写出两段，并正确处理部分写。
+///
+/// 部分写是必须处理的：`writev` 返回的是"这次写进去多少字节"，可能小于两段之和
+/// （内核发送缓冲满、被信号打断等）。不处理就等于静默截断响应——客户端会挂住
+/// 等剩下的 content-length。
+#[cfg(unix)]
+fn writev_all(fd: std::os::raw::c_int, head: &[u8], body: &[u8]) -> io::Result<()> {
+    use std::os::raw::{c_int, c_void};
+
+    #[repr(C)]
+    struct IoVec {
+        base: *const c_void,
+        len: usize,
     }
 
-    out.write_all(&buf)?;
-    out.flush()
+    unsafe extern "C" {
+        fn writev(fd: c_int, iov: *const IoVec, cnt: c_int) -> isize;
+    }
+
+    let mut a: &[u8] = head;
+    let mut b: &[u8] = body;
+    while !a.is_empty() || !b.is_empty() {
+        let iov = [
+            IoVec {
+                base: a.as_ptr().cast::<c_void>(),
+                len: a.len(),
+            },
+            IoVec {
+                base: b.as_ptr().cast::<c_void>(),
+                len: b.len(),
+            },
+        ];
+        // SAFETY: 两个 iovec 都指向有效切片，cnt 如实为 2。
+        let n = unsafe { writev(fd, iov.as_ptr(), 2) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(4) {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        // 推进游标：先消耗 head，跨过了再消耗 body
+        let n = n as usize;
+        if n < a.len() {
+            a = &a[n..];
+        } else {
+            let rest = n - a.len();
+            a = &[];
+            b = &b[rest.min(b.len())..];
+        }
+    }
+    Ok(())
 }
 
 /// `server` 头是常量：没必要每响应 `format!` 一次
@@ -168,6 +300,70 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+
+    // 两条写出路径必须产出**完全相同**的字节：head 共用 `fill_head`，
+    // 只有 body 的写法不同（拼接 vs writev）。这里把两条路径的字节逐一对齐，
+    // 小 body 与大 body（跨过 writev 阈值）各测一次。
+    #[cfg(unix)]
+    fn drain_fd_path(resp: &crate::web::response::Response, close: bool, head_only: bool) -> Vec<u8> {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = std::net::TcpStream::connect(addr).unwrap();
+        let (mut s, _) = l.accept().unwrap();
+        // 6 万字节的 body 用默认缓冲可能写满就阻塞，读端要先开读
+        let h = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            got
+        });
+        super::write_response_fd(c.as_raw_fd(), resp, close, head_only).unwrap();
+        drop(c);
+        h.join().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_path_matches_generic_path() {
+        use crate::web::http::Status;
+
+        for size in [0usize, 10, 4096, 8 * 1024, 20_000, 64 * 1024] {
+            let body = vec![b'x'; size];
+            let resp = crate::web::response::Response::json(&body);
+            let mut want = Vec::new();
+            super::write_response(&mut want, &resp, false, false).unwrap();
+            let got = drain_fd_path(&resp, false, false);
+            assert_eq!(
+                got, want,
+                "body={size} 时 fd 路径与泛型路径字节不一致（len {} vs {}）",
+                got.len(),
+                want.len()
+            );
+        }
+
+        // HEAD：不写 body，但必须保留 content-length
+        let resp = crate::web::response::Response::json(&vec![b'y'; 20_000]);
+        let mut want = Vec::new();
+        super::write_response(&mut want, &resp, true, true).unwrap();
+        let got = drain_fd_path(&resp, true, true);
+        assert_eq!(got, want, "HEAD 响应两条路径不一致");
+        assert!(
+            String::from_utf8_lossy(&got).contains("content-length: 20000"),
+            "HEAD 也要带 content-length"
+        );
+
+        // 204：既没有 body 也没有 content-length
+        let mut resp = crate::web::response::Response::new(Status::NO_CONTENT);
+        resp.body = vec![b'z'; 20_000];
+        let got = drain_fd_path(&resp, false, false);
+        assert!(
+            !String::from_utf8_lossy(&got).contains("content-length"),
+            "204 不能带 content-length"
+        );
+        assert!(got.ends_with(b"\r\n\r\n"), "204 之后不该有多余 body");
+    }
     use super::*;
     use crate::web::http::Status;
 
