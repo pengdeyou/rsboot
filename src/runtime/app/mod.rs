@@ -50,6 +50,8 @@ pub struct App {
     /// 对外服务状态。和每个 worker 的 `Context` 里那一个是同一个 `Arc`，
     /// 所以 handler 读到的是主线程 accept 循环写的值。
     pub(crate) status: crate::server::ServeStatus,
+    /// 连接借调的累计迁移计数（可选）。给了就由 `Server` 往里累加。
+    pub(crate) rebalance_stats: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// 热加载所需的一切输入。放在这里而不是 Builder：它是运行期行为。
@@ -74,6 +76,15 @@ impl ReloadPlan {
 }
 
 impl App {
+    /// 把连接借调的累计迁移数写进外部计数器。
+    ///
+    /// 用途有两个：测试断言借调**真的发生了**（否则"响应都正常"这种断言
+    /// 在借调完全没触发时也会绿，等于安慰剂）；运维上也能看到 worker 之间
+    /// 是否长期失衡。
+    pub fn rebalance_stats(&mut self, h: Arc<std::sync::atomic::AtomicUsize>) {
+        self.rebalance_stats = Some(h);
+    }
+
     pub fn builder() -> Builder {
         Builder::new()
     }

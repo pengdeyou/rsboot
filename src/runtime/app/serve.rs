@@ -97,11 +97,17 @@ impl App {
 
         // 端口被占之类的失败也要把已启动的模块收干净，不能带着半启动状态退出
         let server = match Server::bind(addr, Arc::clone(&router), factory, limits, workers) {
-            Ok(s) => s
-                .on_worker_exit(exit)
-                .grace(grace)
-                .drain(drain)
-                .status(self.status.clone()),
+            Ok(s) => {
+                let s = s
+                    .on_worker_exit(exit)
+                    .grace(grace)
+                    .drain(drain)
+                    .status(self.status.clone());
+                match &self.rebalance_stats {
+                    Some(h) => s.rebalance_stats(Arc::clone(h)),
+                    None => s,
+                }
+            }
             Err(e) => return Err(self.unwind(e)),
         };
 

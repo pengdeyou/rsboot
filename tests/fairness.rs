@@ -173,3 +173,84 @@ fn three_connections_ready_at_once_each_get_their_own_response() {
         }
     }
 }
+
+// 第三个坑（50 线程基准暴露出来的）：连接按 rr 静态均分给 worker，
+// **连接数一样不等于负载一样**。实测两个 worker 的 CPU 能差 24%
+// （2.72s vs 2.20s），吞吐被慢的那个拖住。修法是按累计处理量做周期性借调。
+//
+// 这条测试构造一个明确失衡的场景：一条连接狂发，其余空闲，
+// 断言借调**真的发生了**（计数 > 0），且所有连接在被搬动之后仍然正确应答。
+//
+// 为什么必须断言计数：只断言"响应都正常"是不够的——如果借调压根没触发，
+// 那个测试照样绿，等于安慰剂。计数为 0 就说明没覆盖到迁移路径。
+
+#[test]
+fn idle_connections_get_rebalanced_when_one_worker_is_swamped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let addr = format!("127.0.0.1:{}", free_port());
+    let a2 = addr.clone();
+    let moved = Arc::new(AtomicUsize::new(0));
+    let moved2 = Arc::clone(&moved);
+
+    std::thread::spawn(move || {
+        let cfg = Config::new()
+            .set("app.env", "dev")
+            .set("http.workers", "2")
+            // 忙连接 400ms 内会发上万请求，默认每条连接 100 个请求就主动关闭，
+            // 客户端复用到已关闭的连接会拿到 ConnectionReset —— 与借调无关
+            .set("http.max_requests", "1000000")
+            .set("http.log.requests", "false");
+        let mut app = App::builder()
+            .config(cfg)
+            .database("default", "sqlite://:memory:")
+            .build()
+            .unwrap();
+        let router = Router::new()
+            .get("/a", |_, _| Response::json(br#"{"v":"a"}"#))
+            .unwrap();
+        app.rebalance_stats(moved2);
+        let _ = app.serve_with(&a2, router, Arc::new(AtomicBool::new(false)));
+    });
+    wait_ready(&addr);
+
+    // 6 条独立 keep-alive 连接，rr 分给 2 个 worker
+    let conns: Vec<Arc<Service>> = (0..6).map(|_| client(&addr)).collect();
+    for c in &conns {
+        assert_eq!(c.get("/a").send().unwrap().status, 200);
+    }
+
+    // 只让第一条连接狂发 400ms：它的 worker 累计处理量迅速超出另一个 30%，
+    // 两次检查周期（200ms）内必然触发借调
+    let busy = Arc::clone(&conns[0]);
+    let t = std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut n = 0usize;
+        while start.elapsed() < Duration::from_millis(400) {
+            busy.get("/a").send().unwrap();
+            n += 1;
+        }
+        n
+    });
+    let n = t.join().unwrap();
+    assert!(n > 50, "忙连接只发了 {n} 个请求，构造不出失衡");
+
+    // 借调是异步的：给一个检查周期多一点的时间
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        moved.load(Ordering::Relaxed) > 0,
+        "借调一次都没发生：失衡场景没被纠正（计数=0 说明这段逻辑没被覆盖）"
+    );
+
+    // 被搬动过的连接必须仍然可用，而且不能串响应
+    for (i, c) in conns.iter().enumerate() {
+        for _ in 0..3 {
+            let r = c.get("/a").send().unwrap();
+            assert_eq!(r.status, 200, "连接 {i} 迁移后失败");
+            assert!(
+                String::from_utf8_lossy(&r.body).contains(r#"{"v":"a"}"#),
+                "连接 {i} 迁移后串了响应"
+            );
+        }
+    }
+}

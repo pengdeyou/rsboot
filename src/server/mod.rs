@@ -53,6 +53,14 @@ const WORKER_IDLE_MS: i32 = 500;
 /// listen backlog。std 硬编码 128，短连接突发下会丢 SYN（见 `raise_backlog`）。
 /// 实际生效值由 `net.core.somaxconn` 截断。
 const LISTEN_BACKLOG: i32 = 1024;
+/// 连接借调的检查周期。太短会让 worker 频繁搬连接（连接迁移有成本），
+/// 太长则失衡要持续一段时间才被纠正。
+const REBALANCE_EVERY: Duration = Duration::from_millis(200);
+/// 手上至少要有这么多连接才考虑借调。2 条时搬走一半只会让两边来回乒乓，
+/// 3 条起才有意义（搬 1 条、剩 2 条）。
+const REBALANCE_MIN_CONNS: usize = 3;
+/// 自己累计处理量超过同行的这个百分比才触发借调。取 130 表示"多干 30%"。
+const REBALANCE_TRIGGER_PCT: usize = 130;
 
 const ST_SERVING: u8 = 0;
 const ST_DRAINING: u8 = 1;
@@ -136,6 +144,8 @@ pub struct Server {
     /// 收到关闭信号后先当"跛鸭"服务多久。这段时间里照常接客，
     /// 给 LB / k8s 摘流量的时间。0 表示立刻停 accept。
     drain: Duration,
+    /// 连接借调的累计计数（迁移了多少条连接）。给测试与运维观测用。
+    rebalance_stats: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// 对外可见的服务状态
     status: ServeStatus,
     /// 是否把 SIGINT/SIGTERM 也当作关闭信号
@@ -174,6 +184,7 @@ impl Server {
             on_worker_exit: None,
             grace: Duration::from_secs(10),
             drain: Duration::ZERO,
+            rebalance_stats: None,
             status: ServeStatus::new(),
             watch_signal: true,
         })
@@ -192,6 +203,15 @@ impl Server {
     /// 关闭时等 worker 收尾的预算。默认 10 秒。
     pub fn grace(mut self, d: Duration) -> Self {
         self.grace = d;
+        self
+    }
+
+    /// 观测钩子：把"连接借调累计迁移了多少条连接"写进外部计数器。
+    ///
+    /// 这个数对运维是有意义的：持续增长说明 worker 之间负载长期不均
+    /// （例如长连接大量集中在某一匹 worker 上），值得关注而不是无视。
+    pub fn rebalance_stats(mut self, h: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.rebalance_stats = Some(h);
         self
     }
 
@@ -231,13 +251,34 @@ impl Server {
         // "别再给我派新请求了"，而不是只靠主线程停 accept。
         let closing = Arc::new(AtomicBool::new(false));
 
-        for i in 0..workers {
+        // 先建好全部队列与唤醒器，再 spawn。原因：连接借调（见 worker 里的
+        // `rebalance`）需要 worker 能往**别人**的队列里塞连接，所以每个 worker
+        // 都得持有全部 sender / waker，这些必须先齐。
+        let mut receivers: Vec<Option<std::sync::mpsc::Receiver<Conn>>> =
+            Vec::with_capacity(workers);
+        for _ in 0..workers {
             let (tx, rx) = sync_channel::<Conn>(256);
             senders.push(tx);
-            let waker = poll::Waker::new()
-                .map_err(|e| Error::Lifecycle(format!("创建唤醒器失败：{e}")))?;
-            wakers.push(waker.clone());
+            receivers.push(Some(rx));
+            wakers.push(
+                poll::Waker::new()
+                    .map_err(|e| Error::Lifecycle(format!("创建唤醒器失败：{e}")))?,
+            );
+        }
+        let senders = Arc::new(senders);
+        let wakers = Arc::new(wakers);
+        // 每 worker 的累计处理请求数，用于连接借调
+        let rebalance_stats = self.rebalance_stats.clone();
+        let served: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+            (0..workers)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        );
 
+        for i in 0..workers {
+            let rx = receivers[i]
+                .take()
+                .expect("每个 worker 的接收端只取一次");
             let router = Arc::clone(&self.router);
             let factory = Arc::clone(&self.factory);
             let limits = self.limits;
@@ -245,6 +286,11 @@ impl Server {
             let close = Arc::clone(&closing);
             let on_exit = self.on_worker_exit.clone();
             let ready = ready_tx.clone();
+            let my_waker = wakers[i].clone();
+            let rebalance_stats = rebalance_stats.clone();
+            let all_senders = Arc::clone(&senders);
+            let all_wakers = Arc::clone(&wakers);
+            let served = Arc::clone(&served);
             let handle = std::thread::Builder::new()
                 .name(format!("rsboot-w{i}"))
                 .spawn(move || {
@@ -275,7 +321,13 @@ impl Server {
                     // 而且不需要为每条连接开线程。
                     let mut conns: Vec<Conn> = Vec::new();
                     // 常驻的 poll 集合：fd 数组与就绪缓冲只分配一次
-                    let mut ps = poll::PollSet::with_waker(waker.read_fd());
+                    let mut ps = poll::PollSet::with_waker(my_waker.read_fd());
+                    let mut last_rebalance = std::time::Instant::now();
+                    // 连接借调的冷却：刚被塞过连接的 worker 先别又把它们送回去
+                    // （否则两个 worker 会互相推诿，连接在队列里空转）
+                    let mut stole_at = std::time::Instant::now()
+                        .checked_sub(REBALANCE_EVERY)
+                        .unwrap_or_else(std::time::Instant::now);
                     loop {
                         // 关闭必须能立刻生效：worker 自己握着 sender，
                         // 光靠 "主线程 drop senders" 永远收不到 Disconnected。
@@ -292,8 +344,67 @@ impl Server {
                         }
 
                         // 先把新派来的连接收进本地表
+                        let mut got_from_peer = false;
                         while let Ok(c) = rx.try_recv() {
                             conns.push(c);
+                            got_from_peer = true;
+                        }
+                        if got_from_peer {
+                            stole_at = std::time::Instant::now();
+                        }
+
+                        // 连接借调：静态按连接数均分 ≠ 负载均分。
+                        // 50 条连接里每条请求速率不同，实测两个 worker 的 CPU 能差
+                        // 24%（2.72s vs 2.20s），吞吐被慢的那个拖住。这里按**累计
+                        // 处理请求数**做周期性再平衡：干得比同行多 30% 就把一半连接
+                        // 交出去，交给累计最少的那个。
+                        if last_rebalance.elapsed() >= REBALANCE_EVERY
+                            && stole_at.elapsed() >= REBALANCE_EVERY
+                            && conns.len() >= REBALANCE_MIN_CONNS
+                            && workers > 1
+                        {
+                            last_rebalance = std::time::Instant::now();
+                            let mine = served[i].load(Ordering::Relaxed);
+                            let total: u64 = served
+                                .iter()
+                                .map(|c| c.load(Ordering::Relaxed))
+                                .sum();
+                            let avg = total / workers as u64;
+                            // 注意放大的倍数：`mine * 100 > avg * PCT` 才是"多 30%"
+                            // （写 10 会变成"多 12 倍"，是测试逼出来的真 bug）
+                            if mine * 100 > avg * (REBALANCE_TRIGGER_PCT as u64) {
+                                // 交给累计最少的同行（不含自己）
+                                let target = (0..workers)
+                                    .filter(|&j| j != i)
+                                    .min_by_key(|&j| served[j].load(Ordering::Relaxed))
+                                    .expect("workers > 1 时必然有别人");
+                                let give = conns.len() / 2;
+                                let mut moved = 0usize;
+                                for _ in 0..give {
+                                    let Some(c) = conns.pop() else { break };
+                                    match all_senders[target].try_send(c) {
+                                        Ok(()) => moved += 1,
+                                        Err(std::sync::mpsc::TrySendError::Full(c))
+                                        | Err(std::sync::mpsc::TrySendError::Disconnected(c)) => {
+                                            // 对方队列满/已退：放回自己手里，别再折腾
+                                            conns.push(c);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if moved > 0 {
+                                    if let Some(h) = &rebalance_stats {
+                                        h.fetch_add(moved, Ordering::Relaxed);
+                                    }
+                                    // 先入队后唤醒，和 accept 路径同一个顺序约束
+                                    all_wakers[target].notify();
+                                    // 记一笔"我欠对方"，避免下一轮又立刻判定自己超载
+                                    served[i].store(
+                                        served[i].load(Ordering::Relaxed) / 2,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            }
                         }
 
                         // 拼出本轮要等的 fd（唤醒器恒在 items[0]），然后真阻塞。
@@ -307,7 +418,7 @@ impl Server {
                         }
                         if ps.woken() {
                             // 不清零的话下一轮 poll 会立刻又返回，变成忙等
-                            waker.drain();
+                            my_waker.drain();
                         }
 
                         // 只处理就绪的连接。`swap_remove` + 处理 + 放回：O(1)
@@ -324,6 +435,7 @@ impl Server {
                                 continue;
                             }
                             let mut c = conns.swap_remove(idx);
+                            served[i].fetch_add(1, Ordering::Relaxed);
                             if let Ok(ConnOutcome::KeepAlive) =
                                 c.serve_once(&router, &ctx, &limits, &should_stop)
                             {
@@ -458,7 +570,7 @@ impl Server {
         status.set(ServeState::Closing);
         // worker 此时可能正阻塞在 poll 里（兜底超时 500ms），必须叫醒它们
         // 去看 should_stop，否则关闭会白等一个兜底周期。
-        for w in &wakers {
+        for w in wakers.iter() {
             w.notify();
         }
         drop(senders);

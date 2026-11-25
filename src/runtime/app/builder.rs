@@ -202,6 +202,7 @@ impl Builder {
             reload,
             watcher: None,
             status: crate::server::ServeStatus::new(),
+            rebalance_stats: None,
             services: registry,
         })
     }
