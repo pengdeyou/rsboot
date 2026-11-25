@@ -239,6 +239,9 @@ impl Server {
     /// 关闭过程：停止 accept → 丢弃 sender（worker 的 `recv` 返回错误）→
     /// 等 worker 把手上这条连接处理完 → join。进行中的请求不会被粗暴切断。
     pub fn run(self, shutdown: Arc<AtomicBool>) -> Result<()> {
+        // 先把数据库 socket 接到协程链路上：一次装好，之后所有
+        // `mysql+co://` 连接读写都会让出 worker。
+        mn::net::install_db_hooks();
         let workers = self.workers;
         let mut senders: Vec<SyncSender<Conn>> = Vec::with_capacity(workers);
         // 每 worker 一个唤醒器：派发连接给谁，就叫醒谁。这样 worker 的 poll
