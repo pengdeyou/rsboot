@@ -21,13 +21,17 @@ use std::collections::HashMap;
 use crate::error::{Error, Result};
 use crate::runtime::context::Context;
 use crate::web::error::ApiError;
+use crate::web::envelope::{self, Envelope};
 use crate::web::exception;
 use crate::web::http::{Method, Status};
 use crate::web::path::PathTemplate;
 use crate::web::request::Request;
 use crate::web::response::{IntoResponse, Response};
 
-pub type HandlerFn = Box<dyn Fn(&mut Request, &Context) -> Response>;
+/// handler 必须 `Send + Sync`：它会在多个 worker 线程里被调用。
+/// 这条约束会传导到闭包捕获的类型——捕获一个 `Rc` 或 `RefCell` 就编译不过，
+/// 那正是我们要的（那些类型跨线程用会出错）。
+pub type HandlerFn = Box<dyn Fn(&mut Request, &Context) -> Response + Send + Sync>;
 
 pub struct Route {
     pub method: Method,
@@ -79,7 +83,7 @@ impl Router {
     /// 静默获胜，这种"看起来生效了"的配置错误最难查。
     pub fn route<H, R>(mut self, method: Method, path: &str, handler: H) -> Result<Self>
     where
-        H: Fn(&mut Request, &Context) -> R + 'static,
+        H: Fn(&mut Request, &Context) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         let template = PathTemplate::parse(path).map_err(Error::Config)?;
@@ -109,7 +113,7 @@ impl Router {
 
     pub fn get<H, R>(self, path: &str, h: H) -> Result<Self>
     where
-        H: Fn(&mut Request, &Context) -> R + 'static,
+        H: Fn(&mut Request, &Context) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.route(Method::Get, path, h)
@@ -117,7 +121,7 @@ impl Router {
 
     pub fn post<H, R>(self, path: &str, h: H) -> Result<Self>
     where
-        H: Fn(&mut Request, &Context) -> R + 'static,
+        H: Fn(&mut Request, &Context) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.route(Method::Post, path, h)
@@ -125,7 +129,7 @@ impl Router {
 
     pub fn put<H, R>(self, path: &str, h: H) -> Result<Self>
     where
-        H: Fn(&mut Request, &Context) -> R + 'static,
+        H: Fn(&mut Request, &Context) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.route(Method::Put, path, h)
@@ -133,7 +137,7 @@ impl Router {
 
     pub fn patch<H, R>(self, path: &str, h: H) -> Result<Self>
     where
-        H: Fn(&mut Request, &Context) -> R + 'static,
+        H: Fn(&mut Request, &Context) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.route(Method::Patch, path, h)
@@ -141,7 +145,7 @@ impl Router {
 
     pub fn delete<H, R>(self, path: &str, h: H) -> Result<Self>
     where
-        H: Fn(&mut Request, &Context) -> R + 'static,
+        H: Fn(&mut Request, &Context) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.route(Method::Delete, path, h)
@@ -150,7 +154,7 @@ impl Router {
     /// 没有匹配时的处理器。不设置就回标准的 404 JSON。
     pub fn fallback<H, R>(mut self, h: H) -> Self
     where
-        H: Fn(&mut Request, &Context) -> R + 'static,
+        H: Fn(&mut Request, &Context) -> R + Send + Sync + 'static,
         R: IntoResponse + 'static,
     {
         self.fallback = Some(Box::new(move |req, ctx| h(req, ctx).into_response()));
@@ -172,6 +176,46 @@ impl Router {
 
     /// 分派。
     pub fn handle(&self, req: &mut Request, ctx: &Context) -> Response {
+        let resp = self.dispatch(req, ctx);
+        let mut resp = self.finalize(resp, req, ctx);
+
+        if req.method == Method::Head {
+            // HEAD 的语义是"和 GET 一样的头，但没有 body"。放在最外层，
+            // 这样 404 / 405 / panic 之后的 HEAD 同样不带 body——
+            // 之前只在成功分支清 body，导致 HEAD 404 会回一段 body。
+            resp.body.clear();
+            resp.headers.remove("content-length");
+        }
+        resp
+    }
+
+    /// 出口处的唯一一次"换皮"。
+    ///
+    /// 统一响应体开着的时候，错误必须和成功同形（`code`/`message`/`data`/`trace_id`）。
+    /// 但 handler 里 `return Err(e)` 走的是 `IntoResponse`，它拿不到配置，
+    /// 只能回裸 `{"detail":...}`——这就是"成功带 data、失败带 detail"的经典不一致。
+    /// 所以在这里统一处理：凡是带着 `api_error` 原件的响应，按开关重写一次。
+    fn finalize(&self, mut resp: Response, req: &Request, ctx: &Context) -> Response {
+        if !Envelope::from_config(&ctx.config()).on {
+            return resp;
+        }
+        if resp.status.0 < 400 {
+            return resp;
+        }
+        let Some(err) = resp.api_error.take() else {
+            return resp;
+        };
+        let mut wrapped = envelope::error(&err, Some(req), true);
+        // 405 之类会带 `allow`，换皮不能把这类业务头丢掉
+        for (k, v) in resp.headers.iter() {
+            if k.eq_ignore_ascii_case("allow") {
+                wrapped.headers.insert(k, v);
+            }
+        }
+        wrapped
+    }
+
+    fn dispatch(&self, req: &mut Request, ctx: &Context) -> Response {
         let seg_count = segment_count(&req.path);
         let first = first_segment(&req.path);
 
@@ -222,15 +266,10 @@ impl Router {
             let outcome = exception::with_trace(trace.as_deref(), || {
                 exception::guard(|| (r.handler)(req, ctx))
             });
-            let mut resp = match outcome {
+            let resp = match outcome {
                 Ok(resp) => resp,
                 Err(payload) => exception::panic_response(payload),
             };
-            if req.method == Method::Head {
-                // HEAD 的语义是"和 GET 一样的头，但没有 body"
-                resp.body.clear();
-                resp.headers.remove("content-length");
-            }
             return resp;
         }
 

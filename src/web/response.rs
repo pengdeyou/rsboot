@@ -17,6 +17,13 @@ pub struct Response {
     pub status: Status,
     pub headers: Headers,
     pub body: Vec<u8>,
+    /// 这条响应"本来是哪个错误"。
+    ///
+    /// `IntoResponse for Result<T, E>` 把 `E` 转成响应后，**统一响应体开关**
+    /// 还需要原始 `ApiError` 才能换成包装形状（`code`/`message`/`data`）。
+    /// 所以这里留一份原件：包装只是在出口处换皮，诊断信息一点不丢。
+    /// 关掉包装时这个字段被忽略，形状与裸 `detail` 完全一致。
+    pub api_error: Option<ApiError>,
 }
 
 impl Response {
@@ -25,6 +32,7 @@ impl Response {
             status,
             headers: Headers::new(),
             body: Vec::new(),
+            api_error: None,
         }
     }
 
@@ -38,6 +46,7 @@ impl Response {
             status,
             headers: Headers::new(),
             body: bytes.to_vec(),
+            api_error: None,
         };
         r.headers
             .insert("content-type", "application/json; charset=utf-8");
@@ -54,6 +63,7 @@ impl Response {
             status: Status::OK,
             headers: Headers::new(),
             body: s.into_bytes(),
+            api_error: None,
         };
         r.headers
             .insert("content-type", "text/plain; charset=utf-8");

@@ -90,7 +90,11 @@ mod tests {
     fn empty_body_is_reported_separately() {
         let mut r = post(b"");
         let e = Json::<Body>::from_request(&mut r).unwrap_err();
-        assert!(e.internal.unwrap_or_default().contains("空的"));
+        // 原因必须给到客户端（detail），不能只藏在 internal 里
+        assert!(e.detail.contains("空的"), "{:?}", e.detail);
+        // 没有具体字段名时 loc 只有一层，不能出现 ["body", ""]
+        let body: serde_json::Value = serde_json::from_slice(&e.to_response().body).unwrap();
+        assert_eq!(body["detail"][0]["loc"].as_array().unwrap().len(), 1);
     }
 
     #[test]

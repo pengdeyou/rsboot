@@ -90,13 +90,20 @@ pub fn error(err: &ApiError, req: Option<&Request>, on: bool) -> Response {
     let trace = req.and_then(|r| r.request_id());
     let code = code_of(err.status);
     let data = match (&err.loc, &err.kind) {
-        (Some((where_, name)), Some(kind)) => Some(serde_json::json!({
-            "fields": [{
-                "loc": [where_, name],
-                "msg": err.detail,
-                "type": kind,
-            }]
-        })),
+        (Some((where_, name)), Some(kind)) => {
+            let loc = if name.is_empty() {
+                serde_json::json!([where_])
+            } else {
+                serde_json::json!([where_, name])
+            };
+            Some(serde_json::json!({
+                "fields": [{
+                    "loc": loc,
+                    "msg": err.detail,
+                    "type": kind,
+                }]
+            }))
+        }
         _ => None,
     };
     let message = if data.is_some() {

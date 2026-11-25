@@ -50,6 +50,29 @@ impl Context {
         }
     }
 
+    /// 用一份**共享**的配置槽构造。
+    ///
+    /// server 的每个 worker 都用它：所有 worker 指向同一个 `RwLock<Arc<Config>>`，
+    /// 热加载换一次快照就对全部 worker 同时生效。如果每个 worker 各持一份
+    /// 配置副本，热加载只会改到主线程那一份——改了等于没改，还很难察觉。
+    pub fn from_shared(
+        config: Arc<RwLock<Arc<Config>>>,
+        databases: Vec<(String, Session<Engine>)>,
+        default_db: Option<String>,
+        env: Environment,
+    ) -> Self {
+        Self {
+            config,
+            env,
+            databases: databases
+                .into_iter()
+                .map(|(n, s)| (n, RefCell::new(s)))
+                .collect(),
+            default_db,
+            state: RefCell::new(HashMap::new()),
+        }
+    }
+
     /// 当前配置快照。热加载后自动指向新的一份。
     pub fn config(&self) -> Arc<Config> {
         match self.config.read() {

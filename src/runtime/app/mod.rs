@@ -5,6 +5,7 @@
 
 mod builder;
 mod databases;
+mod serve;
 mod lifecycle;
 mod migrate;
 
@@ -27,6 +28,9 @@ use crate::runtime::module::Module;
 /// 而不是藏在析构里。
 pub struct App {
     pub(crate) ctx: Context,
+    /// 打开库用的 URL 列表。留存不是为了复用连接，而是为了让每个 server
+    /// worker 能在自己的线程里**重建**一份 Context（`Session` 不跨线程）。
+    pub(crate) database_urls: Vec<(String, String)>,
     pub(crate) modules: Vec<Box<dyn Module>>,
     /// 已成功启动的模块下标（关闭时按它逆序）
     pub(crate) started: Vec<usize>,

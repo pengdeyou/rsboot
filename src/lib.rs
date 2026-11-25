@@ -21,12 +21,14 @@
 pub mod config;
 pub mod error;
 pub mod runtime;
+pub mod server;
 pub mod support;
 pub mod web;
 
 pub use config::{Config, Environment};
 pub use error::{Error, Result};
 pub use runtime::{App, Builder, Context, DbHealth, Module};
+pub use server::{ConnLimits, Server};
 pub use web::{
     Api, ApiError, ApiKey, ApiResult, Bearer, Envelope, FromRequest, IntoApiError, IntoResponse, Json,
     Method, Path, Query, Request,

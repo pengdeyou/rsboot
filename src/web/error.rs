@@ -57,11 +57,14 @@ impl ApiError {
     pub fn validation(kind: &str, where_: &str, name: &str, msg: impl Into<String>) -> Self {
         Self {
             status: Status::UNPROCESSABLE_ENTITY,
-            // 客户端看到的 msg 与 loc 组合起来就能直接定位字段
-            detail: format!("{where_}.{name}"),
+            // msg 就是给客户端看的那句话（对齐 FastAPI 的 `msg`）。
+            // 早先这里只写 `where.name`，把真正的解析原因（`missing field `q``）
+            // 塞进 internal 只进日志——客户端只知道"哪里错"，不知道"错在哪"，
+            // 排查全靠猜。定位由 `loc` 承担，msg 承担原因，两者不重复。
+            detail: msg.into(),
             loc: Some((where_.to_string(), name.to_string())),
             kind: Some(format!("{kind}_error")),
-            internal: Some(msg.into()),
+            internal: None,
             request_id: None,
         }
     }
@@ -91,13 +94,22 @@ impl ApiError {
     /// 序列化成响应体。字段名与 FastAPI 一致，多余的字段不出现。
     pub fn to_response(&self) -> Response {
         let body = match (&self.loc, &self.kind) {
-            (Some((where_, name)), Some(kind)) => serde_json::json!({
-                "detail": [{
-                    "loc": [where_, name],
-                    "msg": self.detail,
-                    "type": kind,
-                }]
-            }),
+            (Some((where_, name)), Some(kind)) => {
+                // 整个 body/query 解析失败时没有具体字段名，`loc` 只给一层。
+                // 输出 `["body", ""]` 会让客户端以为有个叫空字符串的参数。
+                let loc = if name.is_empty() {
+                    serde_json::json!([where_])
+                } else {
+                    serde_json::json!([where_, name])
+                };
+                serde_json::json!({
+                    "detail": [{
+                        "loc": loc,
+                        "msg": self.detail,
+                        "type": kind,
+                    }]
+                })
+            }
             _ => {
                 let mut o = serde_json::json!({ "detail": self.detail });
                 if let Some(id) = self.request_id {
@@ -106,7 +118,13 @@ impl ApiError {
                 o
             }
         };
-        Response::json_with(serde_json::to_vec(&body).unwrap_or_default().as_slice(), self.status)
+        let mut r = Response::json_with(
+            serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+            self.status,
+        );
+        // 留一份原件，出口处（Router）据此决定是否换成统一响应体形状
+        r.api_error = Some(self.clone());
+        r
     }
 
     /// 该回给客户端的最小信息（含 5xx 的真实原因——只在服务端用）。

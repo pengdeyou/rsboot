@@ -142,7 +142,7 @@ impl Builder {
 
         let urls = databases::collect_urls(&config, &self.databases);
         let default_db = databases::resolve_default(&config, &urls)?;
-        let sessions = databases::open(urls)?;
+        let sessions = databases::open(urls.clone())?;
 
         let mut seen = HashSet::new();
         for m in &self.modules {
@@ -167,7 +167,8 @@ impl Builder {
         };
 
         Ok(App {
-            ctx: Context::new(config, sessions, default_db, env),
+            ctx: Context::new(config, sessions, default_db.clone(), env),
+            database_urls: urls,
             modules: self.modules,
             started: Vec::new(),
             migrations: self.migrations,

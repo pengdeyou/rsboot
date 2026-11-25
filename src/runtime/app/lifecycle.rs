@@ -44,7 +44,7 @@ impl App {
     }
 
     /// 回滚式关闭：只关已启动的，逆序。关闭本身出错时**不能覆盖**原始错误。
-    fn unwind(&mut self, orig: Error) -> Error {
+    pub(super) fn unwind(&mut self, orig: Error) -> Error {
         match self.stop() {
             Ok(()) => orig,
             Err(e) => Error::Lifecycle(format!("{orig}；此外，失败后的关闭过程也出错：{e}")),
