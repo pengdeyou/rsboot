@@ -86,17 +86,21 @@ impl Drop for Span {
 /// `flush` 一段 14–17 µs 到底是内核慢，还是"EAGAIN → 让出 → 等下一轮"？
 /// 只有把次数拆出来才能判断：每请求 1 次且 0 次 EAGAIN，就是内核成本；
 /// 出现多次 EAGAIN，就是让出策略的账。
-static WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
-static WRITE_EAGAIN: AtomicU64 = AtomicU64::new(0);
+// 必须是线程局部：每个 worker 有自己的采样窗口，进程级共享会让"写次数/请求数"
+// 变成两个 worker 互相污染的数字（实测出现 1.87 与 0.20 并存的假象）。
+thread_local! {
+    static WRITE_CALLS: Cell<u64> = const { Cell::new(0) };
+    static WRITE_EAGAIN: Cell<u64> = const { Cell::new(0) };
+}
 
 #[inline]
 pub fn note_write(eagain: bool) {
     if !on() || !SAMPLE.with(|c| c.get()) {
         return;
     }
-    WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    WRITE_CALLS.with(|c| c.set(c.get() + 1));
     if eagain {
-        WRITE_EAGAIN.fetch_add(1, Ordering::Relaxed);
+        WRITE_EAGAIN.with(|c| c.set(c.get() + 1));
     }
 }
 
@@ -114,8 +118,8 @@ pub fn finish_request() {
         ACC.with(|acc| {
             let v = acc.get();
             let per = |i: usize| v[i] as f64 / n as f64;
-            let WC = &WRITE_CALLS;
-            let WE = &WRITE_EAGAIN;
+            let wc = WRITE_CALLS.with(|c| c.get());
+            let we = WRITE_EAGAIN.with(|c| c.get());
             eprintln!(
                 "[profile] {} req | read {:.0}  parse {:.0}  build {:.0}  handle {:.0}  write {:.0} (head {:.0} + flush {:.0})  = {:.0} ns  wr {:.2}/req eagain {:.2}",
                 n,
@@ -127,12 +131,12 @@ pub fn finish_request() {
                 per(HEAD),
                 per(FLUSH),
                 per(READ) + per(PARSE) + per(BUILD) + per(HANDLE) + per(WRITE),
-                WC.load(Ordering::Relaxed) as f64 / n as f64,
-                WE.load(Ordering::Relaxed) as f64 / n as f64
+                wc as f64 / n as f64,
+                we as f64 / n as f64
             );
             acc.set([0; STAGES]);
-            WRITE_CALLS.store(0, Ordering::Relaxed);
-            WRITE_EAGAIN.store(0, Ordering::Relaxed);
+            WRITE_CALLS.with(|c| c.set(0));
+            WRITE_EAGAIN.with(|c| c.set(0));
         });
         c.set(0);
     });

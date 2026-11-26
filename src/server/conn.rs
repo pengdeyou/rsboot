@@ -140,6 +140,46 @@ pub enum ConnOutcome {
     Closed,
 }
 
+/// 调小收发缓冲（Linux 专用，opt-in）。
+///
+/// 默认 `SO_SNDBUF` 走内核自动调优，能涨到几 MB。缓冲越大，单次 `write` 要维护
+/// 的 `sk_buff` 队列越长；我们一个响应只有 260 B，用不上。这是 A/B 用的开关，
+/// 不设 env 就不动任何东西，行为与之前完全一致。
+#[cfg(target_os = "linux")]
+fn tune_bufs(stream: &std::net::TcpStream) {
+    use std::os::raw::{c_int, c_uint, c_void};
+    unsafe extern "C" {
+        fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: c_uint) -> c_int;
+    }
+    use std::sync::OnceLock;
+    static VALS: OnceLock<(c_int, c_int)> = OnceLock::new();
+    let (snd, rcv) = *VALS.get_or_init(|| {
+        let rd = |k: &str| -> c_int {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<c_int>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(0)
+        };
+        (rd("RSBOOT_SNDBUF"), rd("RSBOOT_RCVBUF"))
+    });
+    if snd == 0 && rcv == 0 {
+        return;
+    }
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    const SOL_SOCKET: c_int = 1;
+    for (name, val) in [(7, snd), (8, rcv)] {
+        if val > 0 {
+            let p = &val as *const c_int as *const c_void;
+            let _ = unsafe { setsockopt(fd, SOL_SOCKET, name, p, 4) };
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_bufs(_stream: &std::net::TcpStream) {}
+
 const CLOSED: std::result::Result<ConnOutcome, std::io::Error> = Ok(ConnOutcome::Closed);
 const KEEP: std::result::Result<ConnOutcome, std::io::Error> = Ok(ConnOutcome::KeepAlive);
 
@@ -149,6 +189,7 @@ impl Conn {
         // 读超时不再依赖 SO_RCVTIMEO——`CoIo` 挂起时自带 250ms 心跳，
         // 真正的空闲上限仍由 `read_head` 里的 elapsed 判定。
         let _ = stream.set_nodelay(nodelay_on());
+        tune_bufs(&stream);
         let reader = BufReader::with_capacity(READ_BUF_BYTES, coio::CoIo::new(stream)?);
         Ok(Self {
             reader,
