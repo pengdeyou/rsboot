@@ -233,8 +233,11 @@ impl App {
                 )))
             }
             Some(v) => v as usize,
+            // 默认留一核：每个 worker 是独立的事件循环线程，accept 线程还要再占一核，
+            // 若 workers 直接取满核数，worker 与 accept 会互抢同一核（4 核上实测
+            // 满配比留一核低 30%，见 README「多连接」一节）。
             None => std::thread::available_parallelism()
-                .map(|p| p.get())
+                .map(|p| p.get().saturating_sub(1).max(1))
                 .unwrap_or(1),
         };
         // 上限 64：每个 worker 一份连接池，超过这个数只会把数据库连接打爆
