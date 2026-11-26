@@ -30,9 +30,10 @@ pub fn write_response<W: Write>(
     resp: &Response,
     close: bool,
     head_only: bool,
+    trace: Option<&[u8]>,
 ) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(96 + resp.headers.len() * 32 + resp.body.len());
-    fill_head(&mut buf, resp, close);
+    fill_head(&mut buf, resp, close, trace);
     if body_forbidden(resp) || head_only {
         // 不写 body
     } else {
@@ -51,7 +52,7 @@ fn body_forbidden(resp: &Response) -> bool {
 ///
 /// 抽出来是为了让"泛型写出"和"fd 直写（大 body 走 `writev`）"两条路径
 /// 拼出**完全相同**的头字节——两份实现迟早跑偏。
-fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool) {
+fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool, trace: Option<&[u8]>) {
     let status = resp.status;
 
     // 状态行
@@ -93,6 +94,18 @@ fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool) {
         buf.extend_from_slice(value.as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
+    // trace id 直接拼在 head 上，不走 `Headers`：每请求两次 `Headers` 插入
+    // （一次请求头、一次响应头）实测占流水线请求的 17%，而值本来就只是一个
+    // 不透明的短字符串，没必要进那张表再被写回层遍历一遍。
+    if let Some(t) = trace {
+        // 值已经在 `conn` 里筛过（要么是客户端给的、长度 ≤64 且不含 CR/LF，
+        // 要么是本进程自己按十六进制拼的），这里只做一次扫描兜底。
+        if !t.contains(&b'\r') && !t.contains(&b'\n') {
+            buf.extend_from_slice(b"x-request-id: ");
+            buf.extend_from_slice(t);
+            buf.extend_from_slice(b"\r\n");
+        }
+    }
     buf.extend_from_slice(b"\r\n");
 
 }
@@ -119,13 +132,14 @@ pub fn write_response_fd(
     close: bool,
     head_only: bool,
     head: &mut Vec<u8>,
+    trace: Option<&[u8]>,
 ) -> io::Result<()> {
     // `head` 由调用方按连接复用：这条路径每个请求都要走一次，新建 `Vec`
     // 就是每请求一次 malloc/free。容量只增不减，稳态下零分配。
     head.clear();
     head.reserve(96 + resp.headers.len() * 32);
     let _h = profile::start(profile::HEAD);
-    fill_head(head, resp, close);
+    fill_head(head, resp, close, trace);
     drop(_h);
 
     let body: &[u8] = if head_only || body_forbidden(resp) {
@@ -313,7 +327,7 @@ mod tests {
             got
         });
         let mut buf = Vec::new();
-        super::write_response_fd(c.as_raw_fd(), resp, close, head_only, &mut buf).unwrap();
+        super::write_response_fd(c.as_raw_fd(), resp, close, head_only, &mut buf, None).unwrap();
         drop(c);
         h.join().unwrap()
     }
@@ -332,7 +346,7 @@ mod tests {
         for _ in 0..n {
             buf.clear();
             buf.reserve(96 + heads * 32);
-            fill_head(&mut buf, &resp, false);
+            fill_head(&mut buf, &resp, false, None);
             std::hint::black_box(&buf);
         }
         let reuse = t.elapsed().as_nanos() as f64 / n as f64;
@@ -340,7 +354,7 @@ mod tests {
         let t = std::time::Instant::now();
         for _ in 0..n {
             let mut fresh: Vec<u8> = Vec::with_capacity(96 + heads * 32);
-            fill_head(&mut fresh, &resp, false);
+            fill_head(&mut fresh, &resp, false, None);
             std::hint::black_box(&fresh);
         }
         let fresh_ns = t.elapsed().as_nanos() as f64 / n as f64;
@@ -366,7 +380,7 @@ mod tests {
             let body = vec![b'x'; size];
             let resp = crate::web::response::Response::json(&body);
             let mut want = Vec::new();
-            super::write_response(&mut want, &resp, false, false).unwrap();
+            super::write_response(&mut want, &resp, false, false, None).unwrap();
             let got = drain_fd_path(&resp, false, false);
             assert_eq!(
                 got, want,
@@ -379,7 +393,7 @@ mod tests {
         // HEAD：不写 body，但必须保留 content-length
         let resp = crate::web::response::Response::json(&vec![b'y'; 20_000]);
         let mut want = Vec::new();
-        super::write_response(&mut want, &resp, true, true).unwrap();
+        super::write_response(&mut want, &resp, true, true, None).unwrap();
         let got = drain_fd_path(&resp, true, true);
         assert_eq!(got, want, "HEAD 响应两条路径不一致");
         assert!(
@@ -402,7 +416,7 @@ mod tests {
 
     fn render(resp: &Response, close: bool, head_only: bool) -> String {
         let mut buf = Vec::new();
-        write_response(&mut buf, resp, close, head_only).unwrap();
+        write_response(&mut buf, resp, close, head_only, None).unwrap();
         String::from_utf8(buf).unwrap()
     }
 

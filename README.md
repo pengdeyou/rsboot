@@ -70,6 +70,11 @@ What the table says, including the parts that don't flatter us:
 
 - **The trace id is now 12 % of a pipelined request.** Batching amortises the syscalls away, so per-request cost fell from 7.3 µs to **2.55 µs** (read 0.8–1.4, parse 0.25, build 0.24, handle 0.43–1.04, write 0.23). With `RSBOOT_NO_TRACE=2`, 16-deep pipelining goes from 884 k to **1 028 k**: generating the id and inserting it twice costs **0.3 µs/request**. It is the two `Headers` inserts and two `Arc` clones, not the hex formatting — that is the next thing worth attacking.
 
+- **The trace id no longer allocates, and no longer touches `Headers`.** Profile said the whole thing cost **198 ns/request** (the `build` stage sat at 238 ns versus 40 ns with `RSBOOT_NO_TRACE=2`), and it was three allocations plus one `Headers` insert (`String` for the hex, `Arc<str>` on top of it, then `insert_shared`). Now the id is formatted straight into a stack buffer (`write_trace_id(&mut [u8])`) and appended to the response head by `fill_head` — zero allocation, zero inserts. `build` dropped 238 → **139 ns**, and 16-deep pipelining went from 899 k to **972 137 / 970 340** (+8 %). `pipeline 1` is unchanged at 255 094 / 258 968.
+
+  Behaviour change worth knowing: the id the server generates now appears **only in the response headers**. `req.request_id()` still returns whatever the client sent, but there is no longer a copy of the generated id in `req.headers`. If a handler logged `req.request_id()` to correlate with the response, it now gets `None` for requests that did not carry one.
+
+
 
 - **Same window, all three servers at their own defaults:** 1 000 connections rsboot **268 163 / 269 438**, actix **260 051 / 261 986**, axum **217 062 / 196 272** — rsboot **2.6 % ahead of actix**, 23 % ahead of axum. At 200 connections: rsboot 269 566 / 271 213, actix 275 465 / 275 556, axum 200 650 / 203 006 — **1.9 % behind actix**. So the earlier "actix is 20 % ahead" was an artefact of hand-setting the worker count, not a property of either server. Parity at 200, a small lead at 1 000.
 

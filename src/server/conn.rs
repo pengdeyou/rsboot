@@ -81,7 +81,7 @@ fn write_closing<W: Write>(out: &mut W) -> std::io::Result<()> {
     )
     .to_response();
     resp.headers.insert("retry-after", "1");
-    write::write_response(out, &resp, true, false)
+    write::write_response(out, &resp, true, false, None)
 }
 
 /// 一条连接的全部状态：socket、读缓冲、已处理请求数。
@@ -377,31 +377,42 @@ impl Conn {
         req.headers = headers;
         req.peer = peer;
 
-        // trace id：优先客户端给的
-        // trace id 只分配一次，请求头与响应头共享同一份文本
-        // `RSBOOT_NO_TRACE`：1 = 用固定 id（不生成，但仍插两次头），2 = 完全不插。
-        // 只为把"生成"和"插头"两笔成本分开量；生产别设。
-        let trace: Option<std::sync::Arc<str>> = match trace_mode() {
-            2 => None,
-            1 => Some(static_trace()),
-            _ => Some(
-                req.request_id()
-                    .filter(|s| !s.is_empty() && s.len() <= 64)
-                    .map(std::sync::Arc::from)
-                    .unwrap_or_else(|| std::sync::Arc::from(next_trace_id())),
-            ),
+        // trace id：优先客户端给的，否则自己生成。
+        //
+        // 全部落在栈缓冲里（`TRACE_MAX` 字节），**零分配**。原来是
+        // `String` + `Arc<str>` 两次 malloc，再加一次 `Headers` 插入——profile
+        // 里光这一段就是 198 ns/请求，流水线下占总成本的 8%。
+        //
+        // 代价：服务端生成的 id 不再出现在**请求头**里（`req.request_id()`
+        // 只在客户端给过时才有值），它只出现在响应头。客户端给的 id 仍然原样
+        // 回显在响应头里。
+        // `RSBOOT_NO_TRACE`：1 = 固定 id，2 = 完全不发；只为拆分测量，生产别设。
+        let mut trace_buf = [0u8; TRACE_MAX];
+        let trace_len = match trace_mode() {
+            2 => 0,
+            1 => {
+                trace_buf[..STATIC_TRACE.len()].copy_from_slice(STATIC_TRACE.as_bytes());
+                STATIC_TRACE.len()
+            }
+            _ => match req.request_id().filter(|s| !s.is_empty() && s.len() <= 64) {
+                Some(s) => {
+                    trace_buf[..s.len()].copy_from_slice(s.as_bytes());
+                    s.len()
+                }
+                None => write_trace_id(&mut trace_buf),
+            },
         };
-        if let Some(t) = &trace {
-            req.headers
-                .insert_shared("x-request-id", std::sync::Arc::clone(t));
-        }
+        let trace: Option<&[u8]> = if trace_len == 0 {
+            None
+        } else {
+            Some(&trace_buf[..trace_len])
+        };
 
         drop(_t);
         let _t = profile::start(profile::HANDLE);
         let mut resp = router.handle(&mut req, ctx);
-        if let Some(t) = trace {
-            resp.headers.insert_shared("x-request-id", t);
-        }
+        // 响应头不插了：`fill_head` 直接把它拼到 head 末尾（见 `write.rs`）。
+        // 请求头那一份仍然插着，因为 handler 可能用 `req.request_id()` 记日志。
 
         drop(_t);
         let _t = profile::start(profile::WRITE);
@@ -431,6 +442,7 @@ impl Conn {
                     parsed.close,
                     head_only,
                     &mut self.out_buf,
+                    trace,
                 )?;
             }
             // `write_response_fd` 会把 head 留在 `out_buf` 里（它复用这块缓冲拼 head），
@@ -438,9 +450,9 @@ impl Conn {
             // 客户端按 content-length 继续往下读，整条连接的数据就错位了。
             self.out_buf.clear();
             #[cfg(not(unix))]
-            write::write_response(self.reader.get_mut(), &resp, parsed.close, head_only)?;
+            write::write_response(self.reader.get_mut(), &resp, parsed.close, head_only, trace)?;
         } else {
-            write::write_response(&mut self.out_buf, &resp, parsed.close, head_only)?;
+            write::write_response(&mut self.out_buf, &resp, parsed.close, head_only, trace)?;
         }
         drop(_t);
         profile::finish_request();
@@ -501,7 +513,7 @@ impl Conn {
 }
 
 fn write_error<W: Write>(out: &mut W, err: ApiError, close: bool) -> std::io::Result<()> {
-    write::write_response(out, &err.to_response(), close, false)
+    write::write_response(out, &err.to_response(), close, false, None)
 }
 
 /// 读"请求行 + 头 + 空行"。
@@ -571,23 +583,31 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
     }
 }
 
-fn push_hex(out: &mut String, mut v: u64) {
+/// trace id 的最大长度（客户端给的 64 上限 + 自生成的 ~20）。
+const TRACE_MAX: usize = 64;
+
+const STATIC_TRACE: &str = "00000000-00000001";
+
+/// 把十六进制写进 `out`，返回写入的字节数。
+fn push_hex(out: &mut [u8], mut v: u64) -> usize {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 16];
-    let mut i = buf.len();
+    let mut tmp = [0u8; 16];
+    let mut i = tmp.len();
     loop {
         i -= 1;
-        buf[i] = DIGITS[(v & 0xf) as usize];
+        tmp[i] = DIGITS[(v & 0xf) as usize];
         v >>= 4;
         if v == 0 {
             break;
         }
     }
-    // SAFETY: buf[i..] 全是 ASCII 十六进制字符
-    out.push_str(std::str::from_utf8(&buf[i..]).unwrap_or("0"));
+    let n = tmp.len() - i;
+    out[..n].copy_from_slice(&tmp[i..]);
+    n
 }
 
-fn next_trace_id() -> String {
+/// 生成 `<epoch>-<seq>` 到 `out`，返回长度。**不分配**。
+fn write_trace_id(out: &mut [u8]) -> usize {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     static EPOCH: OnceLock<u64> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(|| {
@@ -597,11 +617,10 @@ fn next_trace_id() -> String {
             .unwrap_or(0)
     });
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut s = String::with_capacity(24);
-    push_hex(&mut s, epoch);
-    s.push('-');
-    push_hex(&mut s, seq);
-    s
+    let mut n = push_hex(out, epoch);
+    out[n] = b'-';
+    n += 1;
+    n + push_hex(&mut out[n..], seq)
 }
 
 #[cfg(test)]
@@ -709,9 +728,12 @@ mod tests {
 
     #[test]
     fn trace_ids_are_unique() {
-        let a = next_trace_id();
-        let b = next_trace_id();
-        assert_ne!(a, b);
+        let mut a = [0u8; TRACE_MAX];
+        let mut b = [0u8; TRACE_MAX];
+        let an = write_trace_id(&mut a);
+        let bn = write_trace_id(&mut b);
+        assert_ne!(&a[..an], &b[..bn]);
+        assert!(an > 3 && an <= TRACE_MAX);
     }
 }
 
@@ -733,12 +755,6 @@ fn trace_mode() -> u8 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     })
-}
-
-fn static_trace() -> std::sync::Arc<str> {
-    use std::sync::OnceLock;
-    static ID: OnceLock<std::sync::Arc<str>> = OnceLock::new();
-    std::sync::Arc::clone(ID.get_or_init(|| std::sync::Arc::from("00000000-00000001")))
 }
 
 impl Drop for Conn {
