@@ -148,7 +148,7 @@ impl Conn {
         // 连接改成非阻塞：会阻塞的点统统交给调度器，worker 不再被一条慢连接按住。
         // 读超时不再依赖 SO_RCVTIMEO——`CoIo` 挂起时自带 250ms 心跳，
         // 真正的空闲上限仍由 `read_head` 里的 elapsed 判定。
-        let _ = stream.set_nodelay(true);
+        let _ = stream.set_nodelay(nodelay_on());
         let reader = BufReader::with_capacity(READ_BUF_BYTES, coio::CoIo::new(stream)?);
         Ok(Self {
             reader,
@@ -581,4 +581,12 @@ mod tests {
         let b = next_trace_id();
         assert_ne!(a, b);
     }
+}
+
+/// `TCP_NODELAY` 开关：默认开（小响应一写就走，不让 Nagle 攒）。
+/// `RSBOOT_NODELAY=0` 关掉，只为 A/B 量化它的系统调用成本。
+fn nodelay_on() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("RSBOOT_NODELAY").map(|v| v != "0").unwrap_or(true))
 }
