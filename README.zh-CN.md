@@ -6,7 +6,7 @@
 >
 > 但我们**不是裸吞吐冠军**，这份 README 也不装作是：无 I/O 的 JSON 路径上，高并发下 actix-web 领先约 18 %。下表把每一列都列出来，包括我们输掉的那几列。
 
-对标 FastAPI 的 Rust 应用框架：声明式路由、类型化提取、自动 OpenAPI。**HTTP/1.1 协议栈与协程调度全部自研**——不引 tokio，不引 hyper，不引 axum。
+扎根 Rust 生态的应用框架——FastAPI 式的声明式路由、类型化提取、自动 OpenAPI。**同步 handler 跑在栈式协程上，底层 socket 全程非阻塞**：慢 I/O 让出 worker，而不是把它占住。HTTP/1.1 协议栈、协程调度与事件循环全部自研——不引 tokio，不引 hyper，不引 axum。
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)
 

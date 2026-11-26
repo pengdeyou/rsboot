@@ -6,7 +6,7 @@
 >
 > We are **not** the raw-throughput champion, and this README does not pretend otherwise: on the no-I/O JSON path actix-web leads by ~18 % at high concurrency. The measured table below shows every column, including the ones where we lose.
 
-A FastAPI-style application framework for Rust — declarative routing, typed extraction, automatic OpenAPI. **The HTTP/1.1 stack and the coroutine scheduler are written from scratch**: no tokio, no hyper, no axum.
+A Rust-ecosystem-native application framework — FastAPI-style declarative routing, typed extraction, automatic OpenAPI. **Synchronous handlers run on stackful coroutines over non-blocking sockets**: slow I/O yields the worker instead of parking it. The HTTP/1.1 stack, the coroutine scheduler and the event loop are written from scratch — no tokio, no hyper, no axum.
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)
 

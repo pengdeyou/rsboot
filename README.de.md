@@ -6,7 +6,7 @@
 >
 > Wir sind **nicht** der Meister im reinen Durchsatz, und dieses README tut nicht so: Auf dem JSON-Pfad ohne I/O liegt actix-web bei hoher Nebenläufigkeit rund 18 % vorn. Die Tabelle unten zeigt jede Spalte — auch die, in denen wir verlieren.
 
-Ein Anwendungsframework für Rust im Stil von FastAPI — deklaratives Routing, typisierte Extraktion, automatisch erzeugte OpenAPI-Dokumentation. **Der HTTP/1.1-Stack und der Coroutine-Scheduler sind vollständig selbst geschrieben**: kein tokio, kein hyper, kein axum.
+Ein im Rust-Ökosystem beheimatetes Anwendungsframework — deklaratives Routing im FastAPI-Stil, typisierte Extraktion, automatisch erzeugte OpenAPI-Dokumentation. **Synchrone Handler laufen auf Stackful-Coroutinen über nicht blockierenden Sockets**: langsame I/O gibt den Worker frei, statt ihn zu belegen. HTTP/1.1-Stack, Scheduler und Event-Loop sind vollständig selbst geschrieben — kein tokio, kein hyper, kein axum.
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)
 
