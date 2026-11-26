@@ -106,6 +106,13 @@ const LINE_BUF_BYTES: usize = 256;
 /// 响应头组装缓冲起点。
 const OUT_BUF_BYTES: usize = 256;
 
+/// 攒到这么多字节就先写一次。太小会退化成"每个响应一次 write"，
+/// 太大则单连接占住内存、且大响应反而占不到合并的好处。
+const FLUSH_BYTES: usize = 16 * 1024;
+
+/// 超过这个大小的响应不参与合并写，直接 `writev`（见 `serve_one` 里的注释）。
+const BIG_BODY_BYTES: usize = 8 * 1024;
+
 pub struct Conn {
     /// 让出式读缓冲：`read_until` / `read_exact` 内部就会挂起等 `POLLIN`。
     ///
@@ -238,14 +245,13 @@ impl Conn {
     /// worker 用它来决定"该不该现在服务这条连接"：不可读的连接直接放回队列，
     /// 否则 worker 会卡在 read 上等它的下一个请求，把后面排队的连接全饿住。
     #[cfg(unix)]
-    pub fn has_pending_input(&self) -> std::io::Result<bool> {
-        use std::os::unix::io::AsRawFd;
-        crate::server::poll::wait_readable(self.reader.get_ref().get_ref().as_raw_fd(), 0)
-    }
-
-    #[cfg(not(unix))]
-    pub fn has_pending_input(&self) -> std::io::Result<bool> {
-        Ok(true)
+    /// 缓冲里是否还有没处理完的字节（pipelining 的后续请求就在这儿）。
+    ///
+    /// 注意不能用 `poll(fd, 0)` 去查：那些字节已经在用户态缓冲里，
+    /// socket 本身是空的，poll 会说"没数据"——旧实现就是这么错的。
+    #[inline]
+    pub fn has_buffered_input(&self) -> bool {
+        !self.reader.buffer().is_empty()
     }
 
     pub fn into_stream(self) -> TcpStream {
@@ -268,7 +274,7 @@ impl Conn {
     ///
     /// 现在每处理完一个请求就交回队列，由 worker 取下一条连接。这等于在
     /// 线程模型里做了协作式轮转：代价是一次 `mpsc` 传递，换来连接公平。
-    pub fn serve_once<F: Fn() -> bool>(
+    fn serve_one<F: Fn() -> bool>(
         &mut self,
         router: &Router,
         ctx: &Context,
@@ -285,7 +291,7 @@ impl Conn {
         // 直接断连时客户端只看到 "empty reply"，重试逻辑差一点的会当故障；
         // 回 503 + `retry-after` + `connection: close` 它才知道该换实例重试。
         if should_stop() {
-            let _ = write_closing(self.reader.get_mut());
+            let _ = write_closing(&mut self.out_buf);
             return CLOSED;
         }
 
@@ -314,14 +320,14 @@ impl Conn {
             }
             Err(HeadError::TooLarge) => {
                 let _ = write_error(
-                    self.reader.get_mut(),
+                    &mut self.out_buf,
                     ApiError::new(Status(431), "请求头过大"),
                     true,
                 );
                 return CLOSED;
             }
             Err(HeadError::Malformed(m)) => {
-                let _ = write_error(self.reader.get_mut(), ApiError::new(Status::BAD_REQUEST, m), true);
+                let _ = write_error(&mut self.out_buf, ApiError::new(Status::BAD_REQUEST, m), true);
                 return CLOSED;
             }
         };
@@ -332,7 +338,7 @@ impl Conn {
             Ok(p) => p,
             Err(ParseError { status, message }) => {
                 // 解析层拒绝一律断开：边界已不可信
-                let _ = write_error(self.reader.get_mut(), ApiError::new(status, message), true);
+                let _ = write_error(&mut self.out_buf, ApiError::new(status, message), true);
                 return CLOSED;
             }
         };
@@ -344,7 +350,7 @@ impl Conn {
                 if self.reader.read_exact(&mut buf).is_err() {
                     // body 没读全：断开，绝不把半截数据交给 handler
                     let _ = write_error(
-                        self.reader.get_mut(),
+                        &mut self.out_buf,
                         ApiError::new(Status::BAD_REQUEST, "请求体不完整"),
                         true,
                     );
@@ -402,19 +408,40 @@ impl Conn {
         let head_only = matches!(method, Method::Head);
         // 热路径走 fd 直写：大 body 用 `writev` 省一次 memcpy 与大块分配。
         // 泛型版留给测试（它要能用 `Vec<u8>` 当输出）。
-        #[cfg(unix)]
+        // 先攒进 `out_buf`，由 `serve_once` 统一 flush：一条连接上排队的 N 个请求
+        // 可以合并成**一次** `write`。之前是每个响应一次 `write`，16 个请求就是
+        // 16 次系统调用；pipelining 下这是实打实的差距。
+        //
+        // 大 body 例外：`write_response_fd` 走 `writev`，body 不复制。若把它先搬进
+        // `out_buf`，一个 1 MB 的下载就要多一次 1 MB memcpy。所以大响应用先把攒下的
+        // 部分写出去，再直接写 fd，保持零拷贝。
+        // 缓冲里没有下一个请求（绝大多数长连接只发一个就等）→ 沿用原来的
+        // `writev` 直写，一次系统调用、body 不复制，与引入合并写之前完全一致。
+        // 只有确实排着队的连接才值得攒起来合并。
+        if resp.body.len() > BIG_BODY_BYTES
+            || (self.reader.buffer().is_empty() && self.out_buf.is_empty())
         {
-            use std::os::unix::io::AsRawFd;
-            write::write_response_fd(
-                self.reader.get_ref().get_ref().as_raw_fd(),
-                &resp,
-                parsed.close,
-                head_only,
-                &mut self.out_buf,
-            )?;
+            self.flush_out()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                write::write_response_fd(
+                    self.reader.get_ref().get_ref().as_raw_fd(),
+                    &resp,
+                    parsed.close,
+                    head_only,
+                    &mut self.out_buf,
+                )?;
+            }
+            // `write_response_fd` 会把 head 留在 `out_buf` 里（它复用这块缓冲拼 head），
+            // 写完之后必须清掉：否则下一次 flush 会把上一个响应**再写一遍**，
+            // 客户端按 content-length 继续往下读，整条连接的数据就错位了。
+            self.out_buf.clear();
+            #[cfg(not(unix))]
+            write::write_response(self.reader.get_mut(), &resp, parsed.close, head_only)?;
+        } else {
+            write::write_response(&mut self.out_buf, &resp, parsed.close, head_only)?;
         }
-        #[cfg(not(unix))]
-        write::write_response(self.reader.get_mut(), &resp, parsed.close, head_only)?;
         drop(_t);
         profile::finish_request();
         self.served += 1;
@@ -422,6 +449,54 @@ impl Conn {
             return CLOSED;
         }
         KEEP
+    }
+
+    /// 处理请求，直到"缓冲里没有排队的数据"或连接结束。
+    ///
+    /// 为什么需要这层循环：`BufReader` 读到第一个请求头时，往往已经把后面的
+    /// 请求一起读进了缓冲区。那一刻 socket 上没有新数据，`poll` 不会报事件，
+    /// 连接就挂在那儿直到超时——HTTP/1.1 pipelining 的请求正是这样被静默吞掉的
+    /// （实测一条连接连发 4 个请求，只回 1 个）。所以只要缓冲区里还有字节，
+    /// 就在同一个协程里接着处理，不交回队列。
+    ///
+    /// 半截请求也走这条路径：`read_head` 在 `WouldBlock` 时会挂起等数据，与
+    /// 普通等待没有区别，只是省掉一次 `mpsc` 往返。
+    pub fn serve_once<F: Fn() -> bool>(
+        &mut self,
+        router: &Router,
+        ctx: &Context,
+        limits: &Limits,
+        should_stop: &F,
+    ) -> std::io::Result<ConnOutcome> {
+        let out = loop {
+            let outcome = self.serve_one(router, ctx, limits, should_stop)?;
+            let more = outcome == ConnOutcome::KeepAlive
+                && !self.reader.buffer().is_empty()
+                && !should_stop();
+            if !more || self.out_buf.len() >= FLUSH_BYTES {
+                self.flush_out()?;
+                if !more {
+                    break outcome;
+                }
+            }
+        };
+        Ok(out)
+    }
+
+    /// 把攒下的响应一次写出去。
+    fn flush_out(&mut self) -> std::io::Result<()> {
+        if self.out_buf.is_empty() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            super::coio::write_fd_all(self.reader.get_ref().get_ref().as_raw_fd(), &self.out_buf)?;
+        }
+        #[cfg(not(unix))]
+        self.reader.get_mut().write_all(&self.out_buf)?;
+        self.out_buf.clear();
+        Ok(())
     }
 }
 

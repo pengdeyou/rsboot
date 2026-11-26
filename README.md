@@ -58,6 +58,19 @@ What the table says, including the parts that don't flatter us:
 
 - **The worker default was the whole 20 %.** The table above had `WORKERS=2` set by hand, to leave cores for the client — that is the wrong setting. Sweeping workers with the 2-thread client at 1 000 connections, 15 s each: **W=1 123 827 / 125 035, W=2 227 418 / 220 739, W=3 269 438 / 266 476**. Three workers, which is what the library picks by itself on a 4-core box (`cores − 1`), beat two by **19 %**. The reason is that this load is latency-bound, not batch-bound: one request in flight per connection, each request ~7 µs, and dividing 1 000 connections over W workers shrinks both the bitmap and the ready-fd set per round, so the RTT of each request drops. More workers win until the box is oversubscribed, and 3 workers + 1 accept = 4 threads on 4 cores is exactly full.
 
+- **HTTP/1.1 pipelining was silently dropping requests — and now batches the answers.** `BufReader` slurps several requests into its own buffer while reading the first one. That buffer is invisible to `poll`, so after answering request #1 the connection was parked waiting for an event that never arrives: a client sending 4 requests on one connection got **1 response**, and the other 3 sat until timeout. `serve_once` now loops while `reader.buffer()` is non-empty. Then the follow-up: queued responses are accumulated in `out_buf` and leave in **one** `write` (flush at 16 KiB; bodies over 8 KiB still go straight to `writev` so a download stays zero-copy, and a lone request keeps the old direct path byte for byte). Two-thread client, 1 000 connections, `/json`, 15 s:
+
+  | pipeline | before | after |
+  |---:|---:|---:|
+  | 1 | 258 048 / 257 781 | 266 574 / 253 006 |
+  | 4 | 374 021 (3 of 4 dropped) | **636 159 / 632 847** |
+  | 16 | 516 710 (15 of 16 dropped) | **896 926 / 878 163** |
+
+  Same window: actix **1 497 566** (p16) / 765 326 (p4), axum 198 732 (p16 — hyper does not pipeline). So actix is still ~40 % ahead when clients pipeline, but we went from *wrong answers* to 887 k.
+
+- **The trace id is now 12 % of a pipelined request.** Batching amortises the syscalls away, so per-request cost fell from 7.3 µs to **2.55 µs** (read 0.8–1.4, parse 0.25, build 0.24, handle 0.43–1.04, write 0.23). With `RSBOOT_NO_TRACE=2`, 16-deep pipelining goes from 884 k to **1 028 k**: generating the id and inserting it twice costs **0.3 µs/request**. It is the two `Headers` inserts and two `Arc` clones, not the hex formatting — that is the next thing worth attacking.
+
+
 - **Same window, all three servers at their own defaults:** 1 000 connections rsboot **268 163 / 269 438**, actix **260 051 / 261 986**, axum **217 062 / 196 272** — rsboot **2.6 % ahead of actix**, 23 % ahead of axum. At 200 connections: rsboot 269 566 / 271 213, actix 275 465 / 275 556, axum 200 650 / 203 006 — **1.9 % behind actix**. So the earlier "actix is 20 % ahead" was an artefact of hand-setting the worker count, not a property of either server. Parity at 200, a small lead at 1 000.
 
 
