@@ -67,7 +67,7 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn pipe(fds: *mut [c_int; 2]) -> c_int;
+    fn pipe(fds: *mut c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
 
@@ -237,9 +237,11 @@ impl Waker {
         #[cfg(target_os = "macos")]
         {
             let b: u8 = 1;
-            // SAFETY: 写 1 字节到管道写端。
+            // SAFETY: 写 1 字节到管道写端。`b` 是 `u8`，取址才是 `*const u8`——
+            // `u8` 上没有 `as_ptr()`（原来写成 `b.as_ptr()`，这段只在 macOS 编译，
+            // Linux 上被 cfg 排除，一直没暴露）
             unsafe {
-                write(self.inner.write, b.as_ptr() as *const c_void, 1);
+                write(self.inner.write, (&b as *const u8).cast::<c_void>(), 1);
             }
         }
     }

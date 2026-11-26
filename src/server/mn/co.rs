@@ -20,7 +20,7 @@ pub const STACK_SIZE: usize = 64 * 1024;
 /// 峰值过去后保留一部分复用，避免每次 `alloc/dealloc` 都打到全局分配器。
 const POOL_MAX: usize = 256;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 global_asm!(
     r#"
 .globl rsw_save_switch
@@ -45,6 +45,41 @@ rsw_save_switch:
 rsw_entry_stub:
     mov rdi, r12
     call rsw_on_entry
+    ud2
+"#
+);
+
+// Mach-O 的符号带前导下划线：`extern "C" fn rsw_save_switch` 在 macOS 上解析成
+// `_rsw_save_switch`，而 `.globl rsw_save_switch` 定义的是不带下划线的名字，
+// 两边对不上，链接期就是 undefined symbol。
+//
+// 与 Linux 那段逐字对应，只多了 `_` 前缀——这段同样只在 macOS 编译，
+// 所以直到第一次在 macOS 上链接才暴露。
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+global_asm!(
+    r#"
+.globl _rsw_save_switch
+_rsw_save_switch:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp
+    mov rsp, rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+.globl _rsw_entry_stub
+_rsw_entry_stub:
+    mov rdi, r12
+    call _rsw_on_entry
     ud2
 "#
 );
