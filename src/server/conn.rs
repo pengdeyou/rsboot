@@ -89,13 +89,30 @@ fn write_closing<W: Write>(out: &mut W) -> std::io::Result<()> {
 /// 为什么把 `BufReader` 一起放进来：无缓冲的话每次处理都要重新
 /// `try_clone`（一次 `dup(2)`）。把连接做成"可以被搬来搬去的对象"后，
 /// worker 能在多条连接之间轮转而不用每次付这个成本。
+/// 读缓冲起始容量。
+///
+/// `BufReader::new` 默认要 8 KiB——它不是"按需"的，一建连接就占着。
+/// keep-alive 连接空闲时什么都不读，这 8 KiB 仍然是实打实的 RSS：
+/// 五千条挂在 `poll` 上的空闲连接就是 40 MB，纯粹为"万一头很大"付的。
+/// 请求头 99 % 在 1 KiB 内；更大的头只是多几次 `read`（每次 `poll` 已
+/// 返回可读，成本是 syscall 本身），比"每条空闲连接白占 7 KiB"划算。
+/// 请求体的读取不吃这个容量：`read_exact` 走的是 `BufReader::read` 的
+/// bypass 分支（剩余长度 ≥ 容量时直接读 socket），块大小由内核决定。
+pub const READ_BUF_BYTES: usize = 1024;
+/// 头原文缓冲的起点（一次请求头约 200–600 字节）。
+const HEAD_BUF_BYTES: usize = 512;
+/// `read_until` 的行缓冲起点。
+const LINE_BUF_BYTES: usize = 256;
+/// 响应头组装缓冲起点。
+const OUT_BUF_BYTES: usize = 256;
+
 pub struct Conn {
     stream: TcpStream,
     /// 让出式读缓冲：`read_until` / `read_exact` 内部就会挂起等 `POLLIN`
     reader: BufReader<coio::CoIo>,
     /// 当前请求的头原文。按连接复用：keep-alive 下每条连接处理成千上万个请求，
     /// 每请求新建一个 `String` 意味着一次 malloc + 数次 realloc（头部有 8 行时
-    /// 容量要长两三轮）。
+    /// 容量要长两三轮）。空闲时由 `trim_idle` 把被撑大的容量还回去。
     head_buf: String,
     /// `read_until` 的行缓冲，同样按连接复用。
     line_buf: Vec<u8>,
@@ -127,16 +144,31 @@ impl Conn {
         // 读超时不再依赖 SO_RCVTIMEO——`CoIo` 挂起时自带 250ms 心跳，
         // 真正的空闲上限仍由 `read_head` 里的 elapsed 判定。
         let _ = stream.set_nodelay(true);
-        let reader = BufReader::new(coio::CoIo::new(stream.try_clone()?)?);
+        let reader = BufReader::with_capacity(READ_BUF_BYTES, coio::CoIo::new(stream.try_clone()?)?);
         Ok(Self {
             stream,
             reader,
-            // 一次请求头约 200–600 字节；给个起点，后续扩容由 `reserve` 决定。
-            head_buf: String::with_capacity(512),
-            line_buf: Vec::with_capacity(256),
-            out_buf: Vec::with_capacity(256),
+            head_buf: String::with_capacity(HEAD_BUF_BYTES),
+            line_buf: Vec::with_capacity(LINE_BUF_BYTES),
+            out_buf: Vec::with_capacity(OUT_BUF_BYTES),
             served: 0,
         })
+    }
+
+    /// 连接进入空闲时把复用缓冲归还。
+    ///
+    /// 触发点是"已经空闲满 `io_timeout`"（`read_head` 返回 `Timeout`），
+    /// 所以不会打断一个正在发请求的连接，也不是每个请求都做。正常请求的
+    /// 容量本来就在起点附近，这里等价于三次整数比较；只有被大 Cookie /
+    /// 长 URL 撑到几 KiB 的连接才真的 realloc 一次。
+    ///
+    /// 为什么不在请求之间无条件收缩：每次处理完一个请求都可能短暂回到队列，
+    /// 那时收缩会让下个请求再长一次——拿吞吐换内存，不划算。空闲 5 秒才是
+    /// "这容量确实用不上了"的证据。
+    fn trim_idle(&mut self) {
+        self.head_buf.shrink_to(HEAD_BUF_BYTES);
+        self.line_buf.shrink_to(LINE_BUF_BYTES);
+        self.out_buf.shrink_to(OUT_BUF_BYTES);
     }
 
     pub fn peer(&self) -> Option<String> {
@@ -217,8 +249,13 @@ impl Conn {
             limits.io_timeout,
         ) {
             Ok(()) => (),
-            // 空闲连接不是坏连接：交回队列，让 worker 去服务别人
-            Err(HeadError::Timeout) => return Ok(ConnOutcome::Idle),
+            // 空闲连接不是坏连接：交回队列，让 worker 去服务别人。
+            // 顺手把被撑大的缓冲还掉——此刻它已经闲满 `io_timeout`，
+            // 那些容量短期内不会被用到。
+            Err(HeadError::Timeout) => {
+                self.trim_idle();
+                return Ok(ConnOutcome::Idle);
+            }
             Err(HeadError::Eof) => return CLOSED,
             Err(HeadError::Stopped) => {
                 // 正在关闭：给明确答复再走
@@ -434,6 +471,53 @@ fn next_trace_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一对已连上的本机 TCP socket（`Conn` 要真的 `TcpStream`，还要 `try_clone`）。
+    fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = std::net::TcpStream::connect(addr).unwrap();
+        let (s, _) = l.accept().unwrap();
+        (s, c)
+    }
+
+    #[test]
+    fn new_conn_does_not_reserve_8k_of_read_buffer() {
+        // `BufReader::new` 的默认容量是 8 KiB。空闲连接读不到东西，
+        // 这 8 KiB 全是白占——这条测试锁住"起点就是 1 KiB"。
+        let (a, _b) = tcp_pair();
+        let conn = Conn::new(a, &Limits::default()).unwrap();
+        assert_eq!(conn.reader.capacity(), READ_BUF_BYTES);
+    }
+
+    #[test]
+    fn idle_trim_releases_oversized_buffers() {
+        let (a, _b) = tcp_pair();
+        let mut conn = Conn::new(a, &Limits::default()).unwrap();
+        // 模拟被大 Cookie / 长 URL 撑到 4 KiB 的连接
+        // 真实路径上 `read_head` 开头就 `head.clear()`，空闲态是空串。
+        // (`shrink_to` 不会缩到比 `len` 更小，所以这里必须先清空。)
+        conn.head_buf = String::with_capacity(4096);
+        conn.head_buf.push_str(&"x".repeat(4096));
+        conn.head_buf.clear();
+        conn.line_buf = Vec::with_capacity(4096);
+        conn.out_buf = Vec::with_capacity(4096);
+        conn.trim_idle();
+        // allocator 可能给略多于目标的容量，所以只断言上界
+        assert!(conn.head_buf.capacity() <= 1024, "{}", conn.head_buf.capacity());
+        assert!(conn.line_buf.capacity() <= 1024, "{}", conn.line_buf.capacity());
+        assert!(conn.out_buf.capacity() <= 1024, "{}", conn.out_buf.capacity());
+    }
+
+    #[test]
+    fn idle_trim_is_a_noop_when_capacity_is_already_small() {
+        let (a, _b) = tcp_pair();
+        let mut conn = Conn::new(a, &Limits::default()).unwrap();
+        let before = conn.head_buf.capacity();
+        conn.trim_idle();
+        // 起点本来就 ≤ 目标：不该有 shrink（也不该有分配）
+        assert_eq!(conn.head_buf.capacity(), before);
+    }
 
     fn read_head_from(bytes: &[u8]) -> Result<String, HeadError> {
         let mut r = BufReader::new(std::io::Cursor::new(bytes.to_vec()));
