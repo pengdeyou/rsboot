@@ -298,6 +298,196 @@ impl Waker {
     }
 }
 
+/// Linux 的 `epoll` 后端（macOS 没有 epoll，继续走 `poll` 路径）。
+///
+/// ## 为什么值得写
+///
+/// `poll(2)` 每轮都要把 `nfds` 个 fd 整个交给内核重扫一次（每个 fd 至少一次
+/// 虚调用）。1 000 条连接就是每轮上千次，摊到每请求上是固定成本。新压测器
+/// （单线程、非阻塞、1 000 条 keep-alive 连接）量出来的账：rsboot 每请求
+/// `sys` 9.8 µs，axum（epoll）2.8 µs，而两边 `user` 几乎相同（2.4 对 2.6 µs）
+/// ——差的 7 µs 有相当一部分就是这趟重扫。旁证：QPS 对连接数不敏感（200 与
+/// 1 000 连接同为 139 k），所以它是**每请求固定成本**，不是 O(n) 的抖动。
+///
+/// ## 代价控制
+///
+/// 不为注册付 O(n) 的 `epoll_ctl`。`reg` 位图记着"上一轮已经注册过哪些
+/// fd"，只有集合真的变了才发系统调用；稳态（1 000 条长连接）每轮零 `ctl`。
+/// 每轮固定开销是清零 + 置位两张位图（约 300 ns），比一次 `epoll_wait` 便宜。
+///
+/// ## fd 复用这个坑
+///
+/// 连接关掉后 fd 号会被新连接拿走。内核在 `close` 时已把它踢出 epoll 集合，
+/// 我们的位图却还以为它在——新连接于是永远收不到通知（只能靠兜底超时醒来，
+/// 表现为偶发 0.5 s 卡顿）。所以每 `REBUILD_EVERY` 轮做一次全量重建（DEL
+/// 全部 + ADD 全部）自愈，250 个 fd 的重建约 100 µs，摊到 64 轮可忽略。
+#[cfg(all(unix, not(target_os = "macos")))]
+mod ep {
+    use std::os::raw::c_int;
+
+    pub const BITS: usize = 8192;
+    pub const WORDS: usize = BITS / 64;
+    /// 少于这么多项时 `poll` 更划算（没有可省的扫描，少一次 `epoll` 状态维护）
+    pub const MIN_ITEMS: usize = 8;
+    pub const MAX_EVENTS: usize = 256;
+    pub const REBUILD_EVERY: u32 = 1024;
+
+    const OP_ADD: c_int = 1;
+    const OP_DEL: c_int = 2;
+    const OP_MOD: c_int = 3;
+    const EPOLL_CLOEXEC: c_int = 0o2000000;
+
+    pub const IN: u8 = 0x01;
+    pub const OUT: u8 = 0x04;
+
+    /// 与 glibc 一致：`events: u32` + `data: u64`，**紧凑 12 字节**
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    pub struct Event {
+        pub events: u32,
+        pub data: u64,
+    }
+
+    impl Default for Event {
+        fn default() -> Self {
+            Self { events: 0, data: 0 }
+        }
+    }
+
+    unsafe extern "C" {
+        fn epoll_create1(flags: c_int) -> c_int;
+        fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, ev: *mut Event) -> c_int;
+        pub fn epoll_wait(
+            epfd: c_int,
+            evs: *mut Event,
+            maxevents: c_int,
+            timeout: c_int,
+        ) -> c_int;
+    }
+
+    pub struct Session {
+        pub epfd: c_int,
+        /// 已注册位图（与 `evs` 同步维护）
+        reg: [u64; WORDS],
+        /// 本轮出现的 fd 位图（复用，不每轮分配）
+        cur: [u64; WORDS],
+        /// 每个 fd 已注册的事件掩码，0 = 未注册
+        evs: [u8; BITS],
+        epoch: u32,
+        pub evbuf: [Event; MAX_EVENTS],
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            if self.epfd >= 0 {
+                // SAFETY: 这个 fd 是本结构独占创建的
+                unsafe {
+                    super::close(self.epfd);
+                }
+            }
+        }
+    }
+
+    impl Session {
+        pub fn new() -> std::io::Result<Self> {
+            // SAFETY: 系统调用无参数副作用
+            let fd = unsafe { epoll_create1(EPOLL_CLOEXEC) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self {
+                epfd: fd,
+                reg: [0; WORDS],
+                cur: [0; WORDS],
+                evs: [0; BITS],
+                epoch: 0,
+                evbuf: [Event::default(); MAX_EVENTS],
+            })
+        }
+
+        fn ctl(&self, op: c_int, fd: c_int, mask: u8) -> bool {
+            let mut ev = Event {
+                events: mask as u32,
+                data: fd as u64,
+            };
+            // `Event` 是 packed：不能对它取普通引用，只能取裸指针
+            let p = std::ptr::addr_of_mut!(ev);
+            // SAFETY: 指针指向刚构造的栈上事件，大小与布局与内核约定一致
+            unsafe { epoll_ctl(self.epfd, op, fd, p) == 0 }
+        }
+
+        /// 把当前 `items` 与已注册集合对账，只对差异发系统调用。
+        pub fn sync(&mut self, items: &[super::PollFd]) {
+            self.epoch = self.epoch.wrapping_add(1);
+            self.cur = [0; WORDS];
+
+            if self.epoch % REBUILD_EVERY == 0 {
+                // 全量重建：自愈 fd 复用留下的"假注册"
+                for w in 0..WORDS {
+                    let mut bits = self.reg[w];
+                    while bits != 0 {
+                        let b = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let fd = (w * 64 + b) as c_int;
+                        self.ctl(OP_DEL, fd, 0);
+                    }
+                    self.reg[w] = 0;
+                }
+                self.evs = [0; BITS];
+            }
+
+            for p in items {
+                let fd = p.fd as usize;
+                if fd >= BITS {
+                    continue;
+                }
+                let bit = 1u64 << (fd % 64);
+                self.cur[fd / 64] |= bit;
+                let mask = events_mask(p.events);
+                let have = self.evs[fd];
+                if have == 0 {
+                    if self.ctl(OP_ADD, fd as c_int, mask) {
+                        self.reg[fd / 64] |= bit;
+                        self.evs[fd] = mask;
+                    }
+                } else if have != mask && self.ctl(OP_MOD, fd as c_int, mask) {
+                    self.evs[fd] = mask;
+                }
+            }
+
+            for w in 0..WORDS {
+                let mut gone = self.reg[w] & !self.cur[w];
+                while gone != 0 {
+                    let b = gone.trailing_zeros() as usize;
+                    gone &= gone - 1;
+                    let idx = w * 64 + b;
+                    self.ctl(OP_DEL, idx as c_int, 0);
+                    self.evs[idx] = 0;
+                    self.reg[w] &= !(1u64 << b);
+                }
+            }
+        }
+    }
+
+    pub fn events_mask(ev: std::os::raw::c_short) -> u8 {
+        let mut m = 0u8;
+        if ev & super::POLLIN != 0 {
+            m |= IN;
+        }
+        if ev & super::POLLOUT != 0 {
+            m |= OUT;
+        }
+        m
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn no_epoll() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("RSBOOT_NO_EPOLL").is_some())
+}
+
 /// 常驻的 `pollfd` 集合：fd 数组与就绪下标缓冲都只分配一次，之后原地复用。
 ///
 /// 为什么要它：worker 每轮循环都要"把所有连接 fd 拼起来 poll"。旧写法每轮
@@ -310,6 +500,9 @@ pub struct PollSet {
     woken: bool,
     /// 唤醒器占了几个槽（0 或 1），决定就绪下标要不要减偏移
     waker_slots: usize,
+    /// Linux 上的 epoll 后端；项数够多且有变化才存在，否则走 `poll`
+    #[cfg(all(unix, not(target_os = "macos")))]
+    ep: Option<ep::Session>,
 }
 
 #[cfg(unix)]
@@ -327,6 +520,8 @@ impl PollSet {
             ready: Vec::with_capacity(64),
             woken: false,
             waker_slots: 0,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            ep: None,
         }
     }
 
@@ -374,6 +569,8 @@ impl PollSet {
                 revents: 0,
             });
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        self.sync_backend();
     }
 
     /// 等任意 fd 就绪。
@@ -386,6 +583,10 @@ impl PollSet {
         self.woken = false;
         if self.items.is_empty() {
             return Ok(());
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if self.ep.is_some() {
+            return self.wait_ep(timeout_ms);
         }
         for p in self.items.iter_mut() {
             p.revents = 0;
@@ -411,6 +612,87 @@ impl PollSet {
                 self.woken = true;
             } else {
                 self.ready.push(i - self.waker_slots);
+            }
+        }
+        Ok(())
+    }
+
+    /// 决定这一轮走 `epoll` 还是 `poll`，并把 `epoll` 的注册集合与 `items` 对账。
+    ///
+    /// 退出条件（退回 `poll`）：项数太少，或某个 fd 超出位图范围（极端高 fd）。
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn sync_backend(&mut self) {
+        // 逃生阀 + A/B 开关：`RSBOOT_NO_EPOLL=1` 强制走 `poll`（macOS 路径）
+        if no_epoll() {
+            self.ep = None;
+            return;
+        }
+        let use_ep = self.items.len() >= ep::MIN_ITEMS
+            && self
+                .items
+                .iter()
+                .all(|p| p.fd >= 0 && (p.fd as usize) < ep::BITS);
+        if !use_ep {
+            self.ep = None; // Drop 里 close
+            return;
+        }
+        if self.ep.is_none() {
+            match ep::Session::new() {
+                Ok(s) => self.ep = Some(s),
+                // 建不出来（EMFILE/ENOMEM）不是错误：这轮及以后走 `poll` 就是了
+                Err(_) => return,
+            }
+        }
+        if let Some(s) = self.ep.as_mut() {
+            s.sync(&self.items);
+        }
+    }
+
+    /// `epoll_wait` 分支：只收内核报回来的就绪 fd，不再全量重扫。
+    ///
+    /// 内核报的是 fd 号（`data`），这里换回 `items` 下标。就绪数通常只有几个
+    /// （本轮 2–3 个），线性查找的代价是一次就绪 × 几百字节比较，可忽略；
+    /// 好处是下标与 `items` 永远同步，不怕连接在轮内被 `swap_remove` 打乱。
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn wait_ep(&mut self, timeout_ms: i32) -> std::io::Result<()> {
+        let items_addr = self.items.as_ptr();
+        let items_len = self.items.len();
+        let sess = self.ep.as_mut().expect("wait_ep 只在有 ep 时调用");
+        // SAFETY: 缓冲区属于本结构，长度按常量传入
+        let n = unsafe {
+            ep::epoll_wait(
+                sess.epfd,
+                sess.evbuf.as_mut_ptr(),
+                ep::MAX_EVENTS as c_int,
+                timeout_ms,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(4) {
+                return Ok(());
+            }
+            return Err(e);
+        }
+        for k in 0..n as usize {
+            // SAFETY: `Event` 是 packed，只能按裸指针读字段
+            let d = unsafe { std::ptr::addr_of!(sess.evbuf[k].data).read_unaligned() };
+            let fd = d as c_int;
+            let mut hit = usize::MAX;
+            for i in 0..items_len {
+                // SAFETY: i < items_len，指针有效且未被写
+                if unsafe { (*items_addr.add(i)).fd } == fd {
+                    hit = i;
+                    break;
+                }
+            }
+            if hit == usize::MAX {
+                continue;
+            }
+            if hit < self.waker_slots {
+                self.woken = true;
+            } else {
+                self.ready.push(hit - self.waker_slots);
             }
         }
         Ok(())
