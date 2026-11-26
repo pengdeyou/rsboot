@@ -50,11 +50,10 @@ rsw_entry_stub:
 );
 
 // Mach-O 的符号带前导下划线：`extern "C" fn rsw_save_switch` 在 macOS 上解析成
-// `_rsw_save_switch`，而 `.globl rsw_save_switch` 定义的是不带下划线的名字，
+// `_rsw_save_switch`，而 `.globl rsw_save_switch` 定义的是不带下划线的名字——
 // 两边对不上，链接期就是 undefined symbol。
 //
-// 与 Linux 那段逐字对应，只多了 `_` 前缀——这段同样只在 macOS 编译，
-// 所以直到第一次在 macOS 上链接才暴露。
+// 这段同样只在 macOS 编译，Linux 上被 cfg 排除，因此一直没暴露。
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 global_asm!(
     r#"

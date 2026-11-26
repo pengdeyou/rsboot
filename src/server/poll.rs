@@ -238,8 +238,8 @@ impl Waker {
         {
             let b: u8 = 1;
             // SAFETY: 写 1 字节到管道写端。`b` 是 `u8`，取址才是 `*const u8`——
-            // `u8` 上没有 `as_ptr()`（原来写成 `b.as_ptr()`，这段只在 macOS 编译，
-            // Linux 上被 cfg 排除，一直没暴露）
+            // `u8` 上没有 `as_ptr()`（这里原来写成 `b.as_ptr()`，因为这段只在
+            // macOS 编译，Linux 上被 cfg 排除，一直没暴露）
             unsafe {
                 write(self.inner.write, (&b as *const u8).cast::<c_void>(), 1);
             }

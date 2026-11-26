@@ -1,0 +1,7 @@
+# 与 rsbatis 保持同一工具链。
+#
+# rsboot 依赖 rsbatis 的 API 与宏展开结果，两个仓库用不同 rustc 时，
+# 编译错误会出现在"看起来无关"的地方——统一版本比追查差异便宜得多。
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
