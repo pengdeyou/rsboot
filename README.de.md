@@ -1,8 +1,10 @@
 # rsboot
 
-> ### Der schnellste Weg, einen Rust-Webdienst zu bauen.
+> ### Der schnellste Weg, einen Rust-Webdienst zu *bauen*.
 >
 > Bei I/O-lastiger Last schneller als axum und actix-web — **9 687 QPS** bei 200 gleichzeitigen Clients / 20 ms, **96-fach gegenüber der eigenen synchronen Vorgängerversion**. Eine Abhängigkeitszeile in `Cargo.toml`; Signalbehandlung, OpenAPI-Dokumentation und Connection-Pooling sind eingebaut — in wenigen Zeilen vom leeren Verzeichnis zum laufenden Endpunkt.
+>
+> Wir sind **nicht** der Meister im reinen Durchsatz, und dieses README tut nicht so: Auf dem JSON-Pfad ohne I/O liegt actix-web bei hoher Nebenläufigkeit rund 18 % vorn. Die Tabelle unten zeigt jede Spalte — auch die, in denen wir verlieren.
 
 Ein Anwendungsframework für Rust im Stil von FastAPI — deklaratives Routing, typisierte Extraktion, automatisch erzeugte OpenAPI-Dokumentation. **Der HTTP/1.1-Stack und der Coroutine-Scheduler sind vollständig selbst geschrieben**: kein tokio, kein hyper, kein axum.
 
@@ -34,12 +36,14 @@ Gemessen gegen axum und actix-web. Aufbau: Linux-VM mit 4 Kernen, **2 Worker-Thr
 | `/slow` — 20 ms Verzögerung, 5 gleichzeitig | **248** | 236 | 236 |
 | `/slow` — 20 ms Verzögerung, 20 gleichzeitig | **990** | 944 | 944 |
 | `/slow` — 20 ms Verzögerung, 200 gleichzeitig | **9 687** | 9 237 | 9 292 |
-| `/json` — keine blockierende I/O | **157 730** | 138 926 | **162 098** |
+| `/json` — 4 gleichzeitig, no blocking I/O | **112 267** | 92 280 | 110 919 |
+| `/json` — 20 gleichzeitig, no blocking I/O | 131 350 | 133 843 | **155 315** |
 
 Was die Tabelle aussagt — einschließlich dessen, was uns nicht schmeichelt:
 
 - Bei blockierenden Lasten ist rsboot der schnellste der drei, aber nur um wenige Prozent gegenüber axum/actix — alle drei halten die Worker beschäftigt und konvergieren daher. Die eigentlich interessante Zahl ist der Vergleich mit **unserer eigenen synchronen Version**: 99 → 9 687 QPS bei 200 gleichzeitigen Clients, **96-fach**. Genau dafür existiert die Coroutine-Schicht.
-- Bei reinem, nicht blockierendem JSON-Durchsatz ist **actix-web 2,7 % schneller als rsboot** (162 098 gegenüber 157 730), rsboot liegt 13,5 % vor axum. Bei Handler-Dispatch und Allokationsprofil pro Anfrage gewinnt actix weiterhin — das wird hier nicht beschönigt.
+- Der reine JSON-Durchsatz spaltet sich nach Nebenläufigkeit, und wir verlieren eine Hälfte davon. Bei 4 Clients führt rsboot (**112 267** — 1,2 % vor actix, 21,7 % vor axum). Bei 20 Clients **zieht actix-web um 18 % davon** (155 315 gegenüber 131 350) und axum überholt uns knapp um 1,9 %. Die gemessene Ursache ist unsere Header-State-Machine (757 ns pro Request-Head gegenüber 122 ns bei `httparse`) plus Buchhaltung pro Anfrage — Kosten, die mit gleichzeitigen Anfragen wachsen. Ebenfalls verifiziert: woran es *nicht* liegt — `poll`-Blockieren macht nur 14 % der Worker-Zeit aus, und kleine Antworten gehen bereits in einem einzigen `write` raus.
+- Die frühere Zahl 157 730 ist **zurückgezogen**. Der Lastgenerator selbst kostete Mikrosekunden pro Anfrage (zwei `Instant::now()`-Aufrufe zu je ~1,8 µs auf dieser Test-VM), was alle drei Server auf denselben Wert plättete. Die Tabelle stammt aus einem neu gebauten Client: `rdtsc`-Zeitmessung, keine Allokation und kein Syscall pro Anfrage.
 - Downstream-Aufrufe: 40 gleichzeitige Clients × 20 ms Abhängigkeit, kooperativer Modus **655 QPS / p99 62 ms** gegenüber blockierender Basis **33 QPS / p99 2 323 ms** — 20-facher Unterschied, ausgelöst durch einen einzigen Schalter (`RSBOOT_BLOCKING_IO`).
 
 Diese Zahlen schwanken je nach Maschine. Vergleiche nur innerhalb eines Laufs, nie über Maschinen hinweg und nie gegen absolute Werte aus fremden Blogposts.
