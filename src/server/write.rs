@@ -12,6 +12,7 @@
 
 use std::io::{self, Write};
 
+use crate::server::profile;
 use crate::web::response::Response;
 
 /// 写完整响应。`head_only` 为真时不写 body（HEAD 请求）。
@@ -123,7 +124,9 @@ pub fn write_response_fd(
     // 就是每请求一次 malloc/free。容量只增不减，稳态下零分配。
     head.clear();
     head.reserve(96 + resp.headers.len() * 32);
+    let _h = profile::start(profile::HEAD);
     fill_head(head, resp, close);
+    drop(_h);
 
     let body: &[u8] = if head_only || body_forbidden(resp) {
         &[]
@@ -131,11 +134,15 @@ pub fn write_response_fd(
         &resp.body
     };
 
-    if body.len() <= WRITEV_THRESHOLD {
+    let _f = profile::start(profile::FLUSH);
+    let out = if body.len() <= WRITEV_THRESHOLD {
         head.extend_from_slice(body);
-        return write_all_fd(fd, head);
-    }
-    writev_all(fd, head, body)
+        write_all_fd(fd, head)
+    } else {
+        writev_all(fd, head, body)
+    };
+    drop(_f);
+    out
 }
 
 #[cfg(unix)]
@@ -464,5 +471,61 @@ mod tests {
         assert_eq!(civil_from_days(365), (1971, 1, 1));
         // 2000-03-01 = 11017 天
         assert_eq!(civil_from_days(11017), (2000, 3, 1));
+    }
+}
+
+#[cfg(test)]
+mod bench_loopback {
+    //! 回答一个判断题：`flush` 段每次 14–17 µs，是这台机器 loopback 的
+    //! 固有写入成本，还是被压测的并发调度撑起来的？
+    //!
+    //! 这里只让**一个线程写、一个线程读**，其他什么都不做。若这里也是
+    //! 十几 µs，说明是内核/宿主环境；若只有 1–2 µs，说明线上那 14 µs
+    //! 里含的是"唤醒同机对端线程"的调度账，代码这边没有可控余量。
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = TcpStream::connect(addr).unwrap();
+        let (s, _) = l.accept().unwrap();
+        (s, c)
+    }
+
+    fn bench(len: usize) -> f64 {
+        let (mut a, mut b) = pair();
+        let _ = a.set_nodelay(true);
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match b.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let buf = vec![b'x'; len];
+        for _ in 0..1000 {
+            let _ = a.write(&buf);
+        }
+        let n = 20_000u64;
+        let t0 = crate::server::clock::now_ns();
+        for _ in 0..n {
+            let _ = a.write(&buf);
+        }
+        let dt = crate::server::clock::now_ns() - t0;
+        let per = dt as f64 / n as f64;
+        drop(a);
+        let _ = reader.join();
+        per
+    }
+
+    #[test]
+    fn bench_loopback_write() {
+        eprintln!("[bench] loopback write 60B:  {:.0} ns/次", bench(60));
+        eprintln!("[bench] loopback write 574B: {:.0} ns/次", bench(574));
+        eprintln!("[bench] loopback write 4KB:  {:.0} ns/次", bench(4096));
     }
 }

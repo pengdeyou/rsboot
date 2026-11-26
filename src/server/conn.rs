@@ -107,8 +107,13 @@ const LINE_BUF_BYTES: usize = 256;
 const OUT_BUF_BYTES: usize = 256;
 
 pub struct Conn {
-    stream: TcpStream,
-    /// 让出式读缓冲：`read_until` / `read_exact` 内部就会挂起等 `POLLIN`
+    /// 让出式读缓冲：`read_until` / `read_exact` 内部就会挂起等 `POLLIN`。
+    ///
+    /// 连接的所有权只在这里一份。早先 `Conn` 另存一个 `TcpStream`（从
+    /// `try_clone` dup 出来的），读写各握一个 fd：dup 是每连接一次系统调用，
+    /// 还多占一个 fd 配额。短连接压测里 accept 路径 5.7 µs/连接，这一项
+    /// 加上 `set_nodelay` 的 setsockopt 就是其中两刀。现在写响应直接取
+    /// 这里面的 fd。
     reader: BufReader<coio::CoIo>,
     /// 当前请求的头原文。按连接复用：keep-alive 下每条连接处理成千上万个请求，
     /// 每请求新建一个 `String` 意味着一次 malloc + 数次 realloc（头部有 8 行时
@@ -144,9 +149,8 @@ impl Conn {
         // 读超时不再依赖 SO_RCVTIMEO——`CoIo` 挂起时自带 250ms 心跳，
         // 真正的空闲上限仍由 `read_head` 里的 elapsed 判定。
         let _ = stream.set_nodelay(true);
-        let reader = BufReader::with_capacity(READ_BUF_BYTES, coio::CoIo::new(stream.try_clone()?)?);
+        let reader = BufReader::with_capacity(READ_BUF_BYTES, coio::CoIo::new(stream)?);
         Ok(Self {
-            stream,
             reader,
             head_buf: String::with_capacity(HEAD_BUF_BYTES),
             line_buf: Vec::with_capacity(LINE_BUF_BYTES),
@@ -172,7 +176,7 @@ impl Conn {
     }
 
     pub fn peer(&self) -> Option<String> {
-        self.stream.peer_addr().ok().map(|a| a.to_string())
+        self.reader.get_ref().get_ref().peer_addr().ok().map(|a| a.to_string())
     }
 
     /// 原始 fd，给 worker 的 `poll` 用。
@@ -180,7 +184,7 @@ impl Conn {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            Some(self.stream.as_raw_fd())
+            Some(self.reader.get_ref().get_ref().as_raw_fd())
         }
         #[cfg(not(unix))]
         {
@@ -195,7 +199,7 @@ impl Conn {
     #[cfg(unix)]
     pub fn has_pending_input(&self) -> std::io::Result<bool> {
         use std::os::unix::io::AsRawFd;
-        crate::server::poll::wait_readable(self.stream.as_raw_fd(), 0)
+        crate::server::poll::wait_readable(self.reader.get_ref().get_ref().as_raw_fd(), 0)
     }
 
     #[cfg(not(unix))]
@@ -204,7 +208,7 @@ impl Conn {
     }
 
     pub fn into_stream(self) -> TcpStream {
-        self.stream
+        self.reader.into_inner().into_inner()
     }
 
     /// 处理**一个**请求就返回。
@@ -235,7 +239,7 @@ impl Conn {
         // 直接断连时客户端只看到 "empty reply"，重试逻辑差一点的会当故障；
         // 回 503 + `retry-after` + `connection: close` 它才知道该换实例重试。
         if should_stop() {
-            let _ = write_closing(&mut self.stream);
+            let _ = write_closing(self.reader.get_mut());
             return CLOSED;
         }
 
@@ -259,19 +263,19 @@ impl Conn {
             Err(HeadError::Eof) => return CLOSED,
             Err(HeadError::Stopped) => {
                 // 正在关闭：给明确答复再走
-                let _ = write_closing(&mut self.stream);
+                let _ = write_closing(self.reader.get_mut());
                 return CLOSED;
             }
             Err(HeadError::TooLarge) => {
                 let _ = write_error(
-                    &mut self.stream,
+                    self.reader.get_mut(),
                     ApiError::new(Status(431), "请求头过大"),
                     true,
                 );
                 return CLOSED;
             }
             Err(HeadError::Malformed(m)) => {
-                let _ = write_error(&mut self.stream, ApiError::new(Status::BAD_REQUEST, m), true);
+                let _ = write_error(self.reader.get_mut(), ApiError::new(Status::BAD_REQUEST, m), true);
                 return CLOSED;
             }
         };
@@ -282,7 +286,7 @@ impl Conn {
             Ok(p) => p,
             Err(ParseError { status, message }) => {
                 // 解析层拒绝一律断开：边界已不可信
-                let _ = write_error(&mut self.stream, ApiError::new(status, message), true);
+                let _ = write_error(self.reader.get_mut(), ApiError::new(status, message), true);
                 return CLOSED;
             }
         };
@@ -294,7 +298,7 @@ impl Conn {
                 if self.reader.read_exact(&mut buf).is_err() {
                     // body 没读全：断开，绝不把半截数据交给 handler
                     let _ = write_error(
-                        &mut self.stream,
+                        self.reader.get_mut(),
                         ApiError::new(Status::BAD_REQUEST, "请求体不完整"),
                         true,
                     );
@@ -345,7 +349,7 @@ impl Conn {
         {
             use std::os::unix::io::AsRawFd;
             write::write_response_fd(
-                self.stream.as_raw_fd(),
+                self.reader.get_ref().get_ref().as_raw_fd(),
                 &resp,
                 parsed.close,
                 head_only,
@@ -353,7 +357,7 @@ impl Conn {
             )?;
         }
         #[cfg(not(unix))]
-        write::write_response(&mut self.stream, &resp, parsed.close, head_only)?;
+        write::write_response(self.reader.get_mut(), &resp, parsed.close, head_only)?;
         drop(_t);
         profile::finish_request();
         self.served += 1;

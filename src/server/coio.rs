@@ -128,6 +128,7 @@ pub fn write_fd_all(fd: std::os::raw::c_int, mut buf: &[u8]) -> io::Result<()> {
         let n = unsafe { write(fd, buf.as_ptr().cast::<c_void>(), buf.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
+            crate::server::profile::note_write(matches!(e.raw_os_error(), Some(11) | Some(35)));
             match e.raw_os_error() {
                 // EINTR：被信号打断，重试
                 Some(4) => continue,
@@ -151,6 +152,7 @@ pub fn write_fd_all(fd: std::os::raw::c_int, mut buf: &[u8]) -> io::Result<()> {
                 _ => return Err(e),
             }
         }
+        crate::server::profile::note_write(false);
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,

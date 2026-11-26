@@ -169,13 +169,24 @@ fn main_loop(
 
         // 推进协程：让出的请求在这里接着跑。worker 只有这一处会切进
         // 协程栈，别的地方都是纯事件循环。
+        let mut mark = round_t0;
         mn::sched::pump(4096);
+        mark = {
+            let n = clock::now_ns();
+            profile::note_prep(0, mark, n);
+            n
+        };
         {
             let mut g = rets.lock().unwrap();
             if !g.is_empty() {
                 conns.extend(g.drain(..));
             }
         }
+        mark = {
+            let n = clock::now_ns();
+            profile::note_prep(1, mark, n);
+            n
+        };
 
         // 先把新派来的连接收进本地表
         let mut got_from_peer = false;
@@ -186,8 +197,18 @@ fn main_loop(
         if got_from_peer {
             stole_at = Instant::now();
         }
+        mark = {
+            let n = clock::now_ns();
+            profile::note_prep(2, mark, n);
+            n
+        };
 
         maybe_rebalance(id, &mut conns, &sh, &mut last_rebalance, stole_at);
+        mark = {
+            let n = clock::now_ns();
+            profile::note_prep(3, mark, n);
+            n
+        };
 
         // 拼出本轮要等的 fd（唤醒器恒在 items[0]），然后真阻塞。
         // 兜底超时只防"唤醒漏了"，正常路径由 `Waker` 立刻叫醒：
@@ -216,6 +237,7 @@ fn main_loop(
         // 量一下阻塞真正的占比：若 `poll` 只占个位数，换 `epoll` 就纯属
         // 白费——那点内核扫描不是差距来源
         let poll_t0 = clock::now_ns();
+        profile::note_prep(profile::PREP_LAST, mark, poll_t0);
         if let Err(e) = ps.wait(timeout) {
             eprintln!("[rsboot] worker poll 失败：{e}");
             std::thread::sleep(Duration::from_millis(5));
