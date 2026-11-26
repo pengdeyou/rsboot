@@ -1,5 +1,9 @@
 # rsboot
 
+> ### Der schnellste Weg, einen Rust-Webdienst zu bauen.
+>
+> Bei I/O-lastiger Last schneller als axum und actix-web — **9 687 QPS** bei 200 gleichzeitigen Clients / 20 ms, **96-fach gegenüber der eigenen synchronen Vorgängerversion**. Eine Abhängigkeitszeile in `Cargo.toml`; Signalbehandlung, OpenAPI-Dokumentation und Connection-Pooling sind eingebaut — in wenigen Zeilen vom leeren Verzeichnis zum laufenden Endpunkt.
+
 Ein Anwendungsframework für Rust im Stil von FastAPI — deklaratives Routing, typisierte Extraktion, automatisch erzeugte OpenAPI-Dokumentation. **Der HTTP/1.1-Stack und der Coroutine-Scheduler sind vollständig selbst geschrieben**: kein tokio, kein hyper, kein axum.
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)

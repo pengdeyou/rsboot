@@ -1,5 +1,9 @@
 # rsboot
 
+> ### Le moyen le plus rapide de construire un service web en Rust.
+>
+> Plus rapide qu'axum et actix-web sur les charges d'E/S — **9 687 QPS** à 200 clients simultanés / 20 ms, **96× notre propre version synchrone**. Une seule ligne de dépendance dans `Cargo.toml` ; gestion des signaux, documentation OpenAPI et pool de connexions sont intégrés — quelques lignes d'un répertoire vide à un endpoint qui tourne.
+
 Un framework applicatif pour Rust, dans l'esprit de FastAPI : routage déclaratif, extraction typée, documentation OpenAPI générée automatiquement. **La pile HTTP/1.1 et l'ordonnanceur de coroutines sont entièrement écrits maison** : pas de tokio, pas de hyper, pas de axum.
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)

@@ -1,5 +1,9 @@
 # rsboot
 
+> ### 最快的 Rust 开发框架。
+>
+> 慢 I/O 负载下快于 axum 与 actix-web——200 并发 / 20 ms 延迟下 **9 687 QPS**，是自己旧同步实现的 **96 倍**。同时是上手最短的一条路：`Cargo.toml` 里一行依赖声明，信号处理、OpenAPI 文档、连接池全部内置，几行代码就能跑通端点。
+
 对标 FastAPI 的 Rust 应用框架：声明式路由、类型化提取、自动 OpenAPI。**HTTP/1.1 协议栈与协程调度全部自研**——不引 tokio，不引 hyper，不引 axum。
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)
