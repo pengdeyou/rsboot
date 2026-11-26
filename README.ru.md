@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/rsboot-logo.svg" alt="rsboot" width="200">
+</p>
+
 # rsboot
 
 > ### Самый быстрый способ *собрать* веб-сервис на Rust.

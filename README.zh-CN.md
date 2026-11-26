@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/rsboot-logo.svg" alt="rsboot" width="200">
+</p>
+
 # rsboot
 
 > ### 最快的 Rust Web 服务开发方式。

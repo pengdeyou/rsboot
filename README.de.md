@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/rsboot-logo.svg" alt="rsboot" width="200">
+</p>
+
 # rsboot
 
 > ### Der schnellste Weg, einen Rust-Webdienst zu *bauen*.

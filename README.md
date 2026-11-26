@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/rsboot-logo.svg" alt="rsboot" width="200">
+</p>
+
 # rsboot
 
 > ### The fastest way to *build* a Rust web service.
