@@ -24,6 +24,8 @@ pub struct PathTemplate {
     segs: Vec<Seg>,
     /// 是否含参数（不含参数的路由可以走快速比较）
     pub has_params: bool,
+    /// 参数个数。命中时才 `Vec::with_capacity`，别为拿长度再遍历一遍。
+    param_count: usize,
 }
 
 impl PathTemplate {
@@ -42,6 +44,7 @@ impl PathTemplate {
                 raw: "/".to_string(),
                 segs: Vec::new(),
                 has_params: false,
+                param_count: 0,
             });
         }
         let mut segs = Vec::new();
@@ -79,8 +82,17 @@ impl PathTemplate {
         let has_params = !names.is_empty();
         Ok(Self {
             raw: raw.to_string(),
+            param_count: names.len(),
             segs,
             has_params,
+        })
+    }
+
+    /// 逐段视图：`Some(字面量)` 或 `None`（参数段）。给路由树建索引用。
+    pub fn segments(&self) -> impl Iterator<Item = Option<&str>> {
+        self.segs.iter().map(|s| match s {
+            Seg::Lit(l) => Some(l.as_str()),
+            Seg::Param(_) => None,
         })
     }
 
@@ -116,6 +128,15 @@ impl PathTemplate {
     ///
     /// 参数值已经做过百分号解码（`%20` → 空格），所以这里拿到的是业务可用的值。
     pub fn matches(&self, path: &str) -> Option<Vec<(String, String)>> {
+        self.matches_inner(path, false)
+    }
+
+    /// 调用方已经保证"段数与自己相同"时用这个：省掉一次全路径的 `/` 计数。
+    pub(crate) fn matches_with_len(&self, path: &str) -> Option<Vec<(String, String)>> {
+        self.matches_inner(path, true)
+    }
+
+    fn matches_inner(&self, path: &str, len_known: bool) -> Option<Vec<(String, String)>> {
         let trimmed = path.strip_prefix('/').unwrap_or(path);
         // 根路径 `/`
         if self.segs.is_empty() {
@@ -126,31 +147,28 @@ impl PathTemplate {
             };
         }
         if !self.has_params {
-            // 无参数：直接字符串比较，不分配
-            let expected: String = self
-                .segs
-                .iter()
-                .map(|s| match s {
-                    Seg::Lit(l) => l.as_str(),
-                    Seg::Param(_) => unreachable!("has_params 已判定为 false"),
-                })
-                .collect::<Vec<_>>()
-                .join("/");
-            return if trimmed == expected {
+            // 无参数：`raw` 就是这条路径的字面量，直接比，不再逐段拼一个 String
+            // 出来再比。早先的写法每匹配一次静态路由就要 `collect` 一个 Vec、
+            // 再 `join` 出一个 String——只为做一次字符串相等判断。
+            let expect = self.raw.strip_prefix('/').unwrap_or(&self.raw);
+            return if trimmed == expect {
                 Some(Vec::new())
             } else {
                 None
             };
         }
-        let parts: Vec<&str> = trimmed.split('/').collect();
-        if parts.len() != self.segs.len() {
+        // 先按段数排除。这一步不分配：早先是 `trimmed.split('/').collect()`
+        // 成一个 Vec，再不匹配也要为它买一次堆。
+        if !len_known && count_segments(trimmed) != self.segs.len() {
             return None;
         }
-        let mut params = Vec::with_capacity(self.param_names().len());
-        for (seg, part) in self.segs.iter().zip(parts.iter()) {
+        let mut params = Vec::with_capacity(self.param_count);
+        let mut parts = trimmed.split('/');
+        for seg in self.segs.iter() {
+            let Some(part) = parts.next() else { return None };
             match seg {
                 Seg::Lit(l) => {
-                    if l.as_str() != *part {
+                    if l.as_str() != part {
                         return None;
                     }
                 }
@@ -163,8 +181,21 @@ impl PathTemplate {
                 }
             }
         }
+        // 段数已经对齐过，理论上不会多出片段；多出来说明计数与切分口径不一致，
+        // 宁可判不命中，也不要把半截路径当命中。
+        if parts.next().is_some() {
+            return None;
+        }
         Some(params)
     }
+}
+
+/// 数 `a/b/c` 有几段，不分配。
+fn count_segments(trimmed: &str) -> usize {
+    if trimmed.is_empty() {
+        return 0;
+    }
+    1 + trimmed.bytes().filter(|b| *b == b'/').count()
 }
 
 /// `%41` → `A`，`+` **不**当空格（路径里 `+` 是字面加号，只有 query 里才是空格）。
@@ -207,6 +238,48 @@ mod tests {
 
     fn t(s: &str) -> PathTemplate {
         PathTemplate::parse(s).unwrap()
+    }
+
+    /// 量"路由一多，分派退化成什么"。不是断言，是给"要不要换前缀树"
+    /// 这个决定提供数字：200 条同首段、同段数的路由，命中最后一个
+    /// （最坏情况扫全表）。
+    #[test]
+    fn bench_miss_scan() {
+        let statics: Vec<PathTemplate> =
+            (0..200).map(|i| t(&format!("/api/v1/route{i}"))).collect();
+        let params: Vec<PathTemplate> =
+            (0..200).map(|i| t(&format!("/api/v1/seg{i}/{{id}}"))).collect();
+        let n = 2000usize;
+
+        let path = "/api/v1/route199";
+        let started = std::time::Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..n {
+            for tp in &statics {
+                if tp.matches(std::hint::black_box(path)).is_some() {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+        let static_ns = started.elapsed().as_nanos() as f64 / n as f64;
+
+        let ppath = "/api/v1/seg199/42";
+        let started = std::time::Instant::now();
+        let mut phits = 0usize;
+        for _ in 0..n {
+            for tp in &params {
+                if tp.matches(std::hint::black_box(ppath)).is_some() {
+                    phits += 1;
+                    break;
+                }
+            }
+        }
+        let param_ns = started.elapsed().as_nanos() as f64 / n as f64;
+
+        println!(
+            "200 条路由的最坏扫描：静态 {static_ns:.0} ns/请求（命中 {hits}），参数 {param_ns:.0} ns/请求（命中 {phits}）"
+        );
     }
 
     #[test]

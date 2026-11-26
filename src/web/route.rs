@@ -1,12 +1,18 @@
 //! 路由表。
 //!
-//! ## 匹配策略：首段字面量分桶 + 段数预筛
+//! ## 匹配策略：段级前缀树
 //!
-//! 1000 条路由时全表扫描是 1000 次字符串比较；分桶后 `/users/7` 只跟
-//! 首段为 `users` 的那几条比。参数开头的路由（`/{tenant}/x`）单独放一个桶，
-//! 因为它们的首段匹配任何值。
+//! 分派成本跟**段数**走，不跟**路由条数**走。200 条都挂在 `/api/v1/...`
+//! 下时，早先的"按首段分桶再线性扫"会把 200 条全塞进同一个桶，每次请求
+//! 扫到最后一条要几千纳秒（路由越多越慢，这是最容易被忽略的一类退化）。
+//! 前缀树上 `/api/v1/orders/7` 只走 `api`→`v1`→`orders`→`{id}` 四次哈希查。
 //!
-//! 段数是第二道筛子：`/a/b` 不可能匹配 3 段的模板，连字符串比较都不用做。
+//! 同一层同时存在字面量段和参数段时（`/users/me` 与 `/users/{id}`），
+//! 字面量优先：更具体的那条先被尝试，它不接（比如方法不对）再让给参数段。
+//! 这样两条都能命中时结果稳定可预期，不依赖注册顺序。
+//!
+//! 没有任何路由匹配时才算 404；路径匹配上但方法不对仍是 405 + `Allow`——
+//! 把 405 回成 404 会让客户端以为是路径写错，而不去检查方法。
 //!
 //! ## 405 不是 404
 //!
@@ -49,11 +55,89 @@ impl Route {
     }
 }
 
+/// 路径段上的一个节点。
+///
+/// `statics` 是字面量段（`/users` 里的 `users`），`param` 是参数段
+/// （`/users/{id}` 里的 `{id}`）。两者可以同时存在，匹配时字面量先走。
+struct Node {
+    statics: HashMap<Box<str>, Node>,
+    param: Option<Box<Node>>,
+    /// 在这条路径上结束的路由下标。同一路径可以有多条路由（不同方法），
+    /// 405 的 `Allow` 就是从这里的兄弟项收出来的。
+    ends: Vec<usize>,
+}
+
+impl Default for Node {
+    fn default() -> Self {
+        Self {
+            statics: HashMap::new(),
+            param: None,
+            ends: Vec::new(),
+        }
+    }
+}
+
+impl Node {
+    /// 沿路径下行，按"字面量优先、参数其次"的顺序把**所有**匹配到的终点
+    /// 交给 `f`。`f` 返回 `true` 表示已处理完，停止回溯。
+    ///
+    /// 用回调而不是返回 `Vec`：候选通常是 1 组，没必要为它分配。回溯只在
+    /// "字面量子树整条链都没接住"时才发生，深度最多等于段数。
+    fn visit<'a, F>(node: &'a Node, tail: &str, f: &mut F) -> bool
+    where
+        F: FnMut(&'a Vec<usize>) -> bool,
+    {
+        if tail.is_empty() {
+            return if node.ends.is_empty() {
+                false
+            } else {
+                f(&node.ends)
+            };
+        }
+        // 当场切出这一段，不先 `split('/').collect()` 成 Vec：
+        // 那是每请求一次堆分配，只为了让递归能按切片下标走。
+        let (head, rest) = match tail.find('/') {
+            Some(i) => (&tail[..i], &tail[i + 1..]),
+            None => (tail, ""),
+        };
+        if let Some(child) = node.statics.get(head) {
+            if Self::visit(child, rest, f) {
+                return true;
+            }
+        }
+        if let Some(p) = &node.param {
+            // 空段（`/users//7`）不算参数命中，跟模板匹配保持同一口径
+            if !head.is_empty() && Self::visit(p, rest, f) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 注册期插入一段路径。
+    fn insert(&mut self, idx: usize, segs: &[Option<String>]) {
+        let mut node = self;
+        for seg in segs {
+            node = match seg {
+                Some(lit) => node
+                    .statics
+                    .entry(lit.as_str().into())
+                    .or_insert_with(Node::default),
+                None => node
+                    .param
+                    .get_or_insert_with(|| Box::new(Node::default()))
+                    .as_mut(),
+            };
+        }
+        node.ends.push(idx);
+    }
+}
+
 /// 路由注册与分派。
 pub struct Router {
     routes: Vec<Route>,
-    /// 首段字面量 → 路由下标。空串这个桶放"首段是参数"的路由。
-    bucket: HashMap<String, Vec<usize>>,
+    /// 段级前缀树，分派只查它。
+    tree: Node,
     fallback: Option<HandlerFn>,
     /// 中间件。注册顺序 = 外层到内层；`after` 逆序执行。
     pub(crate) middlewares: Vec<Box<dyn Middleware>>,
@@ -78,7 +162,7 @@ impl Router {
     pub fn new() -> Self {
         Self {
             routes: Vec::new(),
-            bucket: HashMap::new(),
+            tree: Node::default(),
             fallback: None,
             middlewares: Vec::new(),
         }
@@ -105,7 +189,10 @@ impl Router {
                 template.raw
             )));
         }
-        let key = template.first_literal().unwrap_or("").to_string();
+        let segs: Vec<Option<String>> = template
+            .segments()
+            .map(|s| s.map(str::to_string))
+            .collect();
         let idx = self.routes.len();
         self.routes.push(Route {
             method,
@@ -115,7 +202,7 @@ impl Router {
             // 存储层只有一种类型，分派时不用再泛型化
             handler: Box::new(move |req, ctx| handler(req, ctx).into_response()),
         });
-        self.bucket.entry(key).or_default().push(idx);
+        self.tree.insert(idx, &segs);
         Ok(self)
     }
 
@@ -300,63 +387,25 @@ impl Router {
     }
 
     fn dispatch(&self, req: &mut Request, ctx: &Context) -> Response {
-        let (seg_count, first) = path_shape(&req.path);
-
-        // 两个桶：首段精确命中的，以及"参数/通配落在首段"的兜底桶。
-        // 精确的优先，顺序不能换。路径是 `/` 时只有一个桶。
-        //
-        // 早先的写法先把两边拷进一个 `Vec<usize>` 再遍历——桶里通常只有
-        // 1–3 条路由，攒这一下就是每请求一次 malloc + memcpy，纯属固定税。
-        let keys: [&str; 2] = [first, ""];
-        let key_count = if first.is_empty() { 1 } else { 2 };
+        // 路径切段一次，之后全是沿树走。切段要借 `req.path`，而命中后要写
+        // `req.params`——先把路径拷成局部 `String`，让两段借用各自独立。
+        // 这条拷贝换掉的是"每请求扫 N 条候选"，值。
+        let path = req.path.clone();
+        let trimmed = path.strip_prefix('/').unwrap_or(&path);
 
         let mut allowed: Vec<Method> = Vec::new();
-        for key in keys.iter().take(key_count) {
-            let Some(idxs) = self.bucket.get(*key) else {
-                continue;
-            };
-            for &idx in idxs {
-            let r = &self.routes[idx];
-            if r.template.len() != seg_count {
-                continue;
-            }
-            let Some(params) = r.template.matches(&req.path) else {
-                continue;
-            };
-
-            let method_ok = r.method == req.method
-                || (req.method == Method::Head && r.method == Method::Get)
-                || (req.method == Method::Options && r.method == Method::Get);
-
-            if !method_ok {
-                if !allowed.contains(&r.method) {
-                    allowed.push(r.method);
+        let mut hit: Option<Response> = None;
+        Node::visit(&self.tree, trimmed, &mut |idxs| {
+            match self.attempt(idxs, req, req.method, ctx, &path, &mut allowed) {
+                Some(resp) => {
+                    hit = Some(resp);
+                    true
                 }
-                continue;
+                None => false,
             }
-
-            // OPTIONS：不执行 handler，直接回能力声明
-            if req.method == Method::Options {
-                if !allowed.contains(&r.method) {
-                    allowed.push(r.method);
-                }
-                continue;
-            }
-
-            req.params = params;
-
-            // 一个 handler panic 不能让 worker 线程退出。捕获后请求对象直接丢弃：
-            // panic 之后它的内部状态不可信，继续用等于在赌。
-            let trace = req.request_id().map(|s| s.to_string());
-            let outcome = exception::with_trace(trace.as_deref(), || {
-                exception::guard(|| (r.handler)(req, ctx))
-            });
-            let resp = match outcome {
-                Ok(resp) => resp,
-                Err(payload) => exception::panic_response(payload),
-            };
+        });
+        if let Some(resp) = hit {
             return resp;
-            }
         }
 
         if !allowed.is_empty() {
@@ -386,6 +435,63 @@ impl Router {
         ApiError::not_found(format!("没有匹配的路由：{} {}", req.method.as_str(), req.path))
             .to_response()
     }
+
+    /// 同一路径上的几条路由里，挑出这次真正要跑的那条。
+    ///
+    /// 返回 `None` 有两种含义：方法都对不上（已记进 `allowed`，外面会回
+    /// 405/204），或者模板细节没匹配上（`/a//b` 这类畸形路径）。两者都
+    /// 表示"这一组没接住，让上层继续往参数分支回溯"。
+    fn attempt(
+        &self,
+        idxs: &[usize],
+        req: &mut Request,
+        method: Method,
+        ctx: &Context,
+        path: &str,
+        allowed: &mut Vec<Method>,
+    ) -> Option<Response> {
+        for &idx in idxs {
+            let r = &self.routes[idx];
+            // 走到这里段数已经和模板一致，不用再数一遍 `/`
+            let Some(params) = r.template.matches_with_len(path) else {
+                continue;
+            };
+
+            let method_ok = r.method == method
+                || (method == Method::Head && r.method == Method::Get)
+                || (method == Method::Options && r.method == Method::Get);
+
+            if !method_ok {
+                if !allowed.contains(&r.method) {
+                    allowed.push(r.method);
+                }
+                continue;
+            }
+
+            // OPTIONS：不执行 handler，直接回能力声明
+            if method == Method::Options {
+                if !allowed.contains(&r.method) {
+                    allowed.push(r.method);
+                }
+                continue;
+            }
+
+            req.params = params;
+
+            // 一个 handler panic 不能让 worker 线程退出。捕获后请求对象直接丢弃：
+            // panic 之后它的内部状态不可信，继续用等于在赌。
+            let trace = req.request_id().map(|s| s.to_string());
+            let outcome = exception::with_trace(trace.as_deref(), || {
+                exception::guard(|| (r.handler)(req, ctx))
+            });
+            let resp = match outcome {
+                Ok(resp) => resp,
+                Err(payload) => exception::panic_response(payload),
+            };
+            return Some(resp);
+        }
+        None
+    }
 }
 
 /// `Allow` 头的值：显式方法 + 由 GET 派生的 HEAD + 恒有的 OPTIONS。
@@ -406,27 +512,6 @@ fn allow_list(allowed: &[Method]) -> String {
     out.join(", ")
 }
 
-/// 一次扫描拿到两件分派要用的事：段数，以及首段（**借用**，不分配）。
-///
-/// 分成两个函数各扫一遍 path，既多走一遍字符串，首段还每次 `to_string()`
-/// ——那是每请求一次堆分配，只为拿去做一次 `HashMap::get`。
-fn path_shape(path: &str) -> (usize, &str) {
-    let t = path.strip_prefix('/').unwrap_or(path);
-    if t.is_empty() {
-        return (0, "");
-    }
-    let mut segs = 1usize;
-    let mut first_end = t.len();
-    for (i, b) in t.bytes().enumerate() {
-        if b == b'/' {
-            if segs == 1 {
-                first_end = i;
-            }
-            segs += 1;
-        }
-    }
-    (segs, &t[..first_end])
-}
 
 #[cfg(test)]
 mod tests {
@@ -465,6 +550,50 @@ mod tests {
         r.handle(&mut req, &c)
     }
 
+    /// 200 条路由挂在同一前缀下的分派成本。命中最后一个 = 最坏情况。
+    /// 小路由表（真实项目常见规模）上，树的分派成本绝对值。
+    #[test]
+    fn bench_dispatch_small() {
+        let r = router();
+        let c = ctx();
+        let n = 20000usize;
+        for path in ["/", "/users", "/users/7"] {
+            let mut req = Request::new(Method::Get, path);
+            let started = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(r.dispatch(&mut req, &c));
+            }
+            let per = started.elapsed().as_nanos() as f64 / n as f64;
+            println!("dispatch 4 条路由 {path}: {per:.0} ns/请求");
+        }
+    }
+
+    #[test]
+    fn bench_dispatch_200() {
+        let mut r = Router::new();
+        for i in 0..100 {
+            r = r
+                .get(&format!("/api/v1/static{i}"), |_, _| Response::text("s"))
+                .unwrap();
+        }
+        for i in 0..100 {
+            r = r
+                .get(&format!("/api/v1/param{i}/{{id}}"), |_, _| Response::text("p"))
+                .unwrap();
+        }
+        let c = ctx();
+        let n = 3000usize;
+        for path in ["/api/v1/static99", "/api/v1/param99/42", "/api/v1/missing"] {
+            let mut req = Request::new(Method::Get, path);
+            let started = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(r.dispatch(&mut req, &c));
+            }
+            let per = started.elapsed().as_nanos() as f64 / n as f64;
+            println!("dispatch 200 条路由 {path}: {per:.0} ns/请求");
+        }
+    }
+
     #[test]
     fn root_and_literal_routes() {
         let r = router();
@@ -499,14 +628,30 @@ mod tests {
     }
 
     #[test]
-    fn path_shape_matches_split_semantics() {
-        // 与旧的 `split('/')` 口径逐条对齐，否则分派会静默漏路由。
-        assert_eq!(path_shape("/"), (0, ""));
-        assert_eq!(path_shape(""), (0, ""));
-        assert_eq!(path_shape("/users"), (1, "users"));
-        assert_eq!(path_shape("/users/7"), (2, "users"));
-        assert_eq!(path_shape("users/7"), (2, "users"));
-        assert_eq!(path_shape("/a//b"), (3, "a"));
+    fn tree_split_semantics() {
+        // 树是"按 `/` 切段"建起来的，口径必须与当年 `split('/')` 一致，
+        // 否则分派会静默漏路由或者把畸形路径当成命中。
+        let r = Router::new()
+            .get("/", |_, _| Response::text("root"))
+            .unwrap()
+            .get("/users", |_, _| Response::text("list"))
+            .unwrap()
+            .get("/users/{id}", |_, _| Response::text("one"))
+            .unwrap()
+            .get("/a/b", |_, _| Response::text("ab"))
+            .unwrap();
+        // 根
+        assert_eq!(call(&r, Method::Get, "/").body, b"root");
+        assert_eq!(call(&r, Method::Get, "").body, b"root");
+        // 无前导斜杠也算同一条路径（与旧实现一致）
+        assert_eq!(call(&r, Method::Get, "users/7").body, b"one");
+        assert_eq!(call(&r, Method::Get, "/users/7").body, b"one");
+        assert_eq!(call(&r, Method::Get, "/users").body, b"list");
+        // 段数不对：`/users` 不该被 `{id}` 接住
+        assert_eq!(call(&r, Method::Get, "/users/7/extra").status, Status::NOT_FOUND);
+        // 空段是畸形路径，不该被当成参数 ""
+        assert_eq!(call(&r, Method::Get, "/users//7").status, Status::NOT_FOUND);
+        assert_eq!(call(&r, Method::Get, "/a//b").status, Status::NOT_FOUND);
     }
 
     #[test]
