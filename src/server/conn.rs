@@ -98,7 +98,24 @@ fn write_closing<W: Write>(out: &mut W) -> std::io::Result<()> {
 /// 返回可读，成本是 syscall 本身），比"每条空闲连接白占 7 KiB"划算。
 /// 请求体的读取不吃这个容量：`read_exact` 走的是 `BufReader::read` 的
 /// bypass 分支（剩余长度 ≥ 容量时直接读 socket），块大小由内核决定。
+/// 读缓冲的默认大小。
+///
+/// 1 KiB 是"省内存"的选择：1 000 条空闲连接实测 6.7 MB RSS。但它也是
+/// pipelining 的上限——一个请求头约 80 字节，1 KiB 只装得下 12 个，
+/// 连发 16 个就要读两次。`RSBOOT_READ_BUF` 可以把它调大做 A/B。
 pub const READ_BUF_BYTES: usize = 1024;
+
+fn read_buf_bytes() -> usize {
+    use std::sync::OnceLock;
+    static F: OnceLock<usize> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("RSBOOT_READ_BUF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 256 && *v <= 64 * 1024)
+            .unwrap_or(READ_BUF_BYTES)
+    })
+}
 /// 头原文缓冲的起点（一次请求头约 200–600 字节）。
 const HEAD_BUF_BYTES: usize = 512;
 /// `read_until` 的行缓冲起点。
@@ -197,7 +214,7 @@ impl Conn {
         // 真正的空闲上限仍由 `read_head` 里的 elapsed 判定。
         let _ = stream.set_nodelay(nodelay_on());
         tune_bufs(&stream);
-        let reader = BufReader::with_capacity(READ_BUF_BYTES, coio::CoIo::new(stream)?);
+        let reader = BufReader::with_capacity(read_buf_bytes(), coio::CoIo::new(stream)?);
         Ok(Self {
             reader,
             head_buf: String::with_capacity(HEAD_BUF_BYTES),
