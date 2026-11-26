@@ -21,25 +21,15 @@
 //! 换来的是关闭语义简单可靠（置位 flag，下一轮就退出），也不会在容器里
 //! 因为信号投递不确定而卡住。
 
-use std::io::Write;
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::runtime::context::Context;
-use crate::server::conn::{Conn, ConnOutcome, Limits};
+use crate::server::conn::Limits;
 use crate::web::route::Router;
-
-/// 仅用于测量：关掉协程，让请求在 worker 栈上同步跑。
-/// 目的不是上线，是量出"每请求一次 spawn"到底值多少时间。
-fn no_coro() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var_os("RSBOOT_NO_CORO").is_some())
-}
 
 pub mod clock;
 pub mod coio;
@@ -51,28 +41,15 @@ pub(crate) mod profile;
 pub mod signal;
 pub mod write;
 
+pub(crate) mod accept;
+pub(crate) mod lifecycle;
+pub(crate) mod worker;
+
 pub use conn::Limits as ConnLimits;
 
-/// `poll` 的单个超时上限：决定关闭/跛鸭判定的精度，也决定空闲时醒来的频率。
-/// 5ms 对关闭响应足够快，对 CPU 几乎等于零成本（poll 不占 CPU，只在超时后醒一次）。
-const ACCEPT_POLL_MS: i32 = 5;
-/// 一次可读最多排空多少条连接：突发流量下别让 poll 和 accept 来回打转。
-const MAX_ACCEPT_PER_WAIT: usize = 64;
-/// worker 等连接就绪的兜底超时。**正常情况下 worker 会被 `Waker` 立刻叫醒**，
-/// 这个值只在"唤醒链路漏了一处"时兜底，防止 worker 永久卡在 `poll` 里关不掉。
-/// 它不再决定延迟，也不再决定空闲 CPU（那是 `Waker` 的活）。
-const WORKER_IDLE_MS: i32 = 500;
 /// listen backlog。std 硬编码 128，短连接突发下会丢 SYN（见 `raise_backlog`）。
 /// 实际生效值由 `net.core.somaxconn` 截断。
 const LISTEN_BACKLOG: i32 = 1024;
-/// 连接借调的检查周期。太短会让 worker 频繁搬连接（连接迁移有成本），
-/// 太长则失衡要持续一段时间才被纠正。
-const REBALANCE_EVERY: Duration = Duration::from_millis(200);
-/// 手上至少要有这么多连接才考虑借调。2 条时搬走一半只会让两边来回乒乓，
-/// 3 条起才有意义（搬 1 条、剩 2 条）。
-const REBALANCE_MIN_CONNS: usize = 3;
-/// 自己累计处理量超过同行的这个百分比才触发借调。取 130 表示"多干 30%"。
-const REBALANCE_TRIGGER_PCT: usize = 130;
 
 const ST_SERVING: u8 = 0;
 const ST_DRAINING: u8 = 1;
@@ -253,441 +230,59 @@ impl Server {
         // 先把数据库 socket 接到协程链路上：一次装好，之后所有
         // `mysql+co://` 连接读写都会让出 worker。
         mn::net::install_db_hooks();
+
         let workers = self.workers;
-        let mut senders: Vec<SyncSender<Conn>> = Vec::with_capacity(workers);
-        // 每 worker 一个唤醒器：派发连接给谁，就叫醒谁。这样 worker 的 poll
-        // 可以长时间阻塞（近乎零空转），又不用等一个 tick 才发现新连接。
-        let mut wakers: Vec<poll::Waker> = Vec::with_capacity(workers);
-        let mut handles = Vec::with_capacity(workers);
-        // worker 启动握手：全部就绪才开始 accept。
-        // 不让"半残服务"上线——两个 worker 里只起来一个，比直接启动失败更难查。
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
         // 内部关闭标志：drain 期满后置位。它让**已建立的连接**知道
         // "别再给我派新请求了"，而不是只靠主线程停 accept。
         let closing = Arc::new(AtomicBool::new(false));
 
-        // 先建好全部队列与唤醒器，再 spawn。原因：连接借调（见 worker 里的
-        // `rebalance`）需要 worker 能往**别人**的队列里塞连接，所以每个 worker
-        // 都得持有全部 sender / waker，这些必须先齐。
-        let mut receivers: Vec<Option<std::sync::mpsc::Receiver<Conn>>> =
-            Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let (tx, rx) = sync_channel::<Conn>(256);
-            senders.push(tx);
-            receivers.push(Some(rx));
-            wakers.push(
-                poll::Waker::new()
-                    .map_err(|e| Error::Lifecycle(format!("创建唤醒器失败：{e}")))?,
-            );
-        }
+        // 队列与唤醒器必须**先全建好**再 spawn：借调要求每个 worker 手里
+        // 都握着全部 sender/waker。
+        let (senders, mut receivers, wakers) = worker::channels(workers)?;
         let senders = Arc::new(senders);
+        let wakers = Arc::new(wakers);
+
         // 协程运行时随这次服务走，不是进程级全局：同进程起第二个 Server
         // 时两者的 worker id 会撞车（踩过，表现为偶发请求挂死）。
         let rt = mn::sched::Runtime::new();
         rt.start_timer();
-        let wakers = Arc::new(wakers);
-        // 每 worker 的累计处理请求数，用于连接借调
-        let rebalance_stats = self.rebalance_stats.clone();
-        let served: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
-            (0..workers)
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
-        );
 
-        for i in 0..workers {
-            let rx = receivers[i]
-                .take()
-                .expect("每个 worker 的接收端只取一次");
-            let router = Arc::clone(&self.router);
-            let factory = Arc::clone(&self.factory);
-            let limits = self.limits;
-            let stop = Arc::clone(&shutdown);
-            let close = Arc::clone(&closing);
-            let on_exit = self.on_worker_exit.clone();
-            let ready = ready_tx.clone();
-            let my_waker = wakers[i].clone();
-            let rebalance_stats = rebalance_stats.clone();
-            let rt = Arc::clone(&rt);
-            let all_senders = Arc::clone(&senders);
-            let all_wakers = Arc::clone(&wakers);
-            let served = Arc::clone(&served);
-            let handle = std::thread::Builder::new()
-                .name(format!("rsboot-w{i}"))
-                .spawn(move || {
-                    let ctx = match factory() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let msg = format!("worker {i} 初始化失败：{e}");
-                            eprintln!("[rsboot] {msg}");
-                            let _ = ready.send(Err(msg));
-                            return;
-                        }
-                    };
-                    if ready.send(Ok(())).is_err() {
-                        // 主线程已经放弃等待（另一个 worker 失败了），这个也别干等了
-                        if let Some(hook) = &on_exit {
-                            hook(&ctx);
-                        }
-                        return;
-                    }
-                    // 接上协程调度器：这个 worker 线程从此可以在 I/O 等待处让出。
-                    // 定时器线程只有一个（进程级），`start_timer` 内部做了幂等。
-                    mn::sched::init(rt, i, mn::sched::Shared::new(my_waker.clone()));
-                    // 处理完、仍可 keep-alive 的连接由协程投回这里，主循环统一收回
-                    let rets: Arc<std::sync::Mutex<Vec<Conn>>> =
-                        Arc::new(std::sync::Mutex::new(Vec::new()));
-                    // 任一来源要求关闭都算：外部编排，或 drain 期满的内部关闭
-                    let should_stop = || stop.load(Ordering::Relaxed) || close.load(Ordering::Relaxed);
-                    // 本 worker 负责的连接表。worker 不是"拿到一条连接读到死"，
-                    // 而是**同时持有它队列里的所有连接**，用 `poll` 等任意一条就绪。
-                    //
-                    // 这一层是必须的：线程-per-worker 的模型下，"一条连接读到死"
-                    // 会让空闲的 keep-alive 连接长期占住 worker，后面的连接全部饿死
-                    // （基准里 max = 5004ms 就是这个）。多路复用把这个问题从根上去掉，
-                    // 而且不需要为每条连接开线程。
-                    let mut conns: Vec<Conn> = Vec::new();
-                    // 常驻的 poll 集合：fd 数组与就绪缓冲只分配一次
-                    let mut ps = poll::PollSet::with_waker(my_waker.read_fd());
-                    let mut last_rebalance = std::time::Instant::now();
-                    // 连接借调的冷却：刚被塞过连接的 worker 先别又把它们送回去
-                    // （否则两个 worker 会互相推诿，连接在队列里空转）
-                    let mut stole_at = std::time::Instant::now()
-                        .checked_sub(REBALANCE_EVERY)
-                        .unwrap_or_else(std::time::Instant::now);
-                    loop {
-                        let round_t0 = clock::now_ns();
-                        // 关闭必须能立刻生效：worker 自己握着 sender，
-                        // 光靠 "主线程 drop senders" 永远收不到 Disconnected。
-                        if should_stop() {
-                            // 手上和队列里的连接都得给明确答复（503 + close），
-                            // 不能静默断——否则客户端只看到 "empty reply"。
-                            for mut c in conns.drain(..) {
-                                let _ = c.serve_once(&router, &ctx, &limits, &should_stop);
-                            }
-                            while let Ok(mut c) = rx.try_recv() {
-                                let _ = c.serve_once(&router, &ctx, &limits, &should_stop);
-                            }
-                            break;
-                        }
+        let shared = Arc::new(worker::Shared {
+            workers,
+            router: Arc::clone(&self.router),
+            factory: Arc::clone(&self.factory),
+            limits: self.limits,
+            shutdown: Arc::clone(&shutdown),
+            closing: Arc::clone(&closing),
+            on_exit: self.on_worker_exit.clone(),
+            senders: Arc::clone(&senders),
+            wakers: Arc::clone(&wakers),
+            // 每 worker 的累计处理请求数，用于连接借调
+            served: Arc::new((0..workers).map(|_| AtomicU64::new(0)).collect()),
+            rt,
+            rebalance_stats: self.rebalance_stats.clone(),
+        });
 
-                        // 推进协程：让出的请求在这里接着跑。worker 只有这一处会切进
-                        // 协程栈，别的地方都是纯事件循环。
-                        mn::sched::pump(4096);
-                        {
-                            let mut g = rets.lock().unwrap();
-                            if !g.is_empty() {
-                                conns.extend(g.drain(..));
-                            }
-                        }
+        // worker 启动握手：全部就绪才开始 accept。不让"半残服务"上线——
+        // 两个 worker 里只起来一个，比直接启动失败更难查。
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let handles = worker::spawn_all(Arc::clone(&shared), &mut receivers, ready_tx)?;
+        let handles = lifecycle::await_ready(workers, ready_rx, Arc::clone(&senders), handles)?;
 
-                        // 先把新派来的连接收进本地表
-                        let mut got_from_peer = false;
-                        while let Ok(c) = rx.try_recv() {
-                            conns.push(c);
-                            got_from_peer = true;
-                        }
-                        if got_from_peer {
-                            stole_at = std::time::Instant::now();
-                        }
+        accept::run(accept::Loop {
+            listener: &self.listener,
+            senders: senders.as_slice(),
+            wakers: wakers.as_slice(),
+            limits: self.limits,
+            workers,
+            shutdown: &shutdown,
+            closing: &closing,
+            status: &self.status,
+            drain: self.drain,
+            watch_signal: self.watch_signal,
+        })?;
 
-                        // 连接借调：静态按连接数均分 ≠ 负载均分。
-                        // 50 条连接里每条请求速率不同，实测两个 worker 的 CPU 能差
-                        // 24%（2.72s vs 2.20s），吞吐被慢的那个拖住。这里按**累计
-                        // 处理请求数**做周期性再平衡：干得比同行多 30% 就把一半连接
-                        // 交出去，交给累计最少的那个。
-                        if last_rebalance.elapsed() >= REBALANCE_EVERY
-                            && stole_at.elapsed() >= REBALANCE_EVERY
-                            && conns.len() >= REBALANCE_MIN_CONNS
-                            && workers > 1
-                        {
-                            last_rebalance = std::time::Instant::now();
-                            let mine = served[i].load(Ordering::Relaxed);
-                            let total: u64 = served
-                                .iter()
-                                .map(|c| c.load(Ordering::Relaxed))
-                                .sum();
-                            let avg = total / workers as u64;
-                            // 注意放大的倍数：`mine * 100 > avg * PCT` 才是"多 30%"
-                            // （写 10 会变成"多 12 倍"，是测试逼出来的真 bug）
-                            if mine * 100 > avg * (REBALANCE_TRIGGER_PCT as u64) {
-                                // 交给累计最少的同行（不含自己）
-                                let target = (0..workers)
-                                    .filter(|&j| j != i)
-                                    .min_by_key(|&j| served[j].load(Ordering::Relaxed))
-                                    .expect("workers > 1 时必然有别人");
-                                let give = conns.len() / 2;
-                                let mut moved = 0usize;
-                                for _ in 0..give {
-                                    let Some(c) = conns.pop() else { break };
-                                    match all_senders[target].try_send(c) {
-                                        Ok(()) => moved += 1,
-                                        Err(std::sync::mpsc::TrySendError::Full(c))
-                                        | Err(std::sync::mpsc::TrySendError::Disconnected(c)) => {
-                                            // 对方队列满/已退：放回自己手里，别再折腾
-                                            conns.push(c);
-                                            break;
-                                        }
-                                    }
-                                }
-                                if moved > 0 {
-                                    if let Some(h) = &rebalance_stats {
-                                        h.fetch_add(moved, Ordering::Relaxed);
-                                    }
-                                    // 先入队后唤醒，和 accept 路径同一个顺序约束
-                                    all_wakers[target].notify();
-                                    // 记一笔"我欠对方"，避免下一轮又立刻判定自己超载
-                                    served[i].store(
-                                        served[i].load(Ordering::Relaxed) / 2,
-                                        Ordering::Relaxed,
-                                    );
-                                }
-                            }
-                        }
-
-                        // 拼出本轮要等的 fd（唤醒器恒在 items[0]），然后真阻塞。
-                        // 兜底超时只防"唤醒漏了"，正常路径由 `Waker` 立刻叫醒：
-                        // 派发方 push 进队列之后才 notify，所以醒来必能 try_recv 到。
-                        // 协程在等哪个 socket，就把它一并交给 `poll`——这是让
-                        // "DB/下游调用"也能让出的全部机制。`n_conns` 记下分界点：
-                        // 就绪下标小于它是连接，大于等于它是等待表里的 fd。
-                        let n_conns = conns.len();
-                        // 让等待表里到期的协程先醒来（超时、空闲连接退出都靠这个）
-                        let now = clock::now_ns();
-                        mn::sched::expire_waits(now);
-                        let wait_fds = mn::sched::wait_fds();
-                        ps.reset_conns_with(
-                            conns.iter().filter_map(|c| c.raw_fd()),
-                            wait_fds.into_iter(),
-                        );
-                        // 队列里还有待跑的协程就立刻回来继续推进，别在 poll 里等
-                        let idle = if mn::sched::pending() > 0 { 0 } else { WORKER_IDLE_MS };
-                        // 有人等着超时的话，poll 不能睡到 500ms——那会让它的截止时刻迟到
-                        let cap = mn::sched::wait_deadline().map(|d| {
-                            (d.saturating_sub(now) / 1_000_000) as i32
-                        });
-                        let timeout = cap.map_or(idle, |c| c.clamp(0, idle));
-                        // 量一下阻塞真正的占比：若 `poll` 只占个位数，
-                        // 换 `epoll` 就纯属白费——那点内核扫描不是差距来源
-                        let poll_t0 = clock::now_ns();
-                        if let Err(e) = ps.wait(timeout) {
-                            eprintln!("[rsboot] worker poll 失败：{e}");
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                            continue;
-                        }
-                        profile::note_poll(round_t0, poll_t0);
-                        if ps.woken() {
-                            // 不清零的话下一轮 poll 会立刻又返回，变成忙等
-                            my_waker.drain();
-                        }
-
-                        // 只处理就绪的连接。`swap_remove` + 处理 + 放回：O(1)
-                        //
-                        // 必须**按下标降序**处理。`swap_remove(i)` 会把尾部元素搬到 i，
-                        // `push` 又会改变长度；若按升序处理，后续的 `ready[j]`（j > i）
-                        // 就指向了别的连接——表现为"同一条连接被处理两次、另一条就绪的
-                        // 连接延后一轮"。更糟的是被重复处理的那条此刻可能已无数据，
-                        // `serve_once` 会阻塞到读超时，把 worker 整条卡住。
-                        // `ready` 天然升序，所以从后往前遍历即可，无需排序。
-                        for k in (0..ps.ready_len()).rev() {
-                            let idx = ps.ready_at(k);
-                            if idx >= n_conns {
-                                // 等待表里的 fd 就绪：把那个协程放回队列。
-                                // 必须降序（同下面的理由）：`wake_wait` 内部也
-                                // 用 `swap_remove`。
-                                mn::sched::wake_wait(idx - n_conns);
-                                continue;
-                            }
-                            if idx >= conns.len() {
-                                continue;
-                            }
-                            let mut c = conns.swap_remove(idx);
-                            served[i].fetch_add(1, Ordering::Relaxed);
-                            // 请求处理放进协程：handler 里凡是要等 I/O 的地方
-                            // （框架的 sleep / DB / 下游调用）都能让出，worker 立刻
-                            // 回去处理别的连接。同步 handler 的签名和借用规则不变。
-                            if mn::sched::ready() && !no_coro() {
-                                let rp: *const Router = &*router;
-                                let cp: *const crate::runtime::context::Context = &ctx;
-                                let s2 = Arc::clone(&stop);
-                                let c2 = Arc::clone(&close);
-                                let lim = limits;
-                                let rets2 = Arc::clone(&rets);
-                                mn::sched::spawn(move || {
-                                    let stop_fn =
-                                        || s2.load(Ordering::Relaxed) || c2.load(Ordering::Relaxed);
-                                    // 每处理一个请求就交回队列：这是**刻意**的。
-                                    // 试过在协程里连跑 8 个请求，吞吐掉 12%——
-                                    // 单连接占住 worker 期间，别的就绪连接只能等。
-                                    match unsafe { c.serve_once(&*rp, &*cp, &lim, &stop_fn) } {
-                                        Ok(ConnOutcome::KeepAlive)
-                                        | Ok(ConnOutcome::Idle) => {
-                                            rets2.lock().unwrap().push(c);
-                                        }
-                                        _ => {}
-                                    }
-                                });
-                            } else if let Ok(ConnOutcome::KeepAlive) =
-                                c.serve_once(&router, &ctx, &limits, &should_stop)
-                            {
-                                conns.push(c);
-                            }
-                            // 关闭/出错/对端要 close 的一律直接丢
-                        }
-                    }
-
-                    // worker 收尾：模块在这里释放线程局部资源（连接、缓冲）
-                    if let Some(hook) = &on_exit {
-                        hook(&ctx);
-                    }
-                })
-                .map_err(|e| Error::Lifecycle(format!("启动 worker {i} 失败：{e}")))?;
-            handles.push(handle);
-        }
-
-        drop(ready_tx);
-        let mut ready_ok = 0usize;
-        let mut ready_failed: Option<String> = None;
-        for _ in 0..workers {
-            match ready_rx.recv() {
-                Ok(Ok(())) => ready_ok += 1,
-                Ok(Err(e)) => ready_failed = Some(e),
-                // 所有 sender 都 drop 了还没等齐：说明有 worker 在握手前就退了
-                Err(_) => break,
-            }
-        }
-        if let Some(e) = ready_failed {
-            drop(senders);
-            for h in handles {
-                let _ = h.join();
-            }
-            return Err(Error::Lifecycle(format!("启动失败：{e}")));
-        }
-        if ready_ok == 0 {
-            return Err(Error::Lifecycle(
-                "没有一个 worker 成功启动（检查数据库配置与模块的 start_worker）".into(),
-            ));
-        }
-
-        self.listener
-            .set_nonblocking(true)
-            .map_err(|e| Error::Lifecycle(format!("设置非阻塞模式失败：{e}")))?;
-
-        let watch_signal = self.watch_signal;
-        let grace = self.grace;
-        let drain = self.drain;
-        let status = self.status.clone();
-        let mut rr = 0usize;
-        // 跛鸭期的截止时刻。`None` = 还没开始关。
-        let mut drain_deadline: Option<Instant> = None;
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                status.set(ServeState::Closing);
-                closing.store(true, Ordering::Relaxed);
-                break;
-            }
-            // 第一次看到信号：进入跛鸭期。此间照常接客，过了预算才真停。
-            if drain_deadline.is_none() && watch_signal && signal::received() {
-                status.set(ServeState::Draining);
-                drain_deadline = Some(Instant::now() + drain);
-            }
-            if let Some(d) = drain_deadline {
-                if Instant::now() >= d {
-                    status.set(ServeState::Closing);
-                    // 让 worker 里**已建立的连接**开始礼貌拒绝，
-                    // 不然它们会一路 keep-alive 到 idle 超时才停
-                    closing.store(true, Ordering::Relaxed);
-                    break;
-                }
-            }
-            // 睡到"有连接"为止，而不是 sleep 轮询。轮询会让每条短连接
-            // 白等最多一个轮询周期（原来是 20ms，基准里直接把 QPS 打到 116）。
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::AsRawFd;
-                match poll::wait_readable(self.listener.as_raw_fd(), ACCEPT_POLL_MS) {
-                    Ok(true) => {}
-                    Ok(false) => continue, // 超时：回到循环头检查关闭/drain
-                    Err(e) => {
-                        eprintln!("[rsboot] poll 失败：{e}");
-                        std::thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                std::thread::sleep(Duration::from_millis(ACCEPT_POLL_MS as u64));
-            }
-
-            // 一次可读往往意味着 backlog 里不止一条：排空它，别让突发连接
-            // 排队等下一轮 poll。上限 64 免得一条线程被 accept 独占。
-            for _ in 0..MAX_ACCEPT_PER_WAIT {
-                match self.listener.accept() {
-                    Ok((stream, _peer)) => {
-                        let wi = rr % workers;
-                        rr = rr.wrapping_add(1);
-                        let tx = &senders[wi];
-                        let wk = &wakers[wi];
-                        // 每条连接只在这里 dup 一次 fd（读缓冲跟着连接走）
-                        let c = match Conn::new(stream, &self.limits) {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-                        match tx.try_send(c) {
-                            // 先入队、后唤醒：worker 醒来必能取到，不会空跑
-                            Ok(()) => wk.notify(),
-                            // 队列满或 worker 已死 → 当场 503，不进内核 backlog 继续堆
-                            Err(std::sync::mpsc::TrySendError::Full(c)) => {
-                                reject_overloaded(c.into_stream())
-                            }
-                            Err(std::sync::mpsc::TrySendError::Disconnected(c)) => {
-                                reject_overloaded(c.into_stream())
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        // 文件描述符耗尽之类的临时错误：退避后重试，不让整个服务退出
-                        eprintln!("[rsboot] accept 失败：{e}");
-                        std::thread::sleep(Duration::from_millis(100));
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 关闭 sender → worker 的 recv 结束 → 处理完手上连接后退出
-        status.set(ServeState::Closing);
-        // worker 此时可能正阻塞在 poll 里（兜底超时 500ms），必须叫醒它们
-        // 去看 should_stop，否则关闭会白等一个兜底周期。
-        for w in wakers.iter() {
-            w.notify();
-        }
-        drop(senders);
-
-        // 等 worker 收尾，但有预算。某个 worker卡在一条慢请求上不该让整个进程
-        // 永远退不出去——超时就放弃等待（线程泄漏，但进程马上结束，无碍）。
-        let deadline = Instant::now() + grace;
-        let mut stragglers = 0usize;
-        for h in handles {
-            while !h.is_finished() {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if h.is_finished() {
-                let _ = h.join();
-            } else {
-                stragglers += 1;
-            }
-        }
-        if stragglers > 0 {
-            eprintln!(
-                "[rsboot] 关闭超过 {:?}，{stragglers} 个 worker 仍未退出（进行中的请求可能被硬切断）",
-                grace
-            );
-        }
+        lifecycle::shutdown(&wakers, senders, handles, self.grace, &self.status);
         Ok(())
     }
 }
@@ -736,20 +331,11 @@ fn raise_backlog(l: &TcpListener) {
 #[cfg(not(unix))]
 fn raise_backlog(_l: &TcpListener) {}
 
-fn reject_overloaded(mut s: TcpStream) {
-    let body = "{\"detail\":\"服务繁忙，worker 队列已满\"}";
-    let head = format!(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = s.write_all(head.as_bytes());
-    let _ = s.write_all(body.as_bytes());
-    let _ = s.flush();
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
     use crate::config::{Config, Environment};
     use crate::web::http::{Method, Status};
     use crate::web::request::Request;
