@@ -341,6 +341,15 @@ mod tests {
         println!("head buffer: 每请求新建 {fresh_ns:.0} ns / 按连接复用 {reuse:.0} ns");
     }
 
+    #[test]
+    fn head_keeps_content_length_of_the_body_it_omits() {
+        // HEAD 的语义是"和 GET 一样的头，但不发 body"。长度必须按**真实**
+        // body 算，不能因为不发就报 0——那会让客户端以为 GET 只有 0 字节。
+        let s = render(&Response::text("hello world"), false, true);
+        assert!(s.contains("content-length: 11"), "{s}");
+        assert!(!s.contains("hello world"), "HEAD 不该带 body：{s}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn fd_path_matches_generic_path() {

@@ -264,13 +264,12 @@ impl Router {
             resp = m.after(req, ctx, resp);
         }
 
-        if req.method == Method::Head {
-            // HEAD 的语义是"和 GET 一样的头，但没有 body"。放在最外层，
-            // 这样 404 / 405 / panic 之后的 HEAD 同样不带 body——
-            // 之前只在成功分支清 body，导致 HEAD 404 会回一段 body。
-            resp.body.clear();
-            resp.headers.remove("content-length");
-        }
+        // HEAD 不再在这里清 body。
+        //
+        // 曾经的写法是 `resp.body.clear()`：结果写回层按 `body.len()` 算
+        // `content-length`，HEAD 的响应头变成 `content-length: 0`——客户端
+        // 以为 GET 只会拿到 0 字节。语义该由写回层负责（它有 `head_only`，
+        // 逐字节决定发不发 body），路由层只管把真实长度留在 `Response` 上。
         resp
     }
 
@@ -301,21 +300,22 @@ impl Router {
     }
 
     fn dispatch(&self, req: &mut Request, ctx: &Context) -> Response {
-        let seg_count = segment_count(&req.path);
-        let first = first_segment(&req.path);
+        let (seg_count, first) = path_shape(&req.path);
 
-        let mut candidates: Vec<usize> = Vec::new();
-        if let Some(v) = self.bucket.get(&first) {
-            candidates.extend_from_slice(v);
-        }
-        if !first.is_empty() {
-            if let Some(v) = self.bucket.get("") {
-                candidates.extend_from_slice(v);
-            }
-        }
+        // 两个桶：首段精确命中的，以及"参数/通配落在首段"的兜底桶。
+        // 精确的优先，顺序不能换。路径是 `/` 时只有一个桶。
+        //
+        // 早先的写法先把两边拷进一个 `Vec<usize>` 再遍历——桶里通常只有
+        // 1–3 条路由，攒这一下就是每请求一次 malloc + memcpy，纯属固定税。
+        let keys: [&str; 2] = [first, ""];
+        let key_count = if first.is_empty() { 1 } else { 2 };
 
         let mut allowed: Vec<Method> = Vec::new();
-        for idx in candidates {
+        for key in keys.iter().take(key_count) {
+            let Some(idxs) = self.bucket.get(*key) else {
+                continue;
+            };
+            for &idx in idxs {
             let r = &self.routes[idx];
             if r.template.len() != seg_count {
                 continue;
@@ -356,6 +356,7 @@ impl Router {
                 Err(payload) => exception::panic_response(payload),
             };
             return resp;
+            }
         }
 
         if !allowed.is_empty() {
@@ -405,18 +406,26 @@ fn allow_list(allowed: &[Method]) -> String {
     out.join(", ")
 }
 
-fn segment_count(path: &str) -> usize {
+/// 一次扫描拿到两件分派要用的事：段数，以及首段（**借用**，不分配）。
+///
+/// 分成两个函数各扫一遍 path，既多走一遍字符串，首段还每次 `to_string()`
+/// ——那是每请求一次堆分配，只为拿去做一次 `HashMap::get`。
+fn path_shape(path: &str) -> (usize, &str) {
     let t = path.strip_prefix('/').unwrap_or(path);
     if t.is_empty() {
-        0
-    } else {
-        t.split('/').count()
+        return (0, "");
     }
-}
-
-fn first_segment(path: &str) -> String {
-    let t = path.strip_prefix('/').unwrap_or(path);
-    t.split('/').next().unwrap_or("").to_string()
+    let mut segs = 1usize;
+    let mut first_end = t.len();
+    for (i, b) in t.bytes().enumerate() {
+        if b == b'/' {
+            if segs == 1 {
+                first_end = i;
+            }
+            segs += 1;
+        }
+    }
+    (segs, &t[..first_end])
 }
 
 #[cfg(test)]
@@ -490,12 +499,27 @@ mod tests {
     }
 
     #[test]
-    fn head_gets_get_route_without_body() {
+    fn path_shape_matches_split_semantics() {
+        // 与旧的 `split('/')` 口径逐条对齐，否则分派会静默漏路由。
+        assert_eq!(path_shape("/"), (0, ""));
+        assert_eq!(path_shape(""), (0, ""));
+        assert_eq!(path_shape("/users"), (1, "users"));
+        assert_eq!(path_shape("/users/7"), (2, "users"));
+        assert_eq!(path_shape("users/7"), (2, "users"));
+        assert_eq!(path_shape("/a//b"), (3, "a"));
+    }
+
+    #[test]
+    fn head_gets_get_route_and_keeps_the_body_length() {
+        // 路由层**不再**清 body：HEAD 不发 body 是写回层的事（它知道
+        // `head_only`），而 `content-length` 必须按真实 body 算。
+        // 这里锁住"body 还在"，否则写回层只能算出一个 0。
         let r = router();
-        let resp = call(&r, Method::Head, "/users/7");
-        assert_eq!(resp.status, Status::OK);
-        assert!(resp.body.is_empty(), "HEAD 不能有 body");
-        assert!(resp.headers.get("content-length").is_none());
+        let get = call(&r, Method::Get, "/users/7");
+        let head = call(&r, Method::Head, "/users/7");
+        assert_eq!(head.status, Status::OK);
+        assert_eq!(head.body.len(), get.body.len(), "HEAD 要保留 GET 的长度");
+        assert!(!head.body.is_empty(), "body 留给写回层决定发不发");
     }
 
     #[test]
