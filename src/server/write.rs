@@ -135,28 +135,10 @@ pub fn write_response_fd(
 }
 
 #[cfg(unix)]
-fn write_all_fd(fd: std::os::raw::c_int, mut buf: &[u8]) -> io::Result<()> {
-    use std::os::raw::{c_int, c_void};
-    unsafe extern "C" {
-        fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
-    }
-    while !buf.is_empty() {
-        // SAFETY: fd 由调用方保证有效，buf 是有效切片。
-        let n = unsafe { write(fd, buf.as_ptr().cast::<c_void>(), buf.len()) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            // EINTR：被信号打断，重试
-            if e.raw_os_error() == Some(4) {
-                continue;
-            }
-            return Err(e);
-        }
-        if n == 0 {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
-        }
-        buf = &buf[n as usize..];
-    }
-    Ok(())
+fn write_all_fd(fd: std::os::raw::c_int, buf: &[u8]) -> io::Result<()> {
+    // 非阻塞 fd：`EAGAIN` 时挂到 `POLLOUT` 让出，而不是阻塞 worker
+    crate::server::coio::write_fd_all(fd, buf)
+
 }
 
 /// `writev` 一次写出两段，并正确处理部分写。

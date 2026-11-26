@@ -21,15 +21,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// 读 socket 的轮询间隔。设成 250ms 是为了让 shutdown 能及时打断空闲连接，
-/// 代价是每个空闲连接每 250ms 醒一次——这个开销远小于让关闭等 5 秒。
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::runtime::context::Context;
+use crate::server::parse::ParsedRequest;
 use crate::server::parse::{self, BodyLen, ParseError, MAX_HEADER_BYTES, MAX_REQUEST_LINE};
 use crate::server::write;
+use super::{coio, profile};
 use crate::web::error::ApiError;
 use crate::web::http::{Method, Status};
 use crate::web::request::Request;
@@ -93,7 +91,8 @@ fn write_closing<W: Write>(out: &mut W) -> std::io::Result<()> {
 /// worker 能在多条连接之间轮转而不用每次付这个成本。
 pub struct Conn {
     stream: TcpStream,
-    reader: BufReader<TcpStream>,
+    /// 让出式读缓冲：`read_until` / `read_exact` 内部就会挂起等 `POLLIN`
+    reader: BufReader<coio::CoIo>,
     served: usize,
 }
 
@@ -102,6 +101,10 @@ pub struct Conn {
 pub enum ConnOutcome {
     /// 还能继续接请求，把它放回队列让别人也有机会
     KeepAlive,
+    /// 这条连接暂时没数据（空闲），协程可以退出，连接交回队列
+    ///
+    /// 与 `Closed` 的区别：连接还活着，`poll` 一有事件就该重新服务它。
+    Idle,
     /// 该关了（对端要求 close、出错、或达到 `max_requests`）
     Closed,
 }
@@ -110,12 +113,12 @@ const CLOSED: std::result::Result<ConnOutcome, std::io::Error> = Ok(ConnOutcome:
 const KEEP: std::result::Result<ConnOutcome, std::io::Error> = Ok(ConnOutcome::KeepAlive);
 
 impl Conn {
-    pub fn new(stream: TcpStream, limits: &Limits) -> std::io::Result<Self> {
-        // 读超时 = 轮询间隔；真正的空闲上限在 read_head 里按 elapsed 判定
-        let _ = stream.set_read_timeout(Some(POLL_INTERVAL));
-        let _ = stream.set_write_timeout(Some(limits.io_timeout));
+    pub fn new(stream: TcpStream, _limits: &Limits) -> std::io::Result<Self> {
+        // 连接改成非阻塞：会阻塞的点统统交给调度器，worker 不再被一条慢连接按住。
+        // 读超时不再依赖 SO_RCVTIMEO——`CoIo` 挂起时自带 250ms 心跳，
+        // 真正的空闲上限仍由 `read_head` 里的 elapsed 判定。
         let _ = stream.set_nodelay(true);
-        let reader = BufReader::new(stream.try_clone()?);
+        let reader = BufReader::new(coio::CoIo::new(stream.try_clone()?)?);
         Ok(Self {
             stream,
             reader,
@@ -177,6 +180,7 @@ impl Conn {
         limits: &Limits,
         should_stop: &F,
     ) -> std::io::Result<ConnOutcome> {
+        profile::pick();
         // 单连接处理上限：防止一个连接永久占着一个 worker 的队列位
         if self.served >= limits.max_requests {
             return CLOSED;
@@ -191,9 +195,12 @@ impl Conn {
         }
 
         let peer = self.peer();
+        let _t = profile::start(profile::READ);
         let head = match read_head(&mut self.reader, should_stop, limits.io_timeout) {
             Ok(h) => h,
-            Err(HeadError::Eof) | Err(HeadError::Timeout) => return CLOSED,
+            // 空闲连接不是坏连接：交回队列，让 worker 去服务别人
+            Err(HeadError::Timeout) => return Ok(ConnOutcome::Idle),
+            Err(HeadError::Eof) => return CLOSED,
             Err(HeadError::Stopped) => {
                 // 正在关闭：给明确答复再走
                 let _ = write_closing(&mut self.stream);
@@ -213,6 +220,8 @@ impl Conn {
             }
         };
 
+        drop(_t);
+        let _t = profile::start(profile::PARSE);
         let parsed = match parse::parse_head(&head, limits.max_body) {
             Ok(p) => p,
             Err(ParseError { status, message }) => {
@@ -239,24 +248,41 @@ impl Conn {
             }
         };
 
-        let mut req = Request::new(parsed.method, parsed.target.path.clone())
-            .with_query(parsed.target.query.clone())
+        drop(_t);
+        let _t = profile::start(profile::BUILD);
+        // 路径与查询串直接搬进去，不再 `clone`：
+        // `parsed` 之后只剩 `method`/`close` 要用，没有第二个人需要这两个 String
+        let ParsedRequest {
+            method,
+            target,
+            headers,
+            close: keep_close,
+            ..
+        } = parsed;
+        let mut req = Request::new(method, target.path)
+            .with_query(target.query)
             .with_body(body);
-        req.headers = parsed.headers;
+        req.headers = headers;
         req.peer = peer;
 
         // trace id：优先客户端给的
-        let trace = req
+        // trace id 只分配一次，请求头与响应头共享同一份文本
+        let trace: std::sync::Arc<str> = req
             .request_id()
             .filter(|s| !s.is_empty() && s.len() <= 64)
-            .map(|s| s.to_string())
-            .unwrap_or_else(next_trace_id);
-        req.headers.insert("x-request-id", &trace);
+            .map(std::sync::Arc::from)
+            .unwrap_or_else(|| std::sync::Arc::from(next_trace_id()));
+        req.headers
+            .insert_shared("x-request-id", std::sync::Arc::clone(&trace));
 
+        drop(_t);
+        let _t = profile::start(profile::HANDLE);
         let mut resp = router.handle(&mut req, ctx);
-        resp.headers.insert("x-request-id", &trace);
+        resp.headers.insert_shared("x-request-id", trace);
 
-        let head_only = matches!(parsed.method, Method::Head);
+        drop(_t);
+        let _t = profile::start(profile::WRITE);
+        let head_only = matches!(method, Method::Head);
         // 热路径走 fd 直写：大 body 用 `writev` 省一次 memcpy 与大块分配。
         // 泛型版留给测试（它要能用 `Vec<u8>` 当输出）。
         #[cfg(unix)]
@@ -266,8 +292,10 @@ impl Conn {
         }
         #[cfg(not(unix))]
         write::write_response(&mut self.stream, &resp, parsed.close, head_only)?;
+        drop(_t);
+        profile::finish_request();
         self.served += 1;
-        if parsed.close {
+        if keep_close {
             return CLOSED;
         }
         KEEP
@@ -292,7 +320,10 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
     let budget = MAX_REQUEST_LINE + MAX_HEADER_BYTES;
     // 从"开始等这个请求"算起。慢速发送超过 idle 就当超时（slowloris 防御）：
     // 一个字节省着发的客户端不该占住 worker。
-    let started = Instant::now();
+    // 用 TSC 廉价时钟：这台 VM 上一次 `Instant::now()` 要 1.87 µs，
+    // 而它是**每请求**一次，等于给每个请求加了一笔固定税。
+    let started_ns = super::clock::now_ns();
+    let idle_ns = idle.as_nanos() as u64;
 
     loop {
         if should_stop() {
@@ -305,7 +336,7 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
                 // socket 设的读超时是轮询间隔（250ms），不是真正的超时；
                 // 真正超时由 elapsed 判定，这样才能在等待期间响应 shutdown。
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                    if started.elapsed() >= idle {
+                    if super::clock::now_ns().saturating_sub(started_ns) >= idle_ns {
                         return Err(HeadError::Timeout);
                     }
                     continue;
@@ -341,6 +372,22 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
     }
 }
 
+fn push_hex(out: &mut String, mut v: u64) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = DIGITS[(v & 0xf) as usize];
+        v >>= 4;
+        if v == 0 {
+            break;
+        }
+    }
+    // SAFETY: buf[i..] 全是 ASCII 十六进制字符
+    out.push_str(std::str::from_utf8(&buf[i..]).unwrap_or("0"));
+}
+
 fn next_trace_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     static EPOCH: OnceLock<u64> = OnceLock::new();
@@ -350,7 +397,12 @@ fn next_trace_id() -> String {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     });
-    format!("{epoch:x}-{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut s = String::with_capacity(24);
+    push_hex(&mut s, epoch);
+    s.push('-');
+    push_hex(&mut s, seq);
+    s
 }
 
 #[cfg(test)]

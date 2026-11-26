@@ -33,10 +33,21 @@ use crate::runtime::context::Context;
 use crate::server::conn::{Conn, ConnOutcome, Limits};
 use crate::web::route::Router;
 
+/// 仅用于测量：关掉协程，让请求在 worker 栈上同步跑。
+/// 目的不是上线，是量出"每请求一次 spawn"到底值多少时间。
+fn no_coro() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("RSBOOT_NO_CORO").is_some())
+}
+
+pub mod clock;
+pub mod coio;
 pub mod conn;
 pub mod mn;
 pub mod parse;
 pub mod poll;
+pub(crate) mod profile;
 pub mod signal;
 pub mod write;
 
@@ -344,6 +355,7 @@ impl Server {
                         .checked_sub(REBALANCE_EVERY)
                         .unwrap_or_else(std::time::Instant::now);
                     loop {
+                        let round_t0 = clock::now_ns();
                         // 关闭必须能立刻生效：worker 自己握着 sender，
                         // 光靠 "主线程 drop senders" 永远收不到 Disconnected。
                         if should_stop() {
@@ -439,20 +451,30 @@ impl Server {
                         // "DB/下游调用"也能让出的全部机制。`n_conns` 记下分界点：
                         // 就绪下标小于它是连接，大于等于它是等待表里的 fd。
                         let n_conns = conns.len();
+                        // 让等待表里到期的协程先醒来（超时、空闲连接退出都靠这个）
+                        let now = clock::now_ns();
+                        mn::sched::expire_waits(now);
                         let wait_fds = mn::sched::wait_fds();
-                        ps.reset_conns(
-                            conns
-                                .iter()
-                                .filter_map(|c| c.raw_fd())
-                                .chain(wait_fds),
+                        ps.reset_conns_with(
+                            conns.iter().filter_map(|c| c.raw_fd()),
+                            wait_fds.into_iter(),
                         );
                         // 队列里还有待跑的协程就立刻回来继续推进，别在 poll 里等
                         let idle = if mn::sched::pending() > 0 { 0 } else { WORKER_IDLE_MS };
-                        if let Err(e) = ps.wait(idle) {
+                        // 有人等着超时的话，poll 不能睡到 500ms——那会让它的截止时刻迟到
+                        let cap = mn::sched::wait_deadline().map(|d| {
+                            (d.saturating_sub(now) / 1_000_000) as i32
+                        });
+                        let timeout = cap.map_or(idle, |c| c.clamp(0, idle));
+                        // 量一下阻塞真正的占比：若 `poll` 只占个位数，
+                        // 换 `epoll` 就纯属白费——那点内核扫描不是差距来源
+                        let poll_t0 = clock::now_ns();
+                        if let Err(e) = ps.wait(timeout) {
                             eprintln!("[rsboot] worker poll 失败：{e}");
                             std::thread::sleep(std::time::Duration::from_millis(5));
                             continue;
                         }
+                        profile::note_poll(round_t0, poll_t0);
                         if ps.woken() {
                             // 不清零的话下一轮 poll 会立刻又返回，变成忙等
                             my_waker.drain();
@@ -483,7 +505,7 @@ impl Server {
                             // 请求处理放进协程：handler 里凡是要等 I/O 的地方
                             // （框架的 sleep / DB / 下游调用）都能让出，worker 立刻
                             // 回去处理别的连接。同步 handler 的签名和借用规则不变。
-                            if mn::sched::ready() {
+                            if mn::sched::ready() && !no_coro() {
                                 let rp: *const Router = &*router;
                                 let cp: *const crate::runtime::context::Context = &ctx;
                                 let s2 = Arc::clone(&stop);
@@ -493,11 +515,15 @@ impl Server {
                                 mn::sched::spawn(move || {
                                     let stop_fn =
                                         || s2.load(Ordering::Relaxed) || c2.load(Ordering::Relaxed);
-                                    // SAFETY: 同线程；router/ctx 活到 worker 退出
-                                    let outcome =
-                                        unsafe { c.serve_once(&*rp, &*cp, &lim, &stop_fn) };
-                                    if let Ok(ConnOutcome::KeepAlive) = outcome {
-                                        rets2.lock().unwrap().push(c);
+                                    // 每处理一个请求就交回队列：这是**刻意**的。
+                                    // 试过在协程里连跑 8 个请求，吞吐掉 12%——
+                                    // 单连接占住 worker 期间，别的就绪连接只能等。
+                                    match unsafe { c.serve_once(&*rp, &*cp, &lim, &stop_fn) } {
+                                        Ok(ConnOutcome::KeepAlive)
+                                        | Ok(ConnOutcome::Idle) => {
+                                            rets2.lock().unwrap().push(c);
+                                        }
+                                        _ => {}
                                     }
                                 });
                             } else if let Ok(ConnOutcome::KeepAlive) =

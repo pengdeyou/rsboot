@@ -21,6 +21,7 @@
 //! 归属就不可信了，继续复用等于把风险传给下一个请求。
 
 use crate::web::http::{Headers, Method, Status};
+use std::sync::Arc;
 
 /// 请求行里的目标：`/path?query`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,13 +143,18 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
         return Err(ParseError::new(Status::BAD_REQUEST, "请求目标里不能有 `#`"));
     }
 
-    let mut headers = Headers::new();
+    // 整块 head 只复制这一次，后面每个头都只是它上面的一个区间
+    let raw: Arc<str> = Arc::from(head);
+    let mut items: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)> = Vec::with_capacity(12);
     let mut total: usize = 0;
     let mut host_seen = false;
     let mut content_length: Option<usize> = None;
     let mut transfer_encoding = false;
 
+    let mut pos = request_line.len() + 2;
     for line in lines {
+        let line_start = pos;
+        pos += line.len() + 2;
         if line.is_empty() {
             continue;
         }
@@ -165,15 +171,15 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
                 "不支持头部续行（obs-fold）；请把同一个头写成一行",
             ));
         }
-        let Some((name, value)) = line.split_once(':') else {
+        let Some((name_raw, value_raw)) = line.split_once(':') else {
             return Err(ParseError::new(
                 Status::BAD_REQUEST,
                 format!("头部缺少冒号：`{}`", truncate(line)),
             ));
         };
-        let name = name.trim();
-        let value = value.trim();
-        if !headers.insert(name, value) {
+        let name = name_raw.trim();
+        let value = value_raw.trim();
+        if !crate::web::http::headers::validate_pair(name, value) {
             // Headers::insert 拒非法 token 与含 CRLF 的值
             return Err(ParseError::new(
                 Status::BAD_REQUEST,
@@ -181,9 +187,22 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
             ));
         }
 
-        match name.to_ascii_lowercase().as_str() {
-            "host" => host_seen = true,
-            "content-length" => {
+        // 记下区间而不是复制字符串：一个请求省掉 16~24 次分配
+        let name_off = line_start + (name_raw.len() - name_raw.trim_start().len());
+        let value_off = line_start
+            + name_raw.len()
+            + 1
+            + (value_raw.len() - value_raw.trim_start().len());
+        items.push((
+            name_off as u32..(name_off + name.len()) as u32,
+            value_off as u32..(value_off + value.len()) as u32,
+        ));
+
+        if name.eq_ignore_ascii_case("host") {
+            host_seen = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            {
+                {
                 let n: usize = value.parse().map_err(|_| {
                     ParseError::new(Status::BAD_REQUEST, "Content-Length 必须是十进制非负整数")
                 })?;
@@ -197,8 +216,9 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
                     _ => content_length = Some(n),
                 }
             }
-            "transfer-encoding" => transfer_encoding = true,
-            _ => {}
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = true;
         }
     }
 
@@ -231,6 +251,7 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
         }
     };
 
+    let headers = Headers::from_parsed(raw, items);
     let conn_header = headers
         .get("connection")
         .map(|v| v.to_ascii_lowercase())

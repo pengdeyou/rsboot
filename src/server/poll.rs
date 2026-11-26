@@ -47,6 +47,7 @@ struct PollFd {
 
 #[cfg(unix)]
 const POLLIN: c_short = 0x0001;
+const POLLOUT: c_short = 0x0004;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 unsafe extern "C" {
@@ -104,6 +105,26 @@ pub fn wait_readable(fd: c_int, timeout_ms: i32) -> std::io::Result<bool> {
     if n < 0 {
         let e = std::io::Error::last_os_error();
         // EINTR = 4：被信号打断，当成超时处理（调用方会重试）
+        if e.raw_os_error() == Some(4) {
+            return Ok(false);
+        }
+        return Err(e);
+    }
+    Ok(n > 0)
+}
+
+/// 等 `fd` 可写最多 `timeout_ms` 毫秒。写缓冲满（`EAGAIN`）时用它。
+#[cfg(unix)]
+pub fn wait_writable(fd: c_int, timeout_ms: i32) -> std::io::Result<bool> {
+    let mut p = PollFd {
+        fd,
+        events: POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: 同 `wait_readable`，只读写这一块栈内存
+    let n = unsafe { poll(&mut p, 1, timeout_ms) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
         if e.raw_os_error() == Some(4) {
             return Ok(false);
         }
@@ -238,8 +259,8 @@ impl Waker {
         {
             let b: u8 = 1;
             // SAFETY: 写 1 字节到管道写端。`b` 是 `u8`，取址才是 `*const u8`——
-            // `u8` 上没有 `as_ptr()`（这里原来写成 `b.as_ptr()`，因为这段只在
-            // macOS 编译，Linux 上被 cfg 排除，一直没暴露）
+            // `u8` 上没有 `as_ptr()`（原来写成 `b.as_ptr()`，这段只在 macOS 编译，
+            // Linux 上被 cfg 排除，一直没暴露）
             unsafe {
                 write(self.inner.write, (&b as *const u8).cast::<c_void>(), 1);
             }
@@ -327,11 +348,29 @@ impl PollSet {
 
     /// 原地重设连接 fd 列表（保留唤醒器槽）。容量够时零分配。
     pub fn reset_conns<I: Iterator<Item = c_int>>(&mut self, fds: I) {
+        self.reset_conns_with(fds, std::iter::empty());
+    }
+
+    /// 连接统一等可读，等待表里的 fd 可以指定等可读还是等可写。
+    ///
+    /// 分界点仍是 `n_conns`：前一段是连接，后一段是协程在等的 fd。
+    pub fn reset_conns_with<I, J>(&mut self, conns: I, waits: J)
+    where
+        I: Iterator<Item = c_int>,
+        J: Iterator<Item = (c_int, bool)>,
+    {
         self.items.truncate(self.waker_slots);
-        for fd in fds {
+        for fd in conns {
             self.items.push(PollFd {
                 fd,
                 events: POLLIN,
+                revents: 0,
+            });
+        }
+        for (fd, want_write) in waits {
+            self.items.push(PollFd {
+                fd,
+                events: if want_write { POLLOUT } else { POLLIN },
                 revents: 0,
             });
         }
@@ -409,6 +448,12 @@ impl PollSet {
         Self
     }
     pub fn reset_conns<I: Iterator<Item = i32>>(&mut self, _fds: I) {}
+    pub fn reset_conns_with<I, J>(&mut self, _c: I, _w: J)
+    where
+        I: Iterator<Item = i32>,
+        J: Iterator<Item = (i32, bool)>,
+    {
+    }
     pub fn wait(&mut self, timeout_ms: i32) -> std::io::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(timeout_ms.max(1) as u64));
         Ok(())

@@ -62,8 +62,8 @@ impl<T> Api<T> {
     where
         T: Serialize,
     {
-        match serde_json::to_vec(&body("OK", "success", serde_json::to_value(&self.0).ok(), req.request_id())) {
-            Ok(bytes) => Response::json_with(&bytes, Status::OK),
+        match serialize("OK", "success", Some(&self.0), req.request_id()) {
+            Ok(bytes) => Response::json_owned(bytes, Status::OK),
             Err(e) => ApiError::internal(format!("响应序列化失败：{e}")).into_response(),
         }
     }
@@ -71,9 +71,8 @@ impl<T> Api<T> {
 
 impl<T: Serialize> IntoResponse for Api<T> {
     fn into_response(self) -> Response {
-        let data = serde_json::to_value(&self.0).ok();
-        match serde_json::to_vec(&body("OK", "success", data, None)) {
-            Ok(bytes) => Response::json_with(&bytes, Status::OK),
+        match serialize("OK", "success", Some(&self.0), None) {
+            Ok(bytes) => Response::json_owned(bytes, Status::OK),
             Err(e) => ApiError::internal(format!("响应序列化失败：{e}")).into_response(),
         }
     }
@@ -89,33 +88,42 @@ pub fn error(err: &ApiError, req: Option<&Request>, on: bool) -> Response {
     }
     let trace = req.and_then(|r| r.request_id());
     let code = code_of(err.status);
-    let data = match (&err.loc, &err.kind) {
-        (Some((where_, name)), Some(kind)) => {
-            let loc = if name.is_empty() {
-                serde_json::json!([where_])
-            } else {
-                serde_json::json!([where_, name])
-            };
-            Some(serde_json::json!({
-                "fields": [{
-                    "loc": loc,
-                    "msg": err.detail,
-                    "type": kind,
-                }]
-            }))
-        }
-        _ => None,
-    };
-    let message = if data.is_some() {
-        "参数校验失败".to_string()
-    } else {
-        err.detail.clone()
-    };
-    match serde_json::to_vec(&body(code, &message, data, trace)) {
-        Ok(bytes) => Response::json_with(&bytes, err.status),
-        // 连错误体都序列化不了，说明是极端环境（内存耗尽等），给最小可用的 500
-        Err(_) => Response::json_with(br#"{"code":"INTERNAL_ERROR","message":"internal error","data":null}"#, Status::INTERNAL_SERVER_ERROR),
+
+    // 只有校验失败才需要 `fields` 这棵树（本身是罕见路径，建树无妨）。
+    // 其余错误 `data` 就是 null，直接写字面量，不经过任何中间结构。
+    if let (Some((where_, name)), Some(kind)) = (&err.loc, &err.kind) {
+        let loc = if name.is_empty() {
+            serde_json::json!([where_])
+        } else {
+            serde_json::json!([where_, name])
+        };
+        let data = serde_json::json!({
+            "fields": [{
+                "loc": loc,
+                "msg": err.detail,
+                "type": kind,
+            }]
+        });
+        return match serialize(code, "参数校验失败", Some(&data), trace) {
+            Ok(bytes) => Response::json_owned(bytes, err.status),
+            Err(_) => fallback_500(),
+        };
     }
+
+    // `ApiError::internal` 已经把真因挪进日志、`detail` 是通用文案，
+    // 所以这里可以直接用 `detail`，不会再泄漏 SQL 或内部路径。
+    match serialize(code, &err.detail, None::<&serde_json::Value>, trace) {
+        Ok(bytes) => Response::json_owned(bytes, err.status),
+        Err(_) => fallback_500(),
+    }
+}
+
+/// 连错误体都序列化不了，说明是极端环境（内存耗尽等），给最小可用的 500。
+fn fallback_500() -> Response {
+    Response::json_owned(
+        br#"{"code":"INTERNAL_ERROR","message":"internal error","data":null}"#.to_vec(),
+        Status::INTERNAL_SERVER_ERROR,
+    )
 }
 
 /// 状态码 → 业务码。刻意**不用** HTTP 状态码当业务码：
@@ -136,23 +144,38 @@ fn code_of(status: Status) -> &'static str {
     }
 }
 
-fn body(
+/// 逐段把 envelope 写进一个 buffer，**不建 `serde_json::Value` 中间树**。
+///
+/// 原实现是 `to_value(&data)` → `json!({...})` 建第二棵树 → `to_vec` →
+/// `Response::json_with` 再 `to_vec()` 一次：一个响应最多四次分配、三次遍历。
+/// 现在只分配一次，字段顺序与旧实现逐字节一致（`code` → `message` →
+/// `data` → `trace_id`）。
+fn serialize<D: Serialize>(
     code: &str,
     message: &str,
-    data: Option<serde_json::Value>,
-    trace_id: Option<&str>,
-) -> serde_json::Value {
-    let mut o = serde_json::json!({
-        "code": code,
-        "message": message,
-        "data": data.unwrap_or(serde_json::Value::Null),
-    });
+    data: Option<&D>,
+    trace: Option<&str>,
+) -> serde_json::Result<Vec<u8>> {
+    // 128 覆盖绝大多数 envelope，避免小响应触发扩容
+    let mut buf = Vec::with_capacity(128);
+    buf.push(b'{');
+    buf.extend_from_slice(br#""code":"#);
+    serde_json::to_writer(&mut buf, code)?;
+    buf.extend_from_slice(br#","message":"#);
+    serde_json::to_writer(&mut buf, message)?;
+    buf.extend_from_slice(br#","data":"#);
+    match data {
+        Some(d) => serde_json::to_writer(&mut buf, d)?,
+        None => buf.extend_from_slice(b"null"),
+    }
     // 没有 trace_id 时不写这个字段，而不是写 null：
     // 客户端"_ 缺失"比"_ 是 null"更容易判断
-    if let Some(t) = trace_id {
-        o["trace_id"] = serde_json::json!(t);
+    if let Some(t) = trace {
+        buf.extend_from_slice(br#","trace_id":"#);
+        serde_json::to_writer(&mut buf, t)?;
     }
-    o
+    buf.push(b'}');
+    Ok(buf)
 }
 
 #[cfg(test)]

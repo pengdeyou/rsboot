@@ -174,7 +174,13 @@ struct Local {
     current: TaskPtr,
     /// 正在等 fd 就绪的协程。worker 每轮会把它们的 fd 拼进 `poll`，
     /// 就绪时把协程放回队列——这是"等 socket 也能让出"的全部机制。
-    waits: Vec<(std::os::raw::c_int, TaskPtr)>,
+    ///
+    /// 第三项是**等哪个方向**：读等 `POLLIN`，写等 `POLLOUT`。
+    /// 少了这个，非阻塞写一旦 `EAGAIN` 就只能忙等。
+    /// 第四项是**这条等待的截止时刻**。由 worker 每轮扫描到期，
+    /// 绝不交给定时器线程：定时器堆里的条目不会因为 fd 先就绪而撤销，
+    /// 协程先跑完并释放任务后，到期条目就成了野指针（S12 崩溃的根因）。
+    waits: Vec<(std::os::raw::c_int, TaskPtr, WaitKind, u64)>,
 }
 
 thread_local! {
@@ -247,15 +253,43 @@ pub fn pump(limit: usize) -> usize {
     done
 }
 
-/// 协程里调用：等 `fd` 可读/可写就绪，期间让出 worker。
+/// 等待方向。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaitKind {
+    Read,
+    Write,
+}
+
+/// 协程里调用：等 `fd` 可读就绪，期间让出 worker。
 ///
 /// 调用前应先用 0 超时的 `poll` 检查一次——已经就绪就别折腾调度器。
 pub fn wait_fd(fd: std::os::raw::c_int) {
+    wait_fd_kind(fd, WaitKind::Read);
+}
+
+/// 等 `fd` 可写就绪。写缓冲满（`EAGAIN`）时用它，**不要忙等**。
+pub fn wait_fd_write(fd: std::os::raw::c_int) {
+    wait_fd_kind(fd, WaitKind::Write);
+}
+
+/// 带截止时间的等待。到期由定时器线程把协程放回队列，
+/// 醒来后调用方自己判时间——这样 slowloris 的"慢速发送上限"在让出后依然成立。
+pub fn wait_fd_until(fd: std::os::raw::c_int, deadline_ns: Option<u64>) {
+    wait_fd_kind_dl(fd, WaitKind::Read, deadline_ns);
+}
+
+fn wait_fd_kind(fd: std::os::raw::c_int, kind: WaitKind) {
+    wait_fd_kind_dl(fd, kind, None);
+}
+
+fn wait_fd_kind_dl(fd: std::os::raw::c_int, kind: WaitKind, deadline: Option<u64>) {
     let t = current_task();
     if t.0.is_null() {
         return;
     }
-    with_local(|l| l.waits.push((fd, t)));
+    // 无截止时间的等待给一个远未来，避免每轮扫描都判它过期
+    let at = deadline.unwrap_or_else(|| crate::server::clock::now_ns() + 3_600_000_000_000);
+    with_local(|l| l.waits.push((fd, t, kind, at)));
     unsafe {
         // deadline 留空：worker 看到 Blocked 但没 deadline 就不会去排定时器
         t.get().deadline.set(None);
@@ -264,9 +298,68 @@ pub fn wait_fd(fd: std::os::raw::c_int) {
     }
 }
 
-/// worker 拼 `poll` 用的等待 fd 列表。
-pub fn wait_fds() -> Vec<std::os::raw::c_int> {
-    with_local(|l| l.waits.iter().map(|(fd, _)| *fd).collect()).unwrap_or_default()
+/// worker 拼 `poll` 用的等待 fd 列表：`(fd, 是否等可写)`。
+pub fn wait_fds() -> Vec<(std::os::raw::c_int, bool)> {
+    with_local(|l| {
+        l.waits
+            .iter()
+            .map(|(fd, _, kind, _)| (*fd, *kind == WaitKind::Write))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// 最早一条等待的截止时刻，给 worker 决定 `poll` 超时用。
+pub fn wait_deadline() -> Option<u64> {
+    with_local(|l| l.waits.iter().map(|(_, _, _, at)| *at).min()).flatten()
+}
+
+/// worker 每轮调用：把已过截止时刻的等待唤醒，让它们自己判超时。
+///
+/// 返回唤醒的条数。必须**降序** `swap_remove`。
+pub fn expire_waits(now_ns: u64) -> usize {
+    // 热路径上等待表通常是空的：先看一眼长度，别为空表 clone Arc、建 Vec
+    if with_local(|l| l.waits.len()).unwrap_or(0) == 0 {
+        return 0;
+    }
+    let Some((due, shared)) = with_local(|l| {
+        let mut due: Vec<TaskPtr> = Vec::new();
+        let mut i = 0;
+        while i < l.waits.len() {
+            if l.waits[i].3 <= now_ns {
+                let (_, t, _, _) = l.waits.swap_remove(i);
+                due.push(t);
+                // swap_remove 把尾巴搬到了 i，这里不能 i += 1
+            } else {
+                i += 1;
+            }
+        }
+        (due, Arc::clone(&l.shared))
+    }) else {
+        return 0;
+    };
+    let n = due.len();
+    for t in due {
+        unsafe { t.get().state.set(TaskState::Runnable) };
+        shared.push(t);
+    }
+    n
+}
+
+/// 主动放弃等待：把当前协程在 `fd` 上的等待条目摘掉。
+///
+/// 超时返回前必须调用。否则条目还留在表里，fd 稍后就绪会把一个
+/// 已经跑起来的协程再推一次队列——同一个协程被调度两次。
+pub fn cancel_wait(fd: std::os::raw::c_int) {
+    let t = current_task();
+    if t.0.is_null() {
+        return;
+    }
+    with_local(|l| {
+        if let Some(i) = l.waits.iter().position(|(f, task, _, _)| *f == fd && task.0 == t.0) {
+            l.waits.swap_remove(i);
+        }
+    });
 }
 
 /// 某个等待项就绪：把协程放回队列并移出等待表。
@@ -276,7 +369,7 @@ pub fn wait_fds() -> Vec<std::os::raw::c_int> {
 pub fn wake_wait(i: usize) {
     let picked: Option<(Arc<Shared>, TaskPtr)> = with_local(|l| {
         if i < l.waits.len() {
-            let (_, t) = l.waits.swap_remove(i);
+            let (_, t, _, _) = l.waits.swap_remove(i);
             Some((Arc::clone(&l.shared), t))
         } else {
             None

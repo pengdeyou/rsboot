@@ -49,7 +49,23 @@ impl Response {
             api_error: None,
         };
         r.headers
-            .insert("content-type", "application/json; charset=utf-8");
+            .insert_static("content-type", "application/json; charset=utf-8");
+        r
+    }
+
+    /// 直接接管调用方已拼好的字节，**零拷贝**。
+    ///
+    /// `json_with` 末尾有一次 `to_vec()`：调用方刚分配好 buffer 又被拷一遍，
+    /// 在统一响应体这种"本来就要逐段拼字节"的路径上纯属白拷。
+    pub fn json_owned(body: Vec<u8>, status: Status) -> Self {
+        let mut r = Self {
+            status,
+            headers: Headers::new(),
+            body,
+            api_error: None,
+        };
+        r.headers
+            .insert_static("content-type", "application/json; charset=utf-8");
         r
     }
 
@@ -66,7 +82,7 @@ impl Response {
             api_error: None,
         };
         r.headers
-            .insert("content-type", "text/plain; charset=utf-8");
+            .insert_static("content-type", "text/plain; charset=utf-8");
         r
     }
 
@@ -82,7 +98,7 @@ impl Response {
             body: s.into_bytes(),
             api_error: None,
         };
-        r.headers.insert("content-type", "text/html; charset=utf-8");
+        r.headers.insert_static("content-type", "text/html; charset=utf-8");
         r
     }
 
