@@ -93,6 +93,15 @@ pub struct Conn {
     stream: TcpStream,
     /// 让出式读缓冲：`read_until` / `read_exact` 内部就会挂起等 `POLLIN`
     reader: BufReader<coio::CoIo>,
+    /// 当前请求的头原文。按连接复用：keep-alive 下每条连接处理成千上万个请求，
+    /// 每请求新建一个 `String` 意味着一次 malloc + 数次 realloc（头部有 8 行时
+    /// 容量要长两三轮）。
+    head_buf: String,
+    /// `read_until` 的行缓冲，同样按连接复用。
+    line_buf: Vec<u8>,
+    /// 响应头的组装缓冲。`write_response_fd` 每次新建一个 `Vec` 来拼状态行与头，
+    /// 同样属于每请求一次的固定税。
+    out_buf: Vec<u8>,
     served: usize,
 }
 
@@ -122,6 +131,10 @@ impl Conn {
         Ok(Self {
             stream,
             reader,
+            // 一次请求头约 200–600 字节；给个起点，后续扩容由 `reserve` 决定。
+            head_buf: String::with_capacity(512),
+            line_buf: Vec::with_capacity(256),
+            out_buf: Vec::with_capacity(256),
             served: 0,
         })
     }
@@ -196,8 +209,14 @@ impl Conn {
 
         let peer = self.peer();
         let _t = profile::start(profile::READ);
-        let head = match read_head(&mut self.reader, should_stop, limits.io_timeout) {
-            Ok(h) => h,
+        match read_head(
+            &mut self.reader,
+            &mut self.head_buf,
+            &mut self.line_buf,
+            should_stop,
+            limits.io_timeout,
+        ) {
+            Ok(()) => (),
             // 空闲连接不是坏连接：交回队列，让 worker 去服务别人
             Err(HeadError::Timeout) => return Ok(ConnOutcome::Idle),
             Err(HeadError::Eof) => return CLOSED,
@@ -222,7 +241,7 @@ impl Conn {
 
         drop(_t);
         let _t = profile::start(profile::PARSE);
-        let parsed = match parse::parse_head(&head, limits.max_body) {
+        let parsed = match parse::parse_head(&self.head_buf, limits.max_body) {
             Ok(p) => p,
             Err(ParseError { status, message }) => {
                 // 解析层拒绝一律断开：边界已不可信
@@ -288,7 +307,13 @@ impl Conn {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            write::write_response_fd(self.stream.as_raw_fd(), &resp, parsed.close, head_only)?;
+            write::write_response_fd(
+                self.stream.as_raw_fd(),
+                &resp,
+                parsed.close,
+                head_only,
+                &mut self.out_buf,
+            )?;
         }
         #[cfg(not(unix))]
         write::write_response(&mut self.stream, &resp, parsed.close, head_only)?;
@@ -312,11 +337,12 @@ fn write_error<W: Write>(out: &mut W, err: ApiError, close: bool) -> std::io::Re
 /// 不会为了找结束标记而把一个 8 KiB 上限的读取变成无界读取。
 fn read_head<R: BufRead, F: Fn() -> bool>(
     reader: &mut R,
+    head: &mut String,
+    line: &mut Vec<u8>,
     should_stop: &F,
     idle: Duration,
-) -> Result<String, HeadError> {
-    let mut head = String::new();
-    let mut line = Vec::new();
+) -> Result<(), HeadError> {
+    head.clear();
     let budget = MAX_REQUEST_LINE + MAX_HEADER_BYTES;
     // 从"开始等这个请求"算起。慢速发送超过 idle 就当超时（slowloris 防御）：
     // 一个字节省着发的客户端不该占住 worker。
@@ -330,7 +356,7 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
             return Err(HeadError::Stopped);
         }
         line.clear();
-        let n = match reader.read_until(b'\n', &mut line) {
+        let n = match reader.read_until(b'\n', line) {
             Ok(n) => n,
             Err(e) => match e.kind() {
                 // socket 设的读超时是轮询间隔（250ms），不是真正的超时；
@@ -367,7 +393,7 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
             return Err(HeadError::TooLarge);
         }
         if s.is_empty() {
-            return Ok(head);
+            return Ok(());
         }
     }
 }
@@ -411,7 +437,10 @@ mod tests {
 
     fn read_head_from(bytes: &[u8]) -> Result<String, HeadError> {
         let mut r = BufReader::new(std::io::Cursor::new(bytes.to_vec()));
-        read_head(&mut r, &|| false, Duration::from_secs(5))
+        let mut head = String::new();
+        let mut line = Vec::new();
+        read_head(&mut r, &mut head, &mut line, &|| false, Duration::from_secs(5))?;
+        Ok(head)
     }
 
     #[test]
@@ -420,8 +449,10 @@ mod tests {
         // 否则关闭期只能静默断连、给不出 503
         let mut r = BufReader::new(std::io::Cursor::new(b"GET / HTT".to_vec()));
         let stop = || true;
+        let mut head = String::new();
+        let mut line = Vec::new();
         assert!(matches!(
-            read_head(&mut r, &stop, Duration::from_secs(5)),
+            read_head(&mut r, &mut head, &mut line, &stop, Duration::from_secs(5)),
             Err(HeadError::Stopped)
         ));
     }

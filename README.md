@@ -40,14 +40,17 @@ Benchmarked against axum and actix-web. Setup: 4-core Linux VM, **2 worker threa
 | `/slow` — 20 ms delay, 5 concurrent | **248** | 236 | 236 |
 | `/slow` — 20 ms delay, 20 concurrent | **990** | 944 | 944 |
 | `/slow` — 20 ms delay, 200 concurrent | **9 687** | 9 237 | 9 292 |
-| `/json` — 4 concurrent, no blocking I/O | **112 267** | 92 280 | 110 919 |
-| `/json` — 20 concurrent, no blocking I/O | 131 350 | 133 843 | **155 315** |
+| `/json` — 4 concurrent, no blocking I/O | **160 006** | 130 504 | 140 917 |
+| `/json` — 20 concurrent, no blocking I/O | **198 557** | 153 618 | 194 150 |
+
+The two `/json` rows were re-measured on 2026-11-26; the `/slow` rows come from an earlier window on the same machine (the coroutine path has not changed since, but treat them as a separate run rather than a single snapshot).
 
 What the table says, including the parts that don't flatter us:
 
 - On blocking-ish workloads rsboot is the fastest of the three, but only by a few percent over axum/actix — the three converge because all of them keep workers busy. The interesting number is the gap against **our own synchronous version**: 99 → 9 687 QPS at 200 concurrency, **96×**. That is the whole reason the coroutine layer exists.
-- Pure JSON throughput splits by concurrency, and we lose one half of it. At 4 clients rsboot leads (**112 267** — 1.2 % over actix, 21.7 % over axum). At 20 clients **actix-web pulls 18 % ahead** (155 315 vs 131 350) and axum edges past us by 1.9 %. The measured cause is our header state machine (757 ns per request head against `httparse`'s 122 ns) plus per-request bookkeeping — costs that grow with in-flight requests. We also verified what it is *not*: `poll` blocking is only 14 % of worker time, and small responses already leave in a single `write` call.
-- The 157 730 figure this README used to print has been **retired**. The load generator itself cost microseconds per request (two `Instant::now()` calls at ~1.8 µs each on this test VM), which flattened all three servers into the same number. The table above comes from a rebuilt client: `rdtsc` timing, no per-request allocation, no per-request syscall.
+- Pure JSON throughput: rsboot leads at both concurrency levels in the current window — 13.5 % over actix-web and 22.6 % over axum at 4 clients; 2.3 % over actix and 29.2 % over axum at 20 clients. The 20-client lead is **inside run-to-run noise** (three rounds spanned 193 k–210 k on this 4-core VM), so read that row as "on par with actix", not as a win.
+- Two figures this README used to print are **retired**. `157 730`: the load generator itself cost microseconds per request (two `Instant::now()` calls at ~1.8 µs each on this test VM), which flattened all three servers into the same number — the rows above come from a rebuilt client (`rdtsc` timing, no per-request allocation, no per-request syscall). `131 350`: measured before the envelope was rewritten (916 ns → 102 ns), before responses were batched into a single `writev`, and while every request still re-allocated its trace id.
+- Response head buffers are now allocated **per connection instead of per request** (`fill_head` micro-benchmark: 163 ns → 109 ns per response). End to end that disappears into noise — an A/B over the same window gave median 230 200 vs 232 270 QPS with a ±25 % spread — so it is kept for the steady-state allocation cost, not for a headline number. For the record: `poll` blocking is 14 % of worker time and small responses already leave in one `writev`, so neither is where the remaining gap sits.
 - Downstream service calls: 40 concurrent clients × 20 ms dependency, cooperative mode **655 QPS / p99 62 ms** vs blocking baseline **33 QPS / p99 2 323 ms** — a 20× difference from a single flag (`RSBOOT_BLOCKING_IO`).
 
 These numbers drift with the machine. Compare servers within one run, never across machines or against someone else's blog post.

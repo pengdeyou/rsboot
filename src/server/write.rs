@@ -117,9 +117,13 @@ pub fn write_response_fd(
     resp: &Response,
     close: bool,
     head_only: bool,
+    head: &mut Vec<u8>,
 ) -> io::Result<()> {
-    let mut head: Vec<u8> = Vec::with_capacity(96 + resp.headers.len() * 32);
-    fill_head(&mut head, resp, close);
+    // `head` 由调用方按连接复用：这条路径每个请求都要走一次，新建 `Vec`
+    // 就是每请求一次 malloc/free。容量只增不减，稳态下零分配。
+    head.clear();
+    head.reserve(96 + resp.headers.len() * 32);
+    fill_head(head, resp, close);
 
     let body: &[u8] = if head_only || body_forbidden(resp) {
         &[]
@@ -129,9 +133,9 @@ pub fn write_response_fd(
 
     if body.len() <= WRITEV_THRESHOLD {
         head.extend_from_slice(body);
-        return write_all_fd(fd, &head);
+        return write_all_fd(fd, head);
     }
-    writev_all(fd, &head, body)
+    writev_all(fd, head, body)
 }
 
 #[cfg(unix)]
@@ -301,9 +305,40 @@ mod tests {
             s.read_to_end(&mut got).unwrap();
             got
         });
-        super::write_response_fd(c.as_raw_fd(), resp, close, head_only).unwrap();
+        let mut buf = Vec::new();
+        super::write_response_fd(c.as_raw_fd(), resp, close, head_only, &mut buf).unwrap();
         drop(c);
         h.join().unwrap()
+    }
+
+    /// 头部缓冲的分配开销：每请求新建 vs 按连接复用。
+    ///
+    /// 不是断言——端到端压测的噪声（±15%）盖住了这一项，只能在微基准里量。
+    #[test]
+    fn bench_head_buffer() {
+        let resp = Response::text("{\"ok\":true}");
+        let heads = resp.headers.len();
+        let n = 200_000usize;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            buf.clear();
+            buf.reserve(96 + heads * 32);
+            fill_head(&mut buf, &resp, false);
+            std::hint::black_box(&buf);
+        }
+        let reuse = t.elapsed().as_nanos() as f64 / n as f64;
+
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let mut fresh: Vec<u8> = Vec::with_capacity(96 + heads * 32);
+            fill_head(&mut fresh, &resp, false);
+            std::hint::black_box(&fresh);
+        }
+        let fresh_ns = t.elapsed().as_nanos() as f64 / n as f64;
+
+        println!("head buffer: 每请求新建 {fresh_ns:.0} ns / 按连接复用 {reuse:.0} ns");
     }
 
     #[cfg(unix)]
