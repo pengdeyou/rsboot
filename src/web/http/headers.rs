@@ -85,16 +85,31 @@ impl Headers {
 
     /// 解析结果构造：整块原文 + 每头的 (名区间, 值区间)。
     pub(crate) fn from_parsed(raw: Arc<str>, items: Vec<(Range<u32>, Range<u32>)>) -> Self {
+        let mut h = Self::sliced(raw, items.len());
+        for (n, v) in items {
+            h.push_sliced(n, v);
+        }
+        h
+    }
+
+    /// 解析路径用：先挂上整块原文，再逐条 `push_sliced`。
+    ///
+    /// 这样一次 `Vec` 分配就装完，不再"先攒 `Vec<(Range, Range)>`、再
+    /// `collect` 成一个 `Vec<Hdr>`"——那是每请求两笔堆分配换一次结构转换。
+    pub(crate) fn sliced(raw: Arc<str>, capacity: usize) -> Self {
         Self {
             raw: Some(raw),
-            items: items
-                .into_iter()
-                .map(|(n, v)| Hdr {
-                    name: Name::Sliced(n),
-                    value: Val::Sliced(v),
-                })
-                .collect(),
+            items: Vec::with_capacity(capacity),
         }
+    }
+
+    /// 追加一条指向 `raw` 的区间。区间由解析方保证落在字符边界内。
+    #[inline]
+    pub(crate) fn push_sliced(&mut self, name: Range<u32>, value: Range<u32>) {
+        self.items.push(Hdr {
+            name: Name::Sliced(name),
+            value: Val::Sliced(value),
+        });
     }
 
     /// 名字大小写不敏感。含非法字符（非 token）或值含 CRLF 时返回 `false`。

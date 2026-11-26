@@ -76,9 +76,9 @@ const MAX_HEADER_LINE: usize = 4 * 1024;
 ///
 /// `head` 是"请求行 + 头 + 空行"这一段原始字节，`max_body` 是配置的 body 上限。
 pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseError> {
-    let mut lines = head.split("\r\n");
-
-    let request_line = lines.next().unwrap_or("");
+    // 请求行到第一个 `\r\n` 为止（整块 head 本身就是"到空行"那一段）
+    let rl_end = head.find("\r\n").unwrap_or(head.len());
+    let request_line = &head[..rl_end];
     if request_line.is_empty() {
         return Err(ParseError::new(Status::BAD_REQUEST, "请求行是空的"));
     }
@@ -145,18 +145,57 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
 
     // 整块 head 只复制这一次，后面每个头都只是它上面的一个区间
     let raw: Arc<str> = Arc::from(head);
-    let mut items: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)> = Vec::with_capacity(12);
+    // 直接往 `Headers` 里塞区间：不再"先攒 Vec<(Range,R)Range> 再 collect
+    // 成 Vec<Hdr>"——那是每请求两笔堆分配 + 一次结构转换。
+    let mut headers = Headers::sliced(raw, 12);
     let mut total: usize = 0;
     let mut host_seen = false;
     let mut content_length: Option<usize> = None;
     let mut transfer_encoding = false;
+    let mut conn_close = false;
+    let mut conn_keepalive = false;
 
-    let mut pos = request_line.len() + 2;
-    for line in lines {
-        let line_start = pos;
-        pos += line.len() + 2;
+    let bytes = head.as_bytes();
+    let mut i = rl_end + 2;
+    while i < bytes.len() {
+        // 一行一行走，同时校验 CR/LF 规范：只允许成对的 `\r\n`，孤立的
+        // `\r` / `\n` 直接拒——那是值里做 CRLF 注入的入口。
+        // 顺手的好处是不用 `split("\r\n")`：它每取一行都要再打一次双字节
+        // 搜索，12 行就是 200 ns，而这里整块只扫一遍。
+        let line_start = i;
+        let mut j = i;
+        // 冒号在这里一起找：一行只扫一遍，不再 `line.find(':')` 再来一趟。
+        let mut colon = usize::MAX;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if b == b'\r' || b == b'\n' {
+                break;
+            }
+            if b == b':' && colon == usize::MAX {
+                colon = j;
+            }
+            j += 1;
+        }
+        let line = &head[line_start..j];
+        let next = match bytes.get(j) {
+            None => bytes.len(),
+            Some(&b'\r') if bytes.get(j + 1) == Some(&b'\n') => j + 2,
+            Some(&b'\r') => {
+                return Err(ParseError::new(
+                    Status::BAD_REQUEST,
+                    "头部里出现了孤立的 `\\r`（只允许成对的 CRLF）",
+                ))
+            }
+            Some(_) => {
+                return Err(ParseError::new(
+                    Status::BAD_REQUEST,
+                    "头部里出现了孤立的 `\\n`（只允许成对的 CRLF）",
+                ))
+            }
+        };
+        i = next;
         if line.is_empty() {
-            continue;
+            break;
         }
         total += line.len() + 2;
         if total > MAX_HEADER_BYTES {
@@ -171,38 +210,51 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
                 "不支持头部续行（obs-fold）；请把同一个头写成一行",
             ));
         }
-        let Some((name_raw, value_raw)) = line.split_once(':') else {
+        if colon == usize::MAX {
             return Err(ParseError::new(
                 Status::BAD_REQUEST,
                 format!("头部缺少冒号：`{}`", truncate(line)),
             ));
-        };
-        let name = name_raw.trim();
-        let value = value_raw.trim();
-        if !crate::web::http::headers::validate_pair(name, value) {
-            // Headers::insert 拒非法 token 与含 CRLF 的值
+        }
+        // RFC 7230 的 OWS 只有 SP / HTAB。`str::trim` 走 Unicode 空白表：
+        // 既慢，又把 `\u{A0}` 之类当可 trim 的空白——口径比规范宽。
+        // 一次扫描拿两侧边界，下面同时用来切字符串和算区间偏移。
+        let name_raw = &head[line_start..colon];
+        let value_raw = &head[colon + 1..j];
+        let (ns, ne) = trim_ows(name_raw);
+        let (vs, ve) = trim_ows(value_raw);
+        let name = &name_raw[ns..ne];
+        let value = &value_raw[vs..ve];
+        if !is_token_bytes(name.as_bytes()) {
             return Err(ParseError::new(
                 Status::BAD_REQUEST,
-                format!("头部名或值非法：`{}`", truncate(name)),
+                format!("头部名非法：`{}`", truncate(name)),
             ));
         }
 
         // 记下区间而不是复制字符串：一个请求省掉 16~24 次分配
-        let name_off = line_start + (name_raw.len() - name_raw.trim_start().len());
-        let value_off = line_start
-            + name_raw.len()
-            + 1
-            + (value_raw.len() - value_raw.trim_start().len());
-        items.push((
+        let name_off = line_start + ns;
+        let value_off = colon + 1 + vs;
+        headers.push_sliced(
             name_off as u32..(name_off + name.len()) as u32,
             value_off as u32..(value_off + value.len()) as u32,
-        ));
+        );
 
-        if name.eq_ignore_ascii_case("host") {
-            host_seen = true;
-        } else if name.eq_ignore_ascii_case("content-length") {
-            {
-                {
+        // 每头只看一次长度再比字节：原来三条 `eq_ignore_ascii_case` 串行，
+        // 一个头要扫三遍。长度不等就直接落到 `_`。
+        match name.len() {
+            4 if eq_ci(name, b"host") => host_seen = true,
+            10 if eq_ci(name, b"connection") => {
+                for t in value.split(',') {
+                    let t = t.trim_ascii();
+                    if t.eq_ignore_ascii_case("close") {
+                        conn_close = true;
+                    } else if t.eq_ignore_ascii_case("keep-alive") {
+                        conn_keepalive = true;
+                    }
+                }
+            }
+            14 if eq_ci(name, b"content-length") => {
                 let n: usize = value.parse().map_err(|_| {
                     ParseError::new(Status::BAD_REQUEST, "Content-Length 必须是十进制非负整数")
                 })?;
@@ -216,9 +268,8 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
                     _ => content_length = Some(n),
                 }
             }
-            }
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            transfer_encoding = true;
+            17 if eq_ci(name, b"transfer-encoding") => transfer_encoding = true,
+            _ => {}
         }
     }
 
@@ -251,16 +302,13 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
         }
     };
 
-    let headers = Headers::from_parsed(raw, items);
-    let conn_header = headers
-        .get("connection")
-        .map(|v| v.to_ascii_lowercase())
-        .unwrap_or_default();
+    // `Connection` 是逗号分隔的 token 列表。上面解析时顺手按 token 比完了，
+    // 不在这里再 `get("connection")` 线性扫一遍头、也不整条 `to_lowercase()`。
     let close = if version == 0 {
         // HTTP/1.0 默认关闭，除非显式 keep-alive
-        !conn_header.contains("keep-alive")
+        !conn_keepalive
     } else {
-        conn_header.contains("close")
+        conn_close
     };
 
     Ok(ParsedRequest {
@@ -271,6 +319,49 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
         body_len,
         close,
     })
+}
+
+/// token 允许的字节（RFC 7230 的 tchar）。查表一次，不为每个字符走分支匹配。
+/// 表开到 256 项：非 ASCII 字节自然落到 `false`，省掉逐字节的 `< 128` 判断。
+static TOKEN_TABLE: [bool; 256] = {
+    const fn tchar(c: u8) -> bool {
+        matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+            | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_'
+            | b'`' | b'|' | b'~')
+    }
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = i < 128 && tchar(i as u8);
+        i += 1;
+    }
+    t
+};
+
+#[inline]
+fn is_token_bytes(b: &[u8]) -> bool {
+    !b.is_empty() && b.iter().all(|&c| TOKEN_TABLE[c as usize])
+}
+
+/// 与给定的小写字面量做大小写不敏感比较。长度不等立刻返回。
+#[inline]
+fn eq_ci(s: &str, lower: &[u8]) -> bool {
+    s.as_bytes().eq_ignore_ascii_case(lower)
+}
+
+/// 头部值两侧的 OWS（SP / HTAB）边界。返回字节下标区间 `[start, end)`。
+#[inline(always)]
+fn trim_ows(s: &str) -> (usize, usize) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let mut j = b.len();
+    while j > i && (b[j - 1] == b' ' || b[j - 1] == b'\t') {
+        j -= 1;
+    }
+    (i, j)
 }
 
 fn truncate(s: &str) -> String {
@@ -292,6 +383,39 @@ mod tests {
 
     fn err(head: &str) -> ParseError {
         parse_head(head, 1024 * 1024).expect_err("应当被拒绝")
+    }
+
+
+
+
+
+    /// 请求头解析的成本。两组样本：压测器实发的极简头（3 行），
+    /// 和真实浏览器/客户端常见规模（12 头 ≈ 700 B）。
+    #[test]
+    fn bench_parse_head() {
+        let lean = "GET /json HTTP/1.1\r\nhost: bench\r\nconnection: keep-alive\r\n\r\n";
+        let full = "GET /api/v1/orders/42?page=2 HTTP/1.1\r\n\
+host: api.example.com\r\n\
+user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36\r\n\
+accept: application/json, text/plain;q=0.9\r\n\
+accept-encoding: gzip, deflate, br\r\n\
+accept-language: zh-CN,zh;q=0.9,en;q=0.8\r\n\
+connection: keep-alive\r\n\
+cookie: sid=8f3a9c; theme=dark; lang=zh\r\n\
+referer: https://api.example.com/docs\r\n\
+x-request-id: 9d2f1a7c-4b3e-4a51-9c8f-2b7d6e1a0c33\r\n\
+x-forwarded-for: 203.0.113.7, 10.0.0.2\r\n\
+if-none-match: \"33a64df5\"\r\n\
+\r\n";
+        let n = 20000usize;
+        for (label, head) in [("极简 3 行", lean), ("常见 12 头", full)] {
+            let started = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(parse_head(std::hint::black_box(head), 1 << 20).ok());
+            }
+            let per = started.elapsed().as_nanos() as f64 / n as f64;
+            println!("parse_head {label} ({} B): {per:.0} ns/请求", head.len());
+        }
     }
 
     #[test]
