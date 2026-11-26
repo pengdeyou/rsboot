@@ -79,8 +79,14 @@ fn slice<'a>(raw: Option<&'a str>, r: &Range<u32>) -> &'a str {
 }
 
 impl Headers {
+    /// 空头部表，**预分配 4 格**：响应头（content-type / content-length /
+    /// x-request-id …）几乎总有 2–4 条，`Vec` 从 0 长到 4 意味着 2–3 次
+    /// `realloc`，而这是每请求都会走的路。
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            raw: None,
+            items: Vec::with_capacity(4),
+        }
     }
 
     /// 解析结果构造：整块原文 + 每头的 (名区间, 值区间)。
@@ -99,7 +105,9 @@ impl Headers {
     pub(crate) fn sliced(raw: Arc<str>, capacity: usize) -> Self {
         Self {
             raw: Some(raw),
-            items: Vec::with_capacity(capacity),
+            // 多留一格：服务端会在请求头里补一条 `x-request-id`，
+            // 按原样精确分配的话，那一次插入就要整体搬迁一次
+            items: Vec::with_capacity(capacity + 1),
         }
     }
 

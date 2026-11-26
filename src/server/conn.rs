@@ -208,7 +208,12 @@ impl Conn {
     }
 
     pub fn into_stream(self) -> TcpStream {
-        self.reader.into_inner().into_inner()
+        // `Conn` 现在有 `Drop`（负责从 epoll 集合里摘 fd），所以不能直接移动字段。
+        // 这里把 `reader` 读出来，再 `forget` 掉 `self`：fd 的所有权已经转给返回的
+        // `TcpStream`，不能再走一次关闭/注销。
+        let reader = unsafe { std::ptr::read(&self.reader) };
+        std::mem::forget(self);
+        reader.into_inner().into_inner()
     }
 
     /// 处理**一个**请求就返回。
@@ -327,18 +332,29 @@ impl Conn {
 
         // trace id：优先客户端给的
         // trace id 只分配一次，请求头与响应头共享同一份文本
-        let trace: std::sync::Arc<str> = req
-            .request_id()
-            .filter(|s| !s.is_empty() && s.len() <= 64)
-            .map(std::sync::Arc::from)
-            .unwrap_or_else(|| std::sync::Arc::from(next_trace_id()));
-        req.headers
-            .insert_shared("x-request-id", std::sync::Arc::clone(&trace));
+        // `RSBOOT_NO_TRACE`：1 = 用固定 id（不生成，但仍插两次头），2 = 完全不插。
+        // 只为把"生成"和"插头"两笔成本分开量；生产别设。
+        let trace: Option<std::sync::Arc<str>> = match trace_mode() {
+            2 => None,
+            1 => Some(static_trace()),
+            _ => Some(
+                req.request_id()
+                    .filter(|s| !s.is_empty() && s.len() <= 64)
+                    .map(std::sync::Arc::from)
+                    .unwrap_or_else(|| std::sync::Arc::from(next_trace_id())),
+            ),
+        };
+        if let Some(t) = &trace {
+            req.headers
+                .insert_shared("x-request-id", std::sync::Arc::clone(t));
+        }
 
         drop(_t);
         let _t = profile::start(profile::HANDLE);
         let mut resp = router.handle(&mut req, ctx);
-        resp.headers.insert_shared("x-request-id", trace);
+        if let Some(t) = trace {
+            resp.headers.insert_shared("x-request-id", t);
+        }
 
         drop(_t);
         let _t = profile::start(profile::WRITE);
@@ -589,4 +605,32 @@ fn nodelay_on() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
     *F.get_or_init(|| std::env::var("RSBOOT_NODELAY").map(|v| v != "0").unwrap_or(true))
+}
+
+/// `x-request-id` 模式：0 = 正常生成（默认），1 = 固定 id，2 = 不发。
+fn trace_mode() -> u8 {
+    use std::sync::OnceLock;
+    static F: OnceLock<u8> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("RSBOOT_NO_TRACE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn static_trace() -> std::sync::Arc<str> {
+    use std::sync::OnceLock;
+    static ID: OnceLock<std::sync::Arc<str>> = OnceLock::new();
+    std::sync::Arc::clone(ID.get_or_init(|| std::sync::Arc::from("00000000-00000001")))
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        // 连接没了，就从 epoll 集合里摘掉：fd 号会被下一条连接复用，
+        // 留着"已注册"的假账会让新连接永远收不到读事件。
+        if let Some(fd) = self.raw_fd() {
+            super::poll::defer_unregister(fd);
+        }
+    }
 }

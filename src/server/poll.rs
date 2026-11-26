@@ -421,6 +421,20 @@ mod ep {
             self.epoch = self.epoch.wrapping_add(1);
             self.cur = [0; WORDS];
 
+            // 先清掉"连接已经销毁"的 fd：它们的号可能已经被新连接拿走，
+            // 不清就会被当成"已注册"，新连接从此收不到通知
+            super::DEFER_DEL.with(|d| {
+                let mut d = d.borrow_mut();
+                for fd in d.drain(..) {
+                    let idx = fd as usize;
+                    if idx < BITS && self.evs[idx] != 0 {
+                        self.ctl(OP_DEL, fd, 0);
+                        self.evs[idx] = 0;
+                        self.reg[idx / 64] &= !(1u64 << (idx % 64));
+                    }
+                }
+            });
+
             if self.epoch % REBUILD_EVERY == 0 {
                 // 全量重建：自愈 fd 复用留下的"假注册"
                 for w in 0..WORDS {
@@ -478,6 +492,37 @@ mod ep {
             m |= OUT;
         }
         m
+    }
+}
+
+// 待注销的 fd：连接对象被丢弃时，由 `Drop` 记在这里，`PollSet::sync` 下一轮取走做
+// `EPOLL_CTL_DEL`。
+// 为什么必须显式注销：`close(2)` 时内核会把这个 fd 从 epoll 集合里删掉，但我们的
+/// 位图还以为它在——随后新连接拿到同一个 fd 号，就**永远收不到 epoll 通知**，
+/// 只能靠 500 ms 兜底超时醒来。短连接压测里表现为 P99 从 1 ms 窜到几十秒。
+#[cfg(all(unix, not(target_os = "macos")))]
+thread_local! {
+    static DEFER_DEL: std::cell::RefCell<Vec<c_int>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 连接销毁时登记 fd（同线程，无锁）。
+///
+/// 为什么必须显式注销：`close(2)` 时内核会把这个 fd 从 epoll 集合里删掉，但我们的
+/// 位图还以为它在——随后新连接拿到同一个 fd 号，就**永远收不到 epoll 通知**，
+/// 只能靠 500 ms 兜底超时醒来。短连接压测里表现为 P99 从 1 ms 窜到几十秒。
+pub(crate) fn defer_unregister(fd: c_int) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        DEFER_DEL.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.len() < 4096 {
+                d.push(fd);
+            }
+        });
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = fd;
     }
 }
 
