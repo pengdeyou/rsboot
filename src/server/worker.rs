@@ -170,7 +170,8 @@ fn main_loop(
         // 推进协程：让出的请求在这里接着跑。worker 只有这一处会切进
         // 协程栈，别的地方都是纯事件循环。
         let mut mark = round_t0;
-        mn::sched::pump(4096);
+        let pumped = mn::sched::pump(4096);
+        profile::note_pump_steps(pumped);
         mark = {
             let n = clock::now_ns();
             profile::note_prep(0, mark, n);

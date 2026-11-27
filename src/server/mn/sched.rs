@@ -40,9 +40,17 @@ impl Shared {
         })
     }
 
+    /// 跨线程投递：必须叫醒可能正睡在 `epoll_wait` 里的 worker。
     fn push(&self, t: TaskPtr) {
         self.queue.lock().unwrap().push_back(t);
         self.waker.notify();
+    }
+
+    /// 同线程投递：worker 此刻正在跑，队列自己在下一轮 `pump` 里就能取到，
+    /// **不需要**叫醒自己。`notify()` 是一次 `write(eventfd)` 系统调用——
+    /// 在这台 VM 上约 0.5 µs，而它本来发生在每请求的 spawn 路径上。
+    fn push_quiet(&self, t: TaskPtr) {
+        self.queue.lock().unwrap().push_back(t);
     }
 
     fn pop(&self) -> Option<TaskPtr> {
@@ -217,7 +225,7 @@ pub fn spawn(f: impl FnOnce() + 'static) -> bool {
         return false;
     };
     let t = Task::new(f, id);
-    shared.push(TaskPtr(t));
+    shared.push_quiet(TaskPtr(t));
     true
 }
 
@@ -341,7 +349,7 @@ pub fn expire_waits(now_ns: u64) -> usize {
     let n = due.len();
     for t in due {
         unsafe { t.get().state.set(TaskState::Runnable) };
-        shared.push(t);
+        shared.push_quiet(t);
     }
     n
 }

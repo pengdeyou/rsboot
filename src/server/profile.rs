@@ -207,6 +207,15 @@ static PREP_NS: [AtomicU64; PREP_STAGES] = [
 static SERVED: AtomicU64 = AtomicU64::new(0);
 static PREP_CNT: AtomicU64 = AtomicU64::new(0);
 
+/// 每轮 `pump` 跑了多少步，用来把 pump 段摊到每步上。
+static PUMP_STEPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_pump_steps(n: usize) {
+    if on() {
+        PUMP_STEPS.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
 /// 记一段：`from..to` 属于第 `stage` 段。最后一段调用时打一行。
 #[inline]
 pub fn note_prep(stage: usize, from: u64, to: u64) {
@@ -227,9 +236,18 @@ pub fn note_prep(stage: usize, from: u64, to: u64) {
             let wait = POLL_NS.load(Ordering::Relaxed) as f64 / POLL_CNT.load(Ordering::Relaxed).max(1) as f64;
             let round = ROUND_NS.load(Ordering::Relaxed) as f64 / POLL_CNT.load(Ordering::Relaxed).max(1) as f64;
             let served = SERVED.load(Ordering::Relaxed) as f64 / n as f64;
+            let steps = PUMP_STEPS.load(Ordering::Relaxed) as f64 / SERVED.load(Ordering::Relaxed).max(1) as f64;
+            // pump 段每步的净开销：pump 段里还含着被它 resume 的协程服务时间，
+            // 把那部分（七段合计）减掉才是调度本身的成本。
+            let pstep = if steps > 0.0 {
+                let pump_ns = PREP_NS[0].load(Ordering::Relaxed) as f64 / SERVED.load(Ordering::Relaxed).max(1) as f64 / steps - 2600.0;
+                pump_ns.max(0.0)
+            } else {
+                0.0
+            };
             eprintln!(
-                "[prep] {n} 轮 | {s}| wait {wait:.0}  = 已计 {:.0}  / 本轮 {round:.0}  | 差 {:.0}  | 每轮 {served:.1} 条",
-                sum, round - sum - wait
+                "[prep] {n} 轮 | {s}| wait {wait:.0}  = 已计 {:.0}  / 本轮 {round:.0}  | 差 {:.0}  | 每轮 {served:.1} 条 | 步/请求 {steps:.2}  pump步 {:.0}ns",
+                sum, round - sum - wait, pstep
             );
         }
     }
