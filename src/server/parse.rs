@@ -24,10 +24,13 @@ use crate::web::http::{Headers, Method, Status};
 use std::sync::Arc;
 
 /// 请求行里的目标：`/path?query`。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Target {
-    pub path: String,
-    pub query: String,
+///
+/// 两个字段都是**原始请求头缓冲里的区间**，解析不做任何分配；`Request`
+/// 也直接借用它们，所以一次请求从头到尾只有 body 会分配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target<'a> {
+    pub path: &'a str,
+    pub query: &'a str,
 }
 
 /// 请求体的长度声明。
@@ -39,11 +42,11 @@ pub enum BodyLen {
 }
 
 #[derive(Debug)]
-pub struct ParsedRequest {
+pub struct ParsedRequest<'a> {
     pub method: Method,
-    pub target: Target,
+    pub target: Target<'a>,
     pub version: u8,
-    pub headers: Headers,
+    pub headers: Headers<'a>,
     pub body_len: BodyLen,
     /// `Connection: close` 或 HTTP/1.0 未要求 keep-alive
     pub close: bool,
@@ -75,7 +78,7 @@ const MAX_HEADER_LINE: usize = 4 * 1024;
 /// 从连接读到的原始首部（不含 body）解析成请求。
 ///
 /// `head` 是"请求行 + 头 + 空行"这一段原始字节，`max_body` 是配置的 body 上限。
-pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseError> {
+pub fn parse_head<'a>(head: &'a str, max_body: usize) -> Result<ParsedRequest<'a>, ParseError> {
     let bytes = head.as_bytes();
     // 请求行到第一个 `\r\n` 为止（整块 head 本身就是"到空行"那一段）。
     // 手扫而不是 `find("\r\n")`：后者要跑两字节搜索的通用算法，而这里
@@ -176,19 +179,14 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
         return Err(ParseError::new(Status::BAD_REQUEST, "请求目标里不能有 `#`"));
     }
     let (path, query) = if qmark == usize::MAX {
-        (target_raw.to_string(), String::new())
+        (target_raw, "")
     } else {
-        (
-            target_raw[..qmark].to_string(),
-            target_raw[qmark + 1..].to_string(),
-        )
+        (&target_raw[..qmark], &target_raw[qmark + 1..])
     };
 
-    // 整块 head 只复制这一次，后面每个头都只是它上面的一个区间
-    let raw: Arc<str> = Arc::from(head);
-    // 直接往 `Headers` 里塞区间：不再"先攒 Vec<(Range,R)Range> 再 collect
-    // 成 Vec<Hdr>"——那是每请求两笔堆分配 + 一次结构转换。
-    let mut headers = Headers::sliced(raw, 12);
+    // 整块 head **不再复制**：`Headers` 直接借这份原文，每个头只是它上面的
+    // 一个区间。原文的生命周期由连接体的 head 缓冲保证。
+    let mut headers = Headers::sliced(head, 12);
     let mut total: usize = 0;
     let mut host_seen = false;
     let mut content_length: Option<usize> = None;
@@ -417,7 +415,7 @@ fn truncate(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn ok(head: &str) -> ParsedRequest {
+    fn ok(head: &str) -> ParsedRequest<'_> {
         parse_head(head, 1024 * 1024).expect("应当解析成功")
     }
 

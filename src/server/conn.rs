@@ -456,7 +456,7 @@ impl Conn {
                 write::write_response_fd(
                     self.reader.get_ref().get_ref().as_raw_fd(),
                     &resp,
-                    parsed.close,
+                    keep_close,
                     head_only,
                     &mut self.out_buf,
                     trace,
@@ -467,9 +467,9 @@ impl Conn {
             // 客户端按 content-length 继续往下读，整条连接的数据就错位了。
             self.out_buf.clear();
             #[cfg(not(unix))]
-            write::write_response(self.reader.get_mut(), &resp, parsed.close, head_only, trace)?;
+            write::write_response(self.reader.get_mut(), &resp, keep_close, head_only, trace)?;
         } else {
-            write::write_response(&mut self.out_buf, &resp, parsed.close, head_only, trace)?;
+            write::write_response(&mut self.out_buf, &resp, keep_close, head_only, trace)?;
         }
         drop(_t);
         profile::finish_request();

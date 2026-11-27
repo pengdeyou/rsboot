@@ -60,14 +60,14 @@ impl std::fmt::Debug for Extensions {
 }
 
 #[derive(Debug)]
-pub struct Request {
+pub struct Request<'a> {
     pub method: Method,
     /// 原始路径（未百分号解码）。解码在模板匹配时逐段做，这样 `%2F` 不会
     /// 被当成段分隔符——否则 `/a%2Fb` 能被绕过成两段路径。
-    pub path: String,
+    pub path: &'a str,
     /// 原始查询串（不含 `?`）
-    pub query: String,
-    pub headers: Headers,
+    pub query: &'a str,
+    pub headers: Headers<'a>,
     pub body: Vec<u8>,
     /// 模板匹配后填入（已解码）
     pub params: Vec<(String, String)>,
@@ -77,12 +77,14 @@ pub struct Request {
     pub peer: Option<String>,
 }
 
-impl Request {
-    pub fn new(method: Method, path: impl Into<String>) -> Self {
+impl<'a> Request<'a> {
+    /// `path` / `query` 都是**借用**：它们指向连接体的 head 缓冲，
+    /// 不复制也不分配。所以 `Request` 的生命周期由那份缓冲决定。
+    pub fn new(method: Method, path: &'a str) -> Self {
         Self {
             method,
-            path: path.into(),
-            query: String::new(),
+            path,
+            query: "",
             headers: Headers::new(),
             body: Vec::new(),
             params: Vec::new(),
@@ -91,8 +93,8 @@ impl Request {
         }
     }
 
-    pub fn with_query(mut self, q: impl Into<String>) -> Self {
-        self.query = q.into();
+    pub fn with_query(mut self, q: &'a str) -> Self {
+        self.query = q;
         self
     }
 

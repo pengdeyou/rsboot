@@ -15,7 +15,7 @@ use crate::web::http::Status;
 #[derive(Debug, Clone)]
 pub struct Response {
     pub status: Status,
-    pub headers: Headers,
+    pub headers: Headers<'static>,
     pub body: Vec<u8>,
     /// 这条响应"本来是哪个错误"。
     ///

@@ -13,14 +13,19 @@
 //!
 //! 手工 `insert`（构造响应头）仍走 `String`：那条路径本来就要拥有数据。
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
 /// 有序头部列表。头部数量很少（一般 < 20），线性查找比哈希更快也更省内存。
-#[derive(Debug, Clone, Default)]
-pub struct Headers {
+///
+/// 生命周期参数只跟"请求头原文"有关：解析出来的头部借连接体内的缓冲，
+/// 不复制也不分配。响应头没有原文，用默认的 `'static`——所以老的
+/// `Headers` / `Response { headers }` 写法一行都不用改。
+#[derive(Debug, Clone)]
+pub struct Headers<'a> {
     /// 解析来源：整块"请求头原文"。`Sliced` 项都指向它。
-    raw: Option<Arc<str>>,
+    raw: Option<Cow<'a, str>>,
     items: Vec<Hdr>,
 }
 
@@ -78,19 +83,30 @@ fn slice<'a>(raw: Option<&'a str>, r: &Range<u32>) -> &'a str {
         .unwrap_or("")
 }
 
-impl Headers {
+impl Headers<'static> {
     /// 空头部表，**预分配 4 格**：响应头（content-type / content-length /
     /// x-request-id …）几乎总有 2–4 条，`Vec` 从 0 长到 4 意味着 2–3 次
     /// `realloc`，而这是每请求都会走的路。
+    ///
+    /// 定义在 `'static` 上：响应头永远没有"原文"，所以 `Headers::new()`
+    /// 的类型不需要调用方标注。
     pub fn new() -> Self {
         Self {
             raw: None,
             items: Vec::with_capacity(4),
         }
     }
+}
 
+impl Default for Headers<'static> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> Headers<'a> {
     /// 解析结果构造：整块原文 + 每头的 (名区间, 值区间)。
-    pub(crate) fn from_parsed(raw: Arc<str>, items: Vec<(Range<u32>, Range<u32>)>) -> Self {
+    pub(crate) fn from_parsed(raw: &'a str, items: Vec<(Range<u32>, Range<u32>)>) -> Self {
         let mut h = Self::sliced(raw, items.len());
         for (n, v) in items {
             h.push_sliced(n, v);
@@ -102,9 +118,9 @@ impl Headers {
     ///
     /// 这样一次 `Vec` 分配就装完，不再"先攒 `Vec<(Range, Range)>`、再
     /// `collect` 成一个 `Vec<Hdr>`"——那是每请求两笔堆分配换一次结构转换。
-    pub(crate) fn sliced(raw: Arc<str>, capacity: usize) -> Self {
+    pub(crate) fn sliced(raw: &'a str, capacity: usize) -> Self {
         Self {
-            raw: Some(raw),
+            raw: Some(Cow::Borrowed(raw)),
             // 多留一格：服务端会在请求头里补一条 `x-request-id`，
             // 按原样精确分配的话，那一次插入就要整体搬迁一次
             items: Vec::with_capacity(capacity + 1),
@@ -308,9 +324,9 @@ mod tests {
 
     #[test]
     fn sliced_view_reads_without_allocating() {
-        let raw: Arc<str> = Arc::from("Host: a\r\nContent-Length: 7\r\n\r\n");
+        let raw = "Host: a\r\nContent-Length: 7\r\n\r\n";
         let items = vec![(0..4, 6..7), (9..23, 25..26)];
-        let h = Headers::from_parsed(Arc::clone(&raw), items);
+        let h = Headers::from_parsed(raw, items);
         assert_eq!(h.len(), 2);
         assert_eq!(h.get("host"), Some("a"));
         assert_eq!(h.get("CONTENT-LENGTH"), Some("7"));
@@ -319,7 +335,7 @@ mod tests {
 
     #[test]
     fn insert_overwrites_a_sliced_header() {
-        let raw: Arc<str> = Arc::from("X-Trace: old\r\n\r\n");
+        let raw = "X-Trace: old\r\n\r\n";
         let mut h = Headers::from_parsed(raw, vec![(0..7, 9..12)]);
         assert!(h.insert("x-trace", "new"));
         assert_eq!(h.len(), 1, "同名覆盖，不该多出一条");

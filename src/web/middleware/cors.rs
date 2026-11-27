@@ -290,7 +290,7 @@ mod tests {
         c
     }
 
-    fn req(method: Method, headers: &[(&str, &str)]) -> Request {
+    fn req(method: Method, headers: &[(&str, &str)]) -> Request<'static> {
         let mut r = Request::new(method, "/x");
         for (k, v) in headers {
             r.headers.insert(k, v);

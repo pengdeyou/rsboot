@@ -142,7 +142,7 @@ mod tests {
     use super::*;
     use crate::web::http::{Method, Status};
 
-    fn req_with_params(pairs: &[(&str, &str)]) -> Request {
+    fn req_with_params(pairs: &[(&str, &str)]) -> Request<'static> {
         let mut r = Request::new(Method::Get, "/x");
         r.params = pairs
             .iter()
