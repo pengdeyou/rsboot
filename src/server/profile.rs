@@ -10,8 +10,12 @@
 //! ./load 127.0.0.1:9001 /json 20 3
 //! ```
 
+// `thread_local!` 的块在 feature 关闭时依然要能编译，所以这几个 import 不按 feature 裁
+#[allow(unused_imports)]
 use std::cell::Cell;
+#[allow(unused_imports)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[allow(unused_imports)]
 use std::sync::OnceLock;
 
 pub const READ: usize = 0;
@@ -31,6 +35,7 @@ fn tsc() -> u64 {
 }
 
 #[inline]
+#[cfg(feature = "prof")]
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RSBOOT_PROFILE").is_some())
@@ -46,6 +51,7 @@ thread_local! {
 }
 
 /// 每个请求开头调用：按 1/64 采样决定这一条要不要计时。
+#[cfg(feature = "prof")]
 pub fn pick() {
     if !on() {
         return;
@@ -62,6 +68,7 @@ pub fn pick() {
 pub struct Span(u64, usize);
 
 #[inline]
+#[cfg(feature = "prof")]
 pub fn start(stage: usize) -> Option<Span> {
     if on() && SAMPLE.with(|c| c.get()) {
         Some(Span(tsc(), stage))
@@ -95,6 +102,7 @@ thread_local! {
 }
 
 #[inline]
+#[cfg(feature = "prof")]
 pub fn note_write(eagain: bool) {
     if !on() || !SAMPLE.with(|c| c.get()) {
         return;
@@ -106,6 +114,7 @@ pub fn note_write(eagain: bool) {
 }
 
 /// 每 5000 个请求打一行，然后清零重新累计。
+#[cfg(feature = "prof")]
 pub fn finish_request() {
     if !on() || !SAMPLE.with(|c| c.get()) {
         return;
@@ -150,6 +159,7 @@ static POLL_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// `round_t0` 是本轮进 worker 循环的时刻，`poll_t0` 是进 `poll` 的时刻。
 /// `poll_t0..now` 是真正阻塞的时间，`round_t0..now` 是本轮总耗时。
+#[cfg(feature = "prof")]
 pub fn note_poll(round_t0: u64, poll_t0: u64) {
     if !on() {
         return;
@@ -210,6 +220,7 @@ static PREP_CNT: AtomicU64 = AtomicU64::new(0);
 /// 每轮 `pump` 跑了多少步，用来把 pump 段摊到每步上。
 static PUMP_STEPS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "prof")]
 pub fn note_pump_steps(n: usize) {
     if on() {
         PUMP_STEPS.fetch_add(n as u64, Ordering::Relaxed);
@@ -218,6 +229,7 @@ pub fn note_pump_steps(n: usize) {
 
 /// 记一段：`from..to` 属于第 `stage` 段。最后一段调用时打一行。
 #[inline]
+#[cfg(feature = "prof")]
 pub fn note_prep(stage: usize, from: u64, to: u64) {
     if !on() {
         return;
@@ -255,8 +267,46 @@ pub fn note_prep(stage: usize, from: u64, to: u64) {
 
 /// 本轮 `service_ready` 服务了几条连接。
 #[inline]
+#[cfg(feature = "prof")]
 pub fn note_served(n: usize) {
     if on() {
         SERVED.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
+
+/// 未启用 `prof` feature 时的一组空实现。
+///
+/// 探针按请求要过七八次 `on()`（每次是一个 `OnceLock` 原子读 + 分支），
+/// 加起来约 10–15 ns；而它只在排查时有意义。让它在编译期整个消失，
+/// 默认构建的热路径上一个字节都不留——要计时就
+/// `cargo build --features rsboot/prof`。
+#[cfg(not(feature = "prof"))]
+mod off {
+    use super::Span;
+
+    #[inline(always)]
+    pub fn on() -> bool {
+        false
+    }
+    #[inline(always)]
+    pub fn pick() {}
+    #[inline(always)]
+    pub fn start(_stage: usize) -> Option<Span> {
+        None
+    }
+    #[inline(always)]
+    pub fn note_write(_eagain: bool) {}
+    #[inline(always)]
+    pub fn finish_request() {}
+    #[inline(always)]
+    pub fn note_poll(_round_t0: u64, _poll_t0: u64) {}
+    #[inline(always)]
+    pub fn note_pump_steps(_n: usize) {}
+    #[inline(always)]
+    pub fn note_prep(_stage: usize, _from: u64, _to: u64) {}
+    #[inline(always)]
+    pub fn note_served(_n: usize) {}
+}
+
+#[cfg(not(feature = "prof"))]
+pub use off::*;

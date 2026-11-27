@@ -16,6 +16,10 @@ default = []
 # 线程缓存的 size-class 分配器。打开后 `#[global_allocator]` 会被换成自研实现，
 # 影响整个链接进来的程序（包括下游自己的分配），所以不默认开。
 tc-alloc = []
+# 分阶段计时探针。默认关：探针本身每请求十几次原子读，并且会把 rdtsc / Instant
+# 调用留在热路径上（实测开着的构建比关掉的慢 1.6%，20 轮 15:5）。
+# 要排查时用 `cargo build --features prof`，并且仍然要 RSBOOT_PROFILE=1 才真的计时。
+prof = []
 
 [dependencies]
 rsbatis = { version = "0.1.0-alpha.29", path = "../rsbatis/crates/rsbatis", features = ["sqlite", "mysql", "migrate"] }
