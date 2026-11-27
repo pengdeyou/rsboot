@@ -425,7 +425,7 @@ impl Router {
 
         if let Some(fb) = &self.fallback {
             let trace = req.request_id().map(|s| s.to_string());
-            return exception::with_trace(trace.as_deref(), || {
+            return exception::with_trace_owned(trace, || {
                 match exception::guard(|| (fb)(req, ctx)) {
                     Ok(resp) => resp,
                     Err(payload) => exception::panic_response(payload),
@@ -481,7 +481,7 @@ impl Router {
             // 一个 handler panic 不能让 worker 线程退出。捕获后请求对象直接丢弃：
             // panic 之后它的内部状态不可信，继续用等于在赌。
             let trace = req.request_id().map(|s| s.to_string());
-            let outcome = exception::with_trace(trace.as_deref(), || {
+            let outcome = exception::with_trace_owned(trace, || {
                 exception::guard(|| (r.handler)(req, ctx))
             });
             let resp = match outcome {

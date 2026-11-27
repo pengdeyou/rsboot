@@ -121,9 +121,17 @@ thread_local! {
 
 /// 在 trace 上下文里执行。退出时恢复原值（支持嵌套调用）。
 pub fn with_trace<R>(trace: Option<&str>, f: impl FnOnce() -> R) -> R {
-    let saved = CURRENT_TRACE.with(|c| {
-        std::mem::replace(&mut *c.borrow_mut(), trace.map(|s| s.to_string()))
-    });
+    with_trace_owned(trace.map(|s| s.to_string()), f)
+}
+
+/// 同上，但调用方已经拿着一份 `String`。
+///
+/// 路由分发处就是这样：`x-request-id` 是从 `req` 里借出来的 `&str`，
+/// 而闭包里还要把 `&mut req` 递给 handler，两个借用撞在一起，所以调用方
+/// 必须先拷成 `String` 脱离借用。那么在这里再 `to_string()` 一次就是纯浪费
+/// ——一个请求两次分配、两次拷贝，只为了把同一段字节挪两个地方。
+pub fn with_trace_owned<R>(trace: Option<String>, f: impl FnOnce() -> R) -> R {
+    let saved = CURRENT_TRACE.with(|c| std::mem::replace(&mut *c.borrow_mut(), trace));
     // 用 guard 保证 panic 时也能恢复，否则 trace 会串到下一个请求
     struct Restore(Option<String>);
     impl Drop for Restore {
