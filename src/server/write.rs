@@ -52,12 +52,33 @@ fn body_forbidden(resp: &Response) -> bool {
 ///
 /// 抽出来是为了让"泛型写出"和"fd 直写（大 body 走 `writev`）"两条路径
 /// 拼出**完全相同**的头字节——两份实现迟早跑偏。
+/// 十进制写进缓冲。
+///
+/// `write!(buf, "{}", n)` 走的是 `io::Write::write_fmt` 那套格式化机械：
+/// 每写一个数字要建一次 `Argument`、过一次 `Display` 的 dyn 调用。状态码和
+/// content-length 是**每个响应**都要写两个数字，换成手写的取模拆分就够。
+#[inline]
+fn push_dec(buf: &mut Vec<u8>, mut v: u64) {
+    if v == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    while v > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
 fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool, trace: Option<&[u8]>) {
     let status = resp.status;
 
     // 状态行
     buf.extend_from_slice(b"HTTP/1.1 ");
-    let _ = write!(buf, "{}", status.0);
+    push_dec(buf, status.0 as u64);
     buf.push(b' ');
     buf.extend_from_slice(status.reason().as_bytes());
     buf.extend_from_slice(b"\r\n");
@@ -71,7 +92,7 @@ fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool, trace: Option<&[u8
     buf.extend_from_slice(b"\r\n");
     if !body_forbidden(resp) {
         buf.extend_from_slice(b"content-length: ");
-        let _ = write!(buf, "{}", resp.body.len());
+        push_dec(buf, resp.body.len() as u64);
         buf.extend_from_slice(b"\r\n");
     }
     if close {
