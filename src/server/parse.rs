@@ -20,6 +20,7 @@
 //! 断开（而不是保持连接）是刻意的：一旦解析出现歧义，这条连接上后续字节的
 //! 归属就不可信了，继续复用等于把风险传给下一个请求。
 
+use crate::web::http::headers::HeaderSpare;
 use crate::web::http::{Headers, Method, Status};
 use std::sync::Arc;
 
@@ -79,6 +80,18 @@ const MAX_HEADER_LINE: usize = 4 * 1024;
 ///
 /// `head` 是"请求行 + 头 + 空行"这一段原始字节，`max_body` 是配置的 body 上限。
 pub fn parse_head<'a>(head: &'a str, max_body: usize) -> Result<ParsedRequest<'a>, ParseError> {
+    parse_head_with(head, max_body, HeaderSpare::new())
+}
+
+/// 同 `parse_head`，但用调用方给的槽位。
+///
+/// keep-alive 连接上，这条路径能让"每个请求一次 `Vec::with_capacity`"变成
+/// 零分配——连接里存着上一轮那批槽位，这里 `clear` 一下就接着用。
+pub fn parse_head_with<'a>(
+    head: &'a str,
+    max_body: usize,
+    spare: HeaderSpare,
+) -> Result<ParsedRequest<'a>, ParseError> {
     let bytes = head.as_bytes();
     // 请求行到第一个 `\r\n` 为止（整块 head 本身就是"到空行"那一段）。
     // 手扫而不是 `find("\r\n")`：后者要跑两字节搜索的通用算法，而这里
@@ -186,7 +199,7 @@ pub fn parse_head<'a>(head: &'a str, max_body: usize) -> Result<ParsedRequest<'a
 
     // 整块 head **不再复制**：`Headers` 直接借这份原文，每个头只是它上面的
     // 一个区间。原文的生命周期由连接体的 head 缓冲保证。
-    let mut headers = Headers::sliced(head, 12);
+    let mut headers = Headers::sliced_with(head, spare);
     let mut total: usize = 0;
     let mut host_seen = false;
     let mut content_length: Option<usize> = None;

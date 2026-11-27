@@ -29,6 +29,7 @@ use crate::server::parse::{self, BodyLen, ParseError, MAX_HEADER_BYTES, MAX_REQU
 use crate::server::write;
 use super::{coio, profile};
 use crate::web::error::ApiError;
+use crate::web::http::headers::HeaderSpare;
 use crate::web::http::{Method, Status};
 use crate::web::request::Request;
 use crate::web::route::Router;
@@ -154,6 +155,9 @@ pub struct Conn {
     /// 连接自增 id。生成的 trace id 用它做第二段，于是不必再每请求抢
     /// 一个全局计数器（3 个 worker 抢同一条 cache line，那是跨核流量）。
     id: u64,
+    /// 请求头槽位的复用池。每请求一次 `Vec::with_capacity(13)` 是固定税，
+    /// 而相邻请求的头部形状几乎一样，还回来就能省掉这次 malloc。
+    hdr_spare: HeaderSpare,
 }
 
 /// 处理完一个请求之后的去向。
@@ -232,6 +236,7 @@ impl Conn {
             out_buf: Vec::with_capacity(OUT_BUF_BYTES),
             served: 0,
             id: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
+            hdr_spare: HeaderSpare::new(),
         })
     }
 
@@ -363,7 +368,8 @@ impl Conn {
 
         drop(_t);
         let _t = profile::start(profile::PARSE);
-        let parsed = match parse::parse_head(&self.head_buf, limits.max_body) {
+        let spare = std::mem::take(&mut self.hdr_spare);
+        let parsed = match parse::parse_head_with(&self.head_buf, limits.max_body, spare) {
             Ok(p) => p,
             Err(ParseError { status, message }) => {
                 // 解析层拒绝一律断开：边界已不可信
@@ -440,6 +446,8 @@ impl Conn {
         drop(_t);
         let _t = profile::start(profile::HANDLE);
         let mut resp = router.handle(&mut req, ctx);
+        // handler 已经返回，请求头不再有人读：把这批槽位还回连接。
+        self.hdr_spare = req.headers.take_spare();
         // 响应头不插了：`fill_head` 直接把它拼到 head 末尾（见 `write.rs`）。
         // 请求头那一份仍然插着，因为 handler 可能用 `req.request_id()` 记日志。
 

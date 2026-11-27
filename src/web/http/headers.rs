@@ -17,6 +17,34 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// 典型请求有多少个头（含服务端补的那条 `x-request-id`）。
+const TYPICAL_HDRS: usize = 13;
+
+/// 可复用的头部槽位。
+///
+/// `Headers` 每次解析都要一个 `Vec::with_capacity(13)`，这是每请求一次的固定税。
+/// 而 keep-alive 连接上，相邻请求的头部形状几乎一样——把这批槽位在连接里
+/// 存一份，下一个请求直接拿来用，这次 malloc 就没了。`clear` 掉旧项是必须的：
+/// 它们的区间指向上一轮的头原文，而那份原文下一轮就被覆写了。
+pub(crate) struct HeaderSpare {
+    items: Vec<Hdr>,
+}
+
+impl HeaderSpare {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            items: Vec::with_capacity(TYPICAL_HDRS),
+        }
+    }
+}
+
+impl Default for HeaderSpare {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 有序头部列表。头部数量很少（一般 < 20），线性查找比哈希更快也更省内存。
 ///
 /// 生命周期参数只跟"请求头原文"有关：解析出来的头部借连接体内的缓冲，
@@ -119,11 +147,34 @@ impl<'a> Headers<'a> {
     /// 这样一次 `Vec` 分配就装完，不再"先攒 `Vec<(Range, Range)>`、再
     /// `collect` 成一个 `Vec<Hdr>`"——那是每请求两笔堆分配换一次结构转换。
     pub(crate) fn sliced(raw: &'a str, capacity: usize) -> Self {
+        Self::sliced_with(
+            raw,
+            HeaderSpare {
+                // 多留一格：服务端会在请求头里补一条 `x-request-id`，
+                // 按原样精确分配的话，那一次插入就要整体搬迁一次
+                items: Vec::with_capacity(capacity + 1),
+            },
+        )
+    }
+
+    /// 用连接里存下的槽位构造：容量够就**一次分配都不做**。
+    pub(crate) fn sliced_with(raw: &'a str, mut spare: HeaderSpare) -> Self {
+        // 上一轮的项指向的是旧的头原文，不能留
+        spare.items.clear();
+        if spare.items.capacity() < TYPICAL_HDRS {
+            spare.items.reserve(TYPICAL_HDRS);
+        }
         Self {
             raw: Some(Cow::Borrowed(raw)),
-            // 多留一格：服务端会在请求头里补一条 `x-request-id`，
-            // 按原样精确分配的话，那一次插入就要整体搬迁一次
-            items: Vec::with_capacity(capacity + 1),
+            items: spare.items,
+        }
+    }
+
+    /// 把这批槽位还回连接，供下一个请求复用。
+    #[inline]
+    pub(crate) fn take_spare(&mut self) -> HeaderSpare {
+        HeaderSpare {
+            items: std::mem::take(&mut self.items),
         }
     }
 
