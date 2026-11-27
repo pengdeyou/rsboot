@@ -22,6 +22,7 @@
 
 use crate::web::http::headers::HeaderSpare;
 use crate::web::http::{Headers, Method, Status};
+use std::sync::Arc;
 
 /// 请求行里的目标：`/path?query`。
 ///
@@ -211,15 +212,35 @@ pub fn parse_head_with<'a>(
         // 搜索，12 行就是 200 ns，而这里整块只扫一遍。
         let line_start = i;
         let mut j = i;
-        // 冒号在这里一起找：一行只扫一遍，不再 `line.find(':')` 再来一趟。
+        // 一趟做三件事：找冒号、找行尾、顺便校验名字。
+        // 原来是三趟——找冒号/行尾一趟、`trim_ows(name)` 一趟、`is_token_bytes`
+        // 再一趟，同一个头扫三遍。名字字段边扫边查 token 表，只允许"尾部 OWS"：
+        // 出现 OWS 之后又冒出非 OWS 就是名字中间有空白，判非法。
         let mut colon = usize::MAX;
+        let mut name_end = usize::MAX;
+        let mut bad_name = false;
+        let mut seen_ows = false;
         while j < bytes.len() {
             let b = bytes[j];
             if b == b'\r' || b == b'\n' {
                 break;
             }
-            if b == b':' && colon == usize::MAX {
-                colon = j;
+            if b == b':' {
+                if colon == usize::MAX {
+                    colon = j;
+                }
+            } else if colon == usize::MAX {
+                if b == b' ' || b == b'\t' {
+                    seen_ows = true;
+                } else {
+                    if seen_ows {
+                        bad_name = true;
+                    }
+                    if !TOKEN_TABLE[b as usize] {
+                        bad_name = true;
+                    }
+                    name_end = j + 1;
+                }
             }
             j += 1;
         }
@@ -263,28 +284,36 @@ pub fn parse_head_with<'a>(
                 format!("头部缺少冒号：`{}`", truncate(line)),
             ));
         }
-        // RFC 7230 的 OWS 只有 SP / HTAB。`str::trim` 走 Unicode 空白表：
-        // 既慢，又把 `\u{A0}` 之类当可 trim 的空白——口径比规范宽。
-        // 一次扫描拿两侧边界，下面同时用来切字符串和算区间偏移。
-        let name_raw = &head[line_start..colon];
-        let value_raw = &head[colon + 1..j];
-        let (ns, ne) = trim_ows(name_raw);
-        let (vs, ve) = trim_ows(value_raw);
-        let name = &name_raw[ns..ne];
-        let value = &value_raw[vs..ve];
-        if !is_token_bytes(name.as_bytes()) {
+        if bad_name || name_end == usize::MAX {
+            let bad = if name_end == usize::MAX {
+                &head[line_start..colon]
+            } else {
+                &head[line_start..name_end]
+            };
             return Err(ParseError::new(
                 Status::BAD_REQUEST,
-                format!("头部名非法：`{}`", truncate(name)),
+                format!("头部名非法：`{}`", truncate(bad)),
             ));
         }
+        // 值的 OWS 只有 SP / HTAB（RFC 7230），`str::trim` 会按 Unicode 空白表
+        // 把 `\u{A0}` 也算进去，口径比规范宽。
+        let name = &head[line_start..name_end];
+        let mut vs = colon + 1;
+        while vs < j && (bytes[vs] == b' ' || bytes[vs] == b'\t') {
+            vs += 1;
+        }
+        let mut ve = j;
+        while ve > vs && (bytes[ve - 1] == b' ' || bytes[ve - 1] == b'\t') {
+            ve -= 1;
+        }
+        let value = &head[vs..ve];
 
-        // 记下区间而不是复制字符串：一个请求省掉 16~24 次分配
-        let name_off = line_start + ns;
-        let value_off = colon + 1 + vs;
+        // 记下区间而不是复制字符串：一个请求省掉 16~24 次分配。
+        // 名字从行首开始（前导 OWS 上面已经拒掉了），不用再加偏移。
+        let name_off = line_start;
         headers.push_sliced(
-            name_off as u32..(name_off + name.len()) as u32,
-            value_off as u32..(value_off + value.len()) as u32,
+            name_off as u32..name_end as u32,
+            vs as u32..ve as u32,
         );
 
         // 每头只看一次长度再比字节：原来三条 `eq_ignore_ascii_case` 串行，
@@ -396,20 +425,6 @@ fn eq_ci(s: &str, lower: &[u8]) -> bool {
     s.as_bytes().eq_ignore_ascii_case(lower)
 }
 
-/// 头部值两侧的 OWS（SP / HTAB）边界。返回字节下标区间 `[start, end)`。
-#[inline(always)]
-fn trim_ows(s: &str) -> (usize, usize) {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    let mut j = b.len();
-    while j > i && (b[j - 1] == b' ' || b[j - 1] == b'\t') {
-        j -= 1;
-    }
-    (i, j)
-}
 
 fn truncate(s: &str) -> String {
     // 回显给客户端的错误信息里只放前 32 字节：既是诊断，又不把恶意长串铺开
@@ -421,6 +436,43 @@ fn truncate(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+/// 名字里的 OWS：尾部允许（等价于老的 trim），中间不允许，空名不允许。
+///
+/// 这三条是"把 trim + token 校验并进主扫描"之后最容易走偏的地方，
+/// 单独钉死比只靠整包解析测试可靠。
+mod name_ows_tests {
+    use super::*;
+
+    fn head() -> String {
+        "GET /x HTTP/1.1\r\n".to_string()
+    }
+
+    #[test]
+    fn trailing_ows_in_name_is_trimmed_not_rejected() {
+        let mut h = head();
+        h.push_str("host \t : example\r\n\r\n");
+        let parsed = parse_head(&h, 0).expect("尾部 OWS 应该被裁掉");
+        assert_eq!(parsed.headers.get("host"), Some("example"));
+    }
+
+    #[test]
+    fn ows_inside_name_is_rejected() {
+        let mut h = head();
+        h.push_str("ho st: example\r\n\r\n");
+        let err = parse_head(&h, 0).unwrap_err();
+        assert_eq!(err.status, Status::BAD_REQUEST);
+    }
+
+    #[test]
+    fn empty_name_is_rejected() {
+        let mut h = head();
+        h.push_str(": example\r\n\r\n");
+        let err = parse_head(&h, 0).unwrap_err();
+        assert_eq!(err.status, Status::BAD_REQUEST);
+    }
+}
+
 mod tests {
     use super::*;
 
