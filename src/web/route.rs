@@ -390,13 +390,14 @@ impl Router {
         // 路径切段一次，之后全是沿树走。切段要借 `req.path`，而命中后要写
         // `req.params`——先把路径拷成局部 `String`，让两段借用各自独立。
         // 这条拷贝换掉的是"每请求扫 N 条候选"，值。
-        let path = req.path.clone();
-        let trimmed = path.strip_prefix('/').unwrap_or(&path);
+        // `req.path` 是 `&'a str`：这里只复制引用（8+8 字节），不产生字符串拷贝
+        let path = req.path;
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
 
         let mut allowed: Vec<Method> = Vec::new();
         let mut hit: Option<Response> = None;
         Node::visit(&self.tree, trimmed, &mut |idxs| {
-            match self.attempt(idxs, req, req.method, ctx, &path, &mut allowed) {
+            match self.attempt(idxs, req, req.method, ctx, path, &mut allowed) {
                 Some(resp) => {
                     hit = Some(resp);
                     true

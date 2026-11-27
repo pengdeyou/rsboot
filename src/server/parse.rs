@@ -95,8 +95,23 @@ pub fn parse_head_with<'a>(
     // 请求行到第一个 `\r\n` 为止（整块 head 本身就是"到空行"那一段）。
     // 手扫而不是 `find("\r\n")`：后者要跑两字节搜索的通用算法，而这里
     // 一行的平均长度只有三十来字节，逐字节比调用搜索器便宜。
+    // 请求行扫一趟：结束位置和两个空格位置一起拿。原来是"先找 CRLF、再回头
+    // 找空格"两趟，40 字节的行等于把同一段读两遍。
     let mut rl_end = 0usize;
+    let (mut sp1, mut sp2) = (usize::MAX, usize::MAX);
     while rl_end + 1 < bytes.len() && !(bytes[rl_end] == b'\r' && bytes[rl_end + 1] == b'\n') {
+        if bytes[rl_end] == b' ' {
+            if sp1 == usize::MAX {
+                sp1 = rl_end;
+            } else if sp2 == usize::MAX {
+                sp2 = rl_end;
+            } else {
+                return Err(ParseError::new(
+                    Status::BAD_REQUEST,
+                    "请求行里有多余的空格。目标里不允许出现空格（应百分号编码）",
+                ));
+            }
+        }
         rl_end += 1;
     }
     if rl_end + 1 >= bytes.len() {
@@ -110,25 +125,7 @@ pub fn parse_head_with<'a>(
         return Err(ParseError::new(Status(414), "请求行过长"));
     }
 
-    // 两个空格就是三个字段的分界；第三个空格直接判错（目标里不许有空格）。
-    // 手扫一趟同时拿到两个位置，比 `split(' ')` 取四次 next 少一层迭代器。
-    let (mut sp1, mut sp2) = (usize::MAX, usize::MAX);
-    let mut k = 0usize;
-    while k < rl_end {
-        if bytes[k] == b' ' {
-            if sp1 == usize::MAX {
-                sp1 = k;
-            } else if sp2 == usize::MAX {
-                sp2 = k;
-            } else {
-                return Err(ParseError::new(
-                    Status::BAD_REQUEST,
-                    "请求行里有多余的空格。目标里不允许出现空格（应百分号编码）",
-                ));
-            }
-        }
-        k += 1;
-    }
+    // 两个空格就是三个字段的分界，上面那一趟已经顺手记下了位置。
     if sp1 == usize::MAX {
         return Err(ParseError::new(Status::BAD_REQUEST, "缺少请求目标"));
     }
