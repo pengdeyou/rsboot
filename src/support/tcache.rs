@@ -30,8 +30,14 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
 use std::ptr;
 
-/// 接管的 size class。粒度按实测的分配分布取，覆盖到 1 KiB。
-const SIZES: [usize; 9] = [16, 32, 64, 96, 128, 192, 256, 512, 1024];
+/// 接管的 size class，**全部是 2 的幂**。
+///
+/// 早先的档位是 `[16, 32, 64, 96, 128, 192, 256, 512, 1024]`，为了省内部碎片
+/// 塞了 96/192 这类中间档，代价是 `class_of` 得线性扫表——9 次比较加分支预测
+/// 失败，在每请求好几次的分配上是一笔真实开销。改成纯幂次之后，档位从
+/// `size` 本身用 `leading_zeros` 一条指令算出来，代价只是碎片翻倍（129 字节
+/// 会拿 256 的块）。对一个每请求几十字节的 HTTP 服务，这个交换是赚的。
+const SIZES: [usize; 7] = [16, 32, 64, 128, 256, 512, 1024];
 const CLASSES: usize = SIZES.len();
 /// 超过这个对齐一律交给系统分配器（自研路径只保证 16 字节对齐）。
 const MAX_ALIGN: usize = 16;
@@ -60,17 +66,19 @@ thread_local! {
 }
 
 /// 按大小找 class；超范围返回 `None`。
+///
+/// 一条 `leading_zeros`，没有任何表访问、也没有分支环：`size` 落在
+/// `(2^(k-1), 2^k]` 就归第 `k - 4` 档（16 是 2^4）。
 #[inline]
 fn class_of(size: usize) -> Option<usize> {
-    // 9 个分支，比二分或查表都便宜，而且全在一条 cache line 里
-    let mut i = 0;
-    while i < CLASSES {
-        if size <= SIZES[i] {
-            return Some(i);
-        }
-        i += 1;
+    if size > SIZES[CLASSES - 1] {
+        return None;
     }
-    None
+    // `size <= 16` 一律进最小的档：`(size - 1).leading_zeros()` 在 size = 0/1
+    // 时会算到 64 位宽再去减 4，直接下溢
+    let size = size.max(16);
+    let bits = usize::BITS - (size - 1).leading_zeros();
+    Some(bits as usize - 4)
 }
 
 /// 给某个 class 换一块新 slab。失败时保持原状（调用方会退回系统分配器）。
