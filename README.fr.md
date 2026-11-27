@@ -33,7 +33,18 @@ rsboot sépare le problème en deux couches : **la couche connexion est pilotée
 
 ## Comparaison de performance
 
-Mesuré face à axum et actix-web. Protocole : VM Linux 4 cœurs, **2 threads workers** pour les trois serveurs, routes identiques, les trois sollicités en alternance dans la même fenêtre de temps, valeurs en QPS.
+Mesuré face à axum et actix-web. Tous les serveurs tournent dans la même fenêtre de temps, en alternance, avec les mêmes routes ; valeurs en QPS. **Les chiffres de fenêtres différentes ne sont pas comparables** — le protocole a changé, les lignes plus anciennes ne restent que parce qu'elles sont la seule mesure de cette charge.
+
+### Comment les chiffres actuels sont produits
+
+- Machine Linux 4 cœurs, **4 threads workers sur tous les serveurs**, client sur **4 threads**, 1 000 connexions keep-alive, `pipeline 16`.
+- Chaque configuration tourne **10 manches × 8 s**, A/B en alternance manche par manche ; puis une seconde série avec l'ordre inversé. Les 20 manches sont regroupées : moyenne plus répartition victoires/défaites.
+- Le bruit entre les manches sur cette machine est de **±0,35 %**, avec des splits de 10:10 à 13:7. Tout ce qui est plus petit n'est pas un résultat, et les deux séries doivent aller dans le même sens.
+- Position actuelle face à actix-web 4 (même fenêtre, 4 workers des deux côtés) : rsboot **999 411** vs actix **1 033 174** — **−3,3 %**, 1:19.
+
+Le journal complet — chaque changement, son delta et tout ce qui a été mesuré puis abandonné — est dans [docs/perf-log.md](docs/perf-log.md).
+
+Les lignes `/slow` et `/json` ci-dessous viennent d'une **fenêtre antérieure** (VM 4 cœurs, 2 threads workers partout, manches plus courtes).
 
 | Scénario | rsboot | axum | actix-web |
 |---|---:|---:|---:|
@@ -51,6 +62,28 @@ Ce que dit le tableau, y compris ce qui ne nous flatte pas :
 - Appels en aval : 40 clients simultanés × 20 ms de dépendance, mode coopératif **655 QPS / p99 62 ms** contre base bloquante **33 QPS / p99 2 323 ms** — un facteur 20 obtenu par un seul commutateur (`RSBOOT_BLOCKING_IO`).
 
 Ces valeurs varient selon la machine. Comparez toujours dans une même exécution, jamais entre machines ni contre les chiffres absolus d'un article de blog.
+
+### Mesuré puis abandonné
+
+Consigné ici pour que personne ne relance la même expérience en espérant un gain. Protocole ci-dessus ; un delta négatif signifie **plus lent**.
+
+| Changement | Résultat | Pourquoi cela n'a rien rapporté |
+|---|---|---|
+| Champ de nom en une seule passe (deux-points + OWS final + vérification du token) | −0,06 %, 13:7 | Neutre. Le coût du parseur n'est pas « combien de fois on parcourt les octets » |
+| `Hdr` 64 → 32 octets (table d'offsets + table latérale) | −0,59 %, 9:11, séries contradictoires | une indirection de plus à chaque accès d'en-tête |
+| `get_unchecked` dans les boucles de parsing | **−1,69 %**, 14:6 | les vérifications de bornes étaient déjà gratuites ; `unsafe` bloquait d'autres optimisations |
+| Scan CRLF écrit à la main dans la tête de réponse | −1,36 %, 12:8 | `str::contains` passe par un memchr vectorisé |
+| `from_utf8_unchecked` sur la tranche d'en-têtes | −0,99 %, 12:8 | même raison — la vérification n'est pas là où part le temps |
+| Pool thread-local pour les `Vec` d'en-têtes de réponse | −0,35 %, 12:8 | et `Drop` sur `Headers` casse l'emprunt dans `serve_once` |
+| `-C target-cpu=x86-64-v3` / `native` | +0,9 %, mais AB −0,4 % / BA +2,3 % | séries en sens opposés = bruit |
+| 12 emplacements d'en-têtes en ligne pour économiser un `malloc` | −8,3 % | le memset de 12 × 64 octets coûte plus que l'allocation |
+| Regrouper toutes les réponses dans `out_buf` (suppression du chemin direct) | −4,3 % | un client qui pipeline garde des requêtes en vol, le serveur en voit rarement plus d'une |
+| `SO_REUSEPORT`, accept par worker | aucun changement | le thread d'accept se réveille une fois toutes les 5 ms en régime stable |
+| `SO_SNDBUF` / `SO_RCVBUF` plus petits | −0,04 % | dans le bruit |
+| Tampon de lecture de 4 KiB par défaut | +0,8 %, non significatif | 1 KiB contient déjà ~12 têtes de requête |
+| Allocateur tcache intégré (feature `tc-alloc`) | +0,36 % | plafond ~0,5 %, désactivé par défaut |
+
+Pour qui veut attaquer les 3 % restants : sur le profil, deux appels système font 70 % d'une requête (3,5–4 µs sur 5 µs), l'espace utilisateur ~1 µs (`parse` 275 ns, `build` 145, `handle` 555). L'écart est donc de ~150 ns et ne peut se trouver que dans ces trois étages — mais trois tentatives structurelles sur `parse` ont toutes atterri dans le bruit, ce qui dit que ces 275 ns sont du travail fixe par requête (construction des items, comptabilité du `Vec`, insertion des spans, validation finale), pas la largeur du scan. La prochaine étape honnête est d'instrumenter `handle` lui-même avec un échantillonnage 1/64 et de découper ses 555 ns en routage, contexte, handler utilisateur et construction de la réponse.
 
 ## Points forts de la conception
 

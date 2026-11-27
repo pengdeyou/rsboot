@@ -33,7 +33,18 @@ rsboot teilt das Problem in zwei Schichten: **die Verbindungsschicht ist ereigni
 
 ## Leistungsvergleich
 
-Gemessen gegen axum und actix-web. Aufbau: Linux-VM mit 4 Kernen, **2 Worker-Threads** für alle drei Server, identische Routen, alle drei im selben Zeitfenster abwechselnd belastet, angegeben sind QPS.
+Gemessen gegen axum und actix-web. Alle Server laufen im selben Zeitfenster, abwechselnd, mit identischen Routen; angegeben sind QPS. **Zahlen aus verschiedenen Fenstern sind nicht vergleichbar** — das Protokoll hat sich geändert, die älteren Zeilen bleiben nur, weil sie die einzige Messung dieser Last sind.
+
+### Wie die aktuellen Zahlen entstehen
+
+- 4-Kern-Linux-Maschine, **4 Worker-Threads auf allen Servern**, Client mit **4 Threads**, 1 000 Keep-Alive-Verbindungen, `pipeline 16`.
+- Jede Konfiguration läuft **10 Runden × 8 s**, A/B rundenweise abwechselnd; danach eine zweite Charge mit umgekehrter Reihenfolge. Die 20 Runden werden gepoolt: Mittelwert plus Sieg/Niederlage-Verteilung.
+- Das Rauschen zwischen den Runden liegt auf dieser Maschine bei **±0,35 %**, mit einem Split von 10:10 bis 13:7. Alles Kleinere ist kein Ergebnis, und beide Chargen müssen in dieselbe Richtung zeigen.
+- Aktueller Stand gegen actix-web 4 (gleiches Fenster, beide mit 4 Workern): rsboot **999 411** vs. actix **1 033 174** — **−3,3 %**, 1:19.
+
+Das vollständige Protokoll — jede Änderung, ihr Delta und alles, was gemessen und wieder verworfen wurde — steht in [docs/perf-log.md](docs/perf-log.md).
+
+Die Zeilen `/slow` und `/json` unten stammen aus einem **früheren Fenster** (4-Kern-VM, überall 2 Worker-Threads, kürzere Läufe).
 
 | Szenario | rsboot | axum | actix-web |
 |---|---:|---:|---:|
@@ -51,6 +62,28 @@ Was die Tabelle aussagt — einschließlich dessen, was uns nicht schmeichelt:
 - Downstream-Aufrufe: 40 gleichzeitige Clients × 20 ms Abhängigkeit, kooperativer Modus **655 QPS / p99 62 ms** gegenüber blockierender Basis **33 QPS / p99 2 323 ms** — 20-facher Unterschied, ausgelöst durch einen einzigen Schalter (`RSBOOT_BLOCKING_IO`).
 
 Diese Zahlen schwanken je nach Maschine. Vergleiche nur innerhalb eines Laufs, nie über Maschinen hinweg und nie gegen absolute Werte aus fremden Blogposts.
+
+### Gemessen und verworfen
+
+Hier festgehalten, damit niemand denselben Versuch noch einmal mit der Erwartung auf einen Gewinn fährt. Protokoll wie oben; ein negatives Delta heißt **langsamer**.
+
+| Änderung | Ergebnis | Warum es nichts brachte |
+|---|---|---|
+| Namensfeld in einem Durchlauf (Doppelpunkt + trailing OWS + Token-Prüfung) | −0,06 %, 13:7 | Neutral. Die Parse-Zeit liegt nicht darin, „wie oft wir die Bytes durchlaufen" |
+| `Hdr` 64 → 32 Bytes (Offset-Tabelle + Seitentabelle) | −0,59 %, 9:11, Chargen widersprüchlich | eine Indirektion mehr bei jedem Header-Zugriff |
+| `get_unchecked` in den Parse-Schleifen | **−1,69 %**, 14:6 | Grenzprüfungen waren schon gratis; `unsafe` blockierte andere Optimierungen |
+| CRLF-Scan im Response-Head von Hand | −1,36 %, 12:8 | `str::contains` nutzt vektorisiertes memchr |
+| `from_utf8_unchecked` auf dem Header-Slice | −0,99 %, 12:8 | gleiche Begründung — die Prüfung ist nicht der Aufwand |
+| Thread-lokaler Pool für Response-Header-`Vec`s | −0,35 %, 12:8 | und `Drop` auf `Headers` bricht das Borrowing in `serve_once` |
+| `-C target-cpu=x86-64-v3` / `native` | +0,9 %, aber AB −0,4 % / BA +2,3 % | gegenläufige Chargen = Rauschen |
+| 12 Header-Slots inline, um ein `malloc` zu sparen | −8,3 % | das memset über 12 × 64 Bytes kostet mehr als die Allokation |
+| Alle Antworten in `out_buf` sammeln (Direkt-Schreibpfad entfernt) | −4,3 % | ein pipelinender Client hält Anfragen in Flight, der Server sieht selten mehr als eine |
+| `SO_REUSEPORT`, Accept pro Worker | keine Änderung | der Accept-Thread wacht im Steady State alle 5 ms auf |
+| Kleinere `SO_SNDBUF` / `SO_RCVBUF` | −0,04 % | im Rauschen |
+| 4 KiB Lesepuffer als Standard | +0,8 %, nicht signifikant | 1 KiB fasst bereits ~12 Request-Heads |
+| Eingebauter tcache-Allocator (Feature `tc-alloc`) | +0,36 % | Obergrenze ~0,5 %, standardmäßig aus |
+
+Für alle, die die restlichen 3 % angreifen wollen: im Profil sind zwei Syscalls 70 % einer Anfrage (3,5–4 µs von 5 µs), Userland ist ~1 µs (`parse` 275 ns, `build` 145, `handle` 555). Die Lücke beträgt also ~150 ns und kann nur in diesen drei Stufen liegen — drei strukturelle Versuche an `parse` landeten jedoch alle im Rauschen, was heißt: die 275 ns sind feste Arbeit pro Anfrage (Item-Aufbau, `Vec`-Buchhaltung, Span-Einträge, Abschlussvalidierung), nicht die Scanbreite. Der nächste ehrliche Schritt ist, `handle` selbst mit 1/64-Sampling zu instrumentieren und die 555 ns in Routing, Kontext, User-Handler und Response-Aufbau zu zerlegen.
 
 ## Entwurfsmerkmale
 
