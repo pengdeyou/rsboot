@@ -22,7 +22,6 @@
 
 use crate::web::http::headers::HeaderSpare;
 use crate::web::http::{Headers, Method, Status};
-use std::sync::Arc;
 
 /// 请求行里的目标：`/path?query`。
 ///

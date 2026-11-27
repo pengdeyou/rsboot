@@ -24,6 +24,9 @@ use crate::error::{Error, Result};
 
 pub struct Context {
     config: Arc<RwLock<Arc<Config>>>,
+    /// `(配置快照的地址, http.envelope 的取值)`。热加载换快照后地址变，
+    /// 缓存自动失效——所以不必在热加载线程里额外通知任何人。
+    env_cache: RefCell<Option<(usize, bool)>>,
     env: Environment,
     databases: HashMap<String, RefCell<Session<Engine>>>,
     default_db: Option<String>,
@@ -43,6 +46,7 @@ impl Context {
             .collect();
         Self {
             config: Arc::new(RwLock::new(Arc::new(config))),
+            env_cache: RefCell::new(None),
             env,
             databases,
             default_db,
@@ -63,6 +67,7 @@ impl Context {
     ) -> Self {
         Self {
             config,
+            env_cache: RefCell::new(None),
             env,
             databases: databases
                 .into_iter()
@@ -81,6 +86,25 @@ impl Context {
             // 继续服务比 panic 更好——热加载本来就是"不能把服务搞挂"的功能。
             Err(e) => Arc::clone(&e.into_inner()),
         }
+    }
+
+    /// 统一响应体开关。**每请求**都要问一次，所以不走"取快照 + 查表"：
+    /// 只读一次锁拿到快照地址，地址没变就直接用上次的答案。
+    /// 省掉的是一次 `Arc::clone`（两条原子操作）和一次 map 查找。
+    pub fn envelope_on(&self) -> bool {
+        let g = match self.config.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let key = Arc::as_ptr(&g) as usize;
+        if let Some((k, v)) = *self.env_cache.borrow() {
+            if k == key {
+                return v;
+            }
+        }
+        let v = g.get_bool("http.envelope").ok().flatten().unwrap_or(false);
+        *self.env_cache.borrow_mut() = Some((key, v));
+        v
     }
 
     /// 配置槽的共享句柄（热加载线程持有它来换快照）。

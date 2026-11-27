@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use crate::error::{Error, Result};
 use crate::runtime::context::Context;
 use crate::web::error::ApiError;
-use crate::web::envelope::{self, Envelope};
+use crate::web::envelope::{self};
 use crate::web::exception;
 use crate::web::middleware::Middleware;
 use crate::web::http::{Method, Status};
@@ -367,7 +367,7 @@ impl Router {
     /// 只能回裸 `{"detail":...}`——这就是"成功带 data、失败带 detail"的经典不一致。
     /// 所以在这里统一处理：凡是带着 `api_error` 原件的响应，按开关重写一次。
     fn finalize(&self, mut resp: Response, req: &Request, ctx: &Context) -> Response {
-        if !Envelope::from_config(&ctx.config()).on {
+        if !ctx.envelope_on() {
             return resp;
         }
         if resp.status.0 < 400 {

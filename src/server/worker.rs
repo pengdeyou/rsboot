@@ -141,7 +141,8 @@ fn main_loop(
     // 定时器线程只有一个（进程级），`start_timer` 内部做了幂等。
     mn::sched::init(Arc::clone(&sh.rt), id, mn::sched::Shared::new(my_waker.clone()));
     // 处理完、仍可 keep-alive 的连接由协程投回这里，主循环统一收回
-    let rets: Arc<std::sync::Mutex<Vec<Conn>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rets: std::rc::Rc<std::cell::RefCell<Vec<Conn>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     // 任一来源要求关闭都算：外部编排，或 drain 期满的内部关闭
     let should_stop = || {
         sh.shutdown.load(Ordering::Relaxed) || sh.closing.load(Ordering::Relaxed)
@@ -178,9 +179,10 @@ fn main_loop(
             n
         };
         {
-            let mut g = rets.lock().unwrap();
-            if !g.is_empty() {
-                conns.extend(g.drain(..));
+            if let Ok(mut g) = rets.try_borrow_mut() {
+                if !g.is_empty() {
+                    conns.extend(g.drain(..));
+                }
             }
         }
         mark = {
@@ -350,7 +352,7 @@ fn service_ready(
     n_conns: usize,
     sh: &Arc<Shared>,
     ctx: &Context,
-    rets: &Arc<std::sync::Mutex<Vec<Conn>>>,
+    rets: &std::rc::Rc<std::cell::RefCell<Vec<Conn>>>,
 ) -> usize {
     let mut served = 0usize;
     for k in (0..ps.ready_len()).rev() {
@@ -366,7 +368,6 @@ fn service_ready(
         }
         let mut c = conns.swap_remove(idx);
         served += 1;
-        sh.served[id].fetch_add(1, Ordering::Relaxed);
         // 请求处理放进协程：handler 里凡是要等 I/O 的地方（框架的 sleep /
         // DB / 下游调用）都能让出，worker 立刻回去处理别的连接。
         // 同步 handler 的签名和借用规则不变。
@@ -377,7 +378,7 @@ fn service_ready(
             let cp: *const Context = ctx;
             let sh2 = Arc::clone(sh);
             let lim = sh.limits;
-            let rets2 = Arc::clone(rets);
+            let rets2 = std::rc::Rc::clone(rets);
             mn::sched::spawn(move || {
                 let stop_fn = || {
                     sh2.shutdown.load(Ordering::Relaxed) || sh2.closing.load(Ordering::Relaxed)
@@ -387,7 +388,9 @@ fn service_ready(
                 // 只能等。
                 match unsafe { c.serve_once(&*rp, &*cp, &lim, &stop_fn) } {
                     Ok(ConnOutcome::KeepAlive) | Ok(ConnOutcome::Idle) => {
-                        rets2.lock().unwrap().push(c);
+                        if let Ok(mut g) = rets2.try_borrow_mut() {
+                            g.push(c);
+                        }
                     }
                     _ => {}
                 }
@@ -400,6 +403,11 @@ fn service_ready(
             conns.push(c);
         }
         // 关闭/出错/对端要 close 的一律直接丢
+    }
+    // 计数器攒到一轮结束再写一次：热路径上每请求一次原子累加是白付的，
+    // 而 `rebalance` 只在一轮之后读它，晚一轮的数据完全够用。
+    if served > 0 {
+        sh.served[id].fetch_add(served as u64, Ordering::Relaxed);
     }
     served
 }
