@@ -8,7 +8,7 @@
 >
 > Fastest to write, fastest to ship — and ahead of axum and actix-web on I/O-bound load — **9 687 QPS** at 200 concurrent clients / 20 ms delay, **96× its own synchronous predecessor**. One dependency line in `Cargo.toml`; signal handling, OpenAPI docs and connection pooling are built in — a few lines from an empty directory to a running endpoint.
 >
-> We are **not** the raw-throughput champion, and this README does not pretend otherwise: on the no-I/O JSON path actix-web leads by ~18 % at high concurrency. The measured table below shows every column, including the ones where we lose.
+> We are **not** the raw-throughput champion, and this README does not pretend otherwise: on the no-I/O JSON path actix-web leads by **~3 %** when both run four workers and the client pipelines 16 deep. The measured tables below show every column, including the ones where we lose.
 
 A Rust-ecosystem-native application framework — FastAPI-style declarative routing, typed extraction, automatic OpenAPI. **Synchronous handlers run on stackful coroutines over non-blocking sockets**: slow I/O yields the worker instead of parking it. The HTTP/1.1 stack, the coroutine scheduler and the event loop are written from scratch — no tokio, no hyper, no axum.
 
@@ -33,7 +33,18 @@ rsboot splits the problem in two: **the connection layer is event-driven, the re
 
 ## Performance
 
-Benchmarked against axum and actix-web. Setup: 4-core Linux VM, **2 worker threads** for all three servers, identical routes, all three measured round-robin inside the same time window, QPS reported.
+Benchmarked against axum and actix-web. All servers run inside the same time window, round-robin, identical routes, QPS reported. Numbers from different windows are **not** comparable — the protocol changed, and the older rows are kept only because they are still the only measurement of that workload.
+
+### How the current numbers are measured
+
+- 4-core Linux box, **4 worker threads on every server**, client on **4 threads**, 1 000 keep-alive connections, `pipeline 16`.
+- Each configuration runs **10 rounds × 8 s**, A/B alternating round by round; then a second batch with the order reversed. The 20 rounds are pooled and reported as a mean plus a win/loss split.
+- Run-to-run noise on this box is **±0.35 %** with a 10:10 to 13:7 split. Anything smaller is not a result, and the two batches must point the same way.
+- Current standing against actix-web 4 (same window, both at 4 workers): rsboot **999 411** vs actix **1 033 174** — **−3.3 %**, 1:19.
+
+The full log — every change, the delta it produced, and everything that was measured and reverted — is in [docs/perf-log.md](docs/perf-log.md).
+
+The `/slow` and `/json` rows below come from an **earlier window** (4-core VM, 2 worker threads everywhere, shorter runs).
 
 | Scenario | rsboot | axum | actix-web |
 |---|---:|---:|---:|
@@ -87,7 +98,7 @@ What the table says, including the parts that don't flatter us:
 - **`pump` was never the hole; the wake was.** `[prep]` said pump held 99.7 % of a round, but that is a container: it resumes coroutines and their service time is counted inside it. Net scheduler cost is **5.7 ns/connection**. What did cost money was `Shared::push` calling `waker.notify()` unconditionally — a `write(eventfd)` per request — while `spawn` and deadline wakeups run *on the worker's own thread*, where nobody is asleep. Split into `push_quiet` (local, no wake) and `push` (cross-thread, wakes): **999 k → 1 063 k, +6.5 %**, +15 % in the cleanest round.
 - **A request head was copied twice.** `BufReader::read_until` filled a `line: Vec<u8>`, which was then pushed into `head: String` — every byte walked twice, with a `clear` + `from_utf8` per line. `read_head` now reads one whole buffer, scans for `\r\n\r\n` on it, and moves the segment with a single `extend`; the only extra work is a 1..3 byte overlap check at the buffer boundary so a terminator split across two fills is not missed. **1 031 k → 1 080 k, +4.7 %** over three alternating rounds, with `Chunked` tests that force `step = 1..3` so every split of `\r\n\r\n` is exercised.
 
-- **The request line and target are scanned once, not three times.** `head.find("\r\n")` ran a general two-byte search for a separator that sits ~30 bytes in; `request_line.split(' ')` built an iterator and pulled four items just to confirm there was no third space; `target.split_once('?')` then `path.contains('#')` walked the target twice. All three are now single manual passes over the bytes: one to locate CRLF, one that records both space positions (a third space is still a 400), and one that finds `?` and `#` together. Microbenchmark: lean 3-header request **167 → 139 ns**, typical 12-header request **641 → 536 ns** (−17 % / −16 %), 284 tests still green.
+- **The request line and target are scanned once, not three times.** `head.find("\r\n")` ran a general two-byte search for a separator that sits ~30 bytes in; `request_line.split(' ')` built an iterator and pulled four items just to confirm there was no third space; `target.split_once('?')` then `path.contains('#')` walked the target twice. All three are now single manual passes over the bytes: one to locate CRLF, one that records both space positions (a third space is still a 400), and one that finds `?` and `#` together. Microbenchmark: lean 3-header request **167 → 139 ns**, typical 12-header request **641 → 536 ns** (−17 % / −16 %).
 
   End to end this is worth about **1 %**: the `parse` stage moved from 225 to 214 ns while pipelined QPS stayed inside the noise band (1 045 360 → 1 053 033). Parsing is 8 % of the 2.8 µs a pipelined request actually costs, so 30 ns buys almost nothing. What remains in the parse path is three allocations per request — `Target { path, query }` both `String`, the `Arc<str>` that copies the whole head, and the `Headers` item array — and that is where httparse pulls ahead: it allocates nothing, returning byte spans into a buffer the caller owns. Matching it means turning `path`/`query` into spans and giving `Headers` a lifetime tied to the connection buffer, which changes the public shape of `Request`. Not worth 2–3 % when the 1.8 µs hole inside `pump` is twenty times larger.
 
@@ -128,6 +139,28 @@ What the table says, including the parts that don't flatter us:
 - Downstream service calls: 40 concurrent clients × 20 ms dependency, cooperative mode **655 QPS / p99 62 ms** vs blocking baseline **33 QPS / p99 2 323 ms** — a 20× difference from a single flag (`RSBOOT_BLOCKING_IO`).
 
 These numbers drift with the machine. Compare servers within one run, never across machines or against someone else's blog post.
+
+### Already tried, measured, and rejected
+
+Kept here so nobody re-runs the same experiment expecting a win. Protocol as above; a negative delta means the change was **slower**.
+
+| Change | Result | Why it did not pay |
+|---|---|---|
+| Merge the name-field passes (colon + trailing OWS + token check into one) | −0.06 %, 13:7 | Neutral. Parser cost is not "how many times we walk the bytes" |
+| `Hdr` 64 → 32 bytes (`Item{pos,len,tag}` + side table) | −0.59 %, 9:11, batches disagreed | One more indirection on every header access |
+| `get_unchecked` in the parse hot loops | **−1.69 %**, 14:6 | Bounds checks were already free; `unsafe` blocked other optimisations |
+| Hand-rolled CRLF scan in the response head | −1.36 %, 12:8 | `str::contains` goes through vectorised memchr |
+| `from_utf8_unchecked` on the header slice | −0.99 %, 12:8 | Same — the check is not where the time is |
+| Thread-local pool for response header `Vec`s | −0.35 %, 12:8 | And `Drop` on `Headers` breaks the borrow in `serve_once` |
+| `-C target-cpu=x86-64-v3` / `native` | +0.9 %, but AB −0.4 % / BA +2.3 % | Two batches pointing opposite ways = noise |
+| Inline 12 header slots to save one `malloc` | −8.3 % | memset of 12 × 64 bytes costs more than the allocation |
+| Batch every response into `out_buf` (drop the direct-write path) | −4.3 % | A pipelining client keeps requests in flight; the server rarely sees more than one |
+| `SO_REUSEPORT`, per-worker accept | no change | The accept thread wakes once every 5 ms at steady state |
+| Smaller `SO_SNDBUF` / `SO_RCVBUF` | −0.04 % | Inside the noise |
+| 4 KiB read buffer as the default | +0.8 %, not significant | 1 KiB already holds ~12 request heads |
+| Bundled tcache allocator (feature `tc-alloc`) | +0.36 % | Ceiling is ~0.5 %; off by default |
+
+The correlating profile, for anyone who wants to attack the remaining 3 %: two syscalls are 70 % of a request (3.5–4 µs of 5 µs), userland is ~1 µs (`parse` 275 ns, `build` 145, `handle` 555). So the gap is ~150 ns and can only live in those three stages — but three structural attempts at `parse` have all landed inside the noise, which says the 275 ns is fixed per-request work (item construction, `Vec` bookkeeping, span pushes, closing validation), not scan width. The next honest step is to instrument `handle` itself at 1/64 sampling and split its 555 ns into routing, context, the user handler and response building, rather than guess again.
 
 ## Design highlights
 
