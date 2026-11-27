@@ -4,3 +4,5 @@
 //! 它是依赖图的最底层，谁都可以用，它不依赖谁。
 
 pub mod redact;
+#[cfg(feature = "tc-alloc")]
+pub mod tcache;

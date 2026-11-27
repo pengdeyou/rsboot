@@ -18,6 +18,10 @@
 //! `rsboot-rpc`（JSON-RPC）、`rsboot-sse`（服务端推送）都是独立 crate，
 //! 按需引入，核心不背它们的依赖。
 
+#[cfg(feature = "tc-alloc")]
+#[global_allocator]
+static TC_ALLOC: support::tcache::TcAlloc = support::tcache::TcAlloc;
+
 pub mod config;
 pub mod error;
 pub mod runtime;

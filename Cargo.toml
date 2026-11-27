@@ -11,6 +11,12 @@ categories = ["web-programming::http-server", "database"]
 readme = "README.md"
 documentation = "https://docs.rs/rsboot"
 
+[features]
+default = []
+# 线程缓存的 size-class 分配器。打开后 `#[global_allocator]` 会被换成自研实现，
+# 影响整个链接进来的程序（包括下游自己的分配），所以不默认开。
+tc-alloc = []
+
 [dependencies]
 rsbatis = { version = "0.1.0-alpha.29", path = "../rsbatis/crates/rsbatis", features = ["sqlite", "mysql", "migrate"] }
 # JSON 是 Web 框架的必需品，serde 生态无法替代
