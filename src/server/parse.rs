@@ -76,8 +76,17 @@ const MAX_HEADER_LINE: usize = 4 * 1024;
 ///
 /// `head` 是"请求行 + 头 + 空行"这一段原始字节，`max_body` 是配置的 body 上限。
 pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseError> {
-    // 请求行到第一个 `\r\n` 为止（整块 head 本身就是"到空行"那一段）
-    let rl_end = head.find("\r\n").unwrap_or(head.len());
+    let bytes = head.as_bytes();
+    // 请求行到第一个 `\r\n` 为止（整块 head 本身就是"到空行"那一段）。
+    // 手扫而不是 `find("\r\n")`：后者要跑两字节搜索的通用算法，而这里
+    // 一行的平均长度只有三十来字节，逐字节比调用搜索器便宜。
+    let mut rl_end = 0usize;
+    while rl_end + 1 < bytes.len() && !(bytes[rl_end] == b'\r' && bytes[rl_end + 1] == b'\n') {
+        rl_end += 1;
+    }
+    if rl_end + 1 >= bytes.len() {
+        rl_end = bytes.len();
+    }
     let request_line = &head[..rl_end];
     if request_line.is_empty() {
         return Err(ParseError::new(Status::BAD_REQUEST, "请求行是空的"));
@@ -86,22 +95,34 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
         return Err(ParseError::new(Status(414), "请求行过长"));
     }
 
-    let mut parts = request_line.split(' ');
-    let method_raw = parts
-        .next()
-        .ok_or_else(|| ParseError::new(Status::BAD_REQUEST, "缺少方法"))?;
-    let target_raw = parts
-        .next()
-        .ok_or_else(|| ParseError::new(Status::BAD_REQUEST, "缺少请求目标"))?;
-    let version_raw = parts
-        .next()
-        .ok_or_else(|| ParseError::new(Status::BAD_REQUEST, "缺少协议版本"))?;
-    if parts.next().is_some() {
-        return Err(ParseError::new(
-            Status::BAD_REQUEST,
-            "请求行里有多余的空格。目标里不允许出现空格（应百分号编码）",
-        ));
+    // 两个空格就是三个字段的分界；第三个空格直接判错（目标里不许有空格）。
+    // 手扫一趟同时拿到两个位置，比 `split(' ')` 取四次 next 少一层迭代器。
+    let (mut sp1, mut sp2) = (usize::MAX, usize::MAX);
+    let mut k = 0usize;
+    while k < rl_end {
+        if bytes[k] == b' ' {
+            if sp1 == usize::MAX {
+                sp1 = k;
+            } else if sp2 == usize::MAX {
+                sp2 = k;
+            } else {
+                return Err(ParseError::new(
+                    Status::BAD_REQUEST,
+                    "请求行里有多余的空格。目标里不允许出现空格（应百分号编码）",
+                ));
+            }
+        }
+        k += 1;
     }
+    if sp1 == usize::MAX {
+        return Err(ParseError::new(Status::BAD_REQUEST, "缺少请求目标"));
+    }
+    if sp2 == usize::MAX {
+        return Err(ParseError::new(Status::BAD_REQUEST, "缺少协议版本"));
+    }
+    let method_raw = &request_line[..sp1];
+    let target_raw = &request_line[sp1 + 1..sp2];
+    let version_raw = &request_line[sp2 + 1..];
 
     let method = Method::parse(method_raw).ok_or_else(|| {
         ParseError::new(
@@ -135,13 +156,33 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
             "请求目标必须是 `/path` 形式（origin-form）",
         ));
     }
-    let (path, query) = match target_raw.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (target_raw.to_string(), String::new()),
-    };
-    if path.contains('#') {
+    // `?` 与 `#` 一趟扫完：`split_once('?')` 找问号、`contains('#')` 再找井号，
+    // 两趟扫描合成一趟。
+    let tb = target_raw.as_bytes();
+    let mut qmark = usize::MAX;
+    let mut hash = usize::MAX;
+    let mut m = 0usize;
+    while m < tb.len() {
+        let c = tb[m];
+        if c == b'?' && qmark == usize::MAX {
+            qmark = m;
+        } else if c == b'#' {
+            hash = m;
+            break;
+        }
+        m += 1;
+    }
+    if hash != usize::MAX {
         return Err(ParseError::new(Status::BAD_REQUEST, "请求目标里不能有 `#`"));
     }
+    let (path, query) = if qmark == usize::MAX {
+        (target_raw.to_string(), String::new())
+    } else {
+        (
+            target_raw[..qmark].to_string(),
+            target_raw[qmark + 1..].to_string(),
+        )
+    };
 
     // 整块 head 只复制这一次，后面每个头都只是它上面的一个区间
     let raw: Arc<str> = Arc::from(head);
@@ -155,7 +196,6 @@ pub fn parse_head(head: &str, max_body: usize) -> Result<ParsedRequest, ParseErr
     let mut conn_close = false;
     let mut conn_keepalive = false;
 
-    let bytes = head.as_bytes();
     let mut i = rl_end + 2;
     while i < bytes.len() {
         // 一行一行走，同时校验 CR/LF 规范：只允许成对的 `\r\n`，孤立的
