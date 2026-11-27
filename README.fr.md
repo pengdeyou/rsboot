@@ -8,7 +8,7 @@
 >
 > Plus rapide qu'axum et actix-web sur les charges d'E/S — **9 687 QPS** à 200 clients simultanés / 20 ms, **96× notre propre version synchrone**. Une seule ligne de dépendance dans `Cargo.toml` ; gestion des signaux, documentation OpenAPI et pool de connexions sont intégrés — quelques lignes d'un répertoire vide à un endpoint qui tourne.
 >
-> Nous ne sommes **pas** le champion du débit brut, et ce README ne fait pas semblant : sur le chemin JSON sans E/S, actix-web mène d'environ 18 % à forte concurrence. Le tableau ci-dessous montre chaque colonne, y compris celles où nous perdons.
+> Nous ne sommes **pas** le champion du débit brut, et ce README ne fait pas semblant : sur le chemin JSON sans E/S, actix-web mène d'environ 3 % quand les deux tournent avec quatre workers et des clients pipelinés en profondeur 16. Le tableau ci-dessous montre chaque colonne, y compris celles où nous perdons.
 
 Un framework applicatif natif de l'écosystème Rust — routage déclaratif à la FastAPI, extraction typée, documentation OpenAPI générée automatiquement. **Les handlers synchrones s'exécutent sur des coroutines à pile, au-dessus de sockets entièrement non bloquantes** : une E/S lente libère le worker au lieu de l'occuper. La pile HTTP/1.1, l'ordonnanceur et la boucle d'événements sont écrits maison — pas de tokio, pas de hyper, pas de axum.
 

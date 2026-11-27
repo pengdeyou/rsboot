@@ -8,7 +8,7 @@
 >
 > Bei I/O-lastiger Last schneller als axum und actix-web — **9 687 QPS** bei 200 gleichzeitigen Clients / 20 ms, **96-fach gegenüber der eigenen synchronen Vorgängerversion**. Eine Abhängigkeitszeile in `Cargo.toml`; Signalbehandlung, OpenAPI-Dokumentation und Connection-Pooling sind eingebaut — in wenigen Zeilen vom leeren Verzeichnis zum laufenden Endpunkt.
 >
-> Wir sind **nicht** der Meister im reinen Durchsatz, und dieses README tut nicht so: Auf dem JSON-Pfad ohne I/O liegt actix-web bei hoher Nebenläufigkeit rund 18 % vorn. Die Tabelle unten zeigt jede Spalte — auch die, in denen wir verlieren.
+> Wir sind **nicht** der Meister im reinen Durchsatz, und dieses README tut nicht so: Auf dem JSON-Pfad ohne I/O liegt actix-web bei vier Workern auf beiden Seiten und 16-fach gepipelineten Clients rund 3 % vorn. Die Tabelle unten zeigt jede Spalte — auch die, in denen wir verlieren.
 
 Ein im Rust-Ökosystem beheimatetes Anwendungsframework — deklaratives Routing im FastAPI-Stil, typisierte Extraktion, automatisch erzeugte OpenAPI-Dokumentation. **Synchrone Handler laufen auf Stackful-Coroutinen über nicht blockierenden Sockets**: langsame I/O gibt den Worker frei, statt ihn zu belegen. HTTP/1.1-Stack, Scheduler und Event-Loop sind vollständig selbst geschrieben — kein tokio, kein hyper, kein axum.
 
