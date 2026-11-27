@@ -237,7 +237,7 @@ fn main_loop(
         // 量一下阻塞真正的占比：若 `poll` 只占个位数，换 `epoll` 就纯属
         // 白费——那点内核扫描不是差距来源
         let poll_t0 = clock::now_ns();
-        profile::note_prep(profile::PREP_LAST, mark, poll_t0);
+        profile::note_prep(profile::PREP_RESET, mark, poll_t0);
         if let Err(e) = ps.wait(timeout) {
             eprintln!("[rsboot] worker poll 失败：{e}");
             std::thread::sleep(Duration::from_millis(5));
@@ -249,7 +249,11 @@ fn main_loop(
             my_waker.drain();
         }
 
-        service_ready(id, &mut conns, &ps, n_conns, &sh, &ctx, &rets);
+        let serve_t0 = clock::now_ns();
+        let served = service_ready(id, &mut conns, &ps, n_conns, &sh, &ctx, &rets);
+        let serve_t1 = clock::now_ns();
+        profile::note_prep(profile::PREP_SERVE, serve_t0, serve_t1);
+        profile::note_served(served);
     }
 
     // worker 收尾：模块在这里释放线程局部资源（连接、缓冲）
@@ -346,7 +350,8 @@ fn service_ready(
     sh: &Arc<Shared>,
     ctx: &Context,
     rets: &Arc<std::sync::Mutex<Vec<Conn>>>,
-) {
+) -> usize {
+    let mut served = 0usize;
     for k in (0..ps.ready_len()).rev() {
         let idx = ps.ready_at(k);
         if idx >= n_conns {
@@ -359,6 +364,7 @@ fn service_ready(
             continue;
         }
         let mut c = conns.swap_remove(idx);
+        served += 1;
         sh.served[id].fetch_add(1, Ordering::Relaxed);
         // 请求处理放进协程：handler 里凡是要等 I/O 的地方（框架的 sleep /
         // DB / 下游调用）都能让出，worker 立刻回去处理别的连接。
@@ -394,6 +400,7 @@ fn service_ready(
         }
         // 关闭/出错/对端要 close 的一律直接丢
     }
+    served
 }
 
 /// 仅用于测量：关掉协程，让请求在 worker 栈上同步跑。

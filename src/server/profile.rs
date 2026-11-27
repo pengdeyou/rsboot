@@ -26,7 +26,8 @@ const STAGES: usize = 7;
 
 #[inline(always)]
 fn tsc() -> u64 {
-    crate::server::clock::now_ns()
+    // profile 要的是精确差值，不能读请求级的缓存（那个 64 次才刷新一次）
+    crate::server::clock::raw_ns()
 }
 
 #[inline]
@@ -174,7 +175,15 @@ pub fn note_poll(round_t0: u64, poll_t0: u64) {
 // `note_poll` 只能给出"等待 vs 本轮总长"，本轮总长减去等待就是
 // poll **之前**做的事（收队列、调度器查询、rebalance 检查、拼 fd 数组）。
 // 短连接下一轮只服务一条连接，那段准备成本会被整条连接摊走——必须细分。
-pub const PREP_STAGES: usize = 5;
+pub const PREP_PUMP: usize = 0;
+pub const PREP_DRAIN: usize = 1;
+pub const PREP_RECV: usize = 2;
+pub const PREP_REBAL: usize = 3;
+pub const PREP_RESET: usize = 4;
+/// `poll` 之后取出连接、spawn 协程的那一段。过去它没被计时，
+/// 于是"七段合计"与"本轮总长"之间有一块黑洞。
+pub const PREP_SERVE: usize = 5;
+pub const PREP_STAGES: usize = 6;
 /// 最后一段的下标：`note_prep` 收到它就顺手打一行。
 pub const PREP_LAST: usize = PREP_STAGES - 1;
 pub const PREP_NAMES: [&str; PREP_STAGES] = [
@@ -183,6 +192,7 @@ pub const PREP_NAMES: [&str; PREP_STAGES] = [
     "recv",
     "rebalance",
     "reset",
+    "serve",
 ];
 
 static PREP_NS: [AtomicU64; PREP_STAGES] = [
@@ -191,7 +201,10 @@ static PREP_NS: [AtomicU64; PREP_STAGES] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
+/// 本轮处理了多少条连接（= spawn 了几次）。用来把"每轮成本"换算成"每请求成本"。
+static SERVED: AtomicU64 = AtomicU64::new(0);
 static PREP_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// 记一段：`from..to` 属于第 `stage` 段。最后一段调用时打一行。
@@ -204,12 +217,28 @@ pub fn note_prep(stage: usize, from: u64, to: u64) {
     if stage + 1 == PREP_STAGES {
         let n = PREP_CNT.fetch_add(1, Ordering::Relaxed) + 1;
         if n % 2000 == 0 {
-            let mut s = String::with_capacity(96);
+            let mut s = String::with_capacity(120);
+            let mut sum = 0.0;
             for (i, name) in PREP_NAMES.iter().enumerate() {
                 let v = PREP_NS[i].load(Ordering::Relaxed) as f64 / n as f64;
+                sum += v;
                 s.push_str(&format!("{name} {v:.0}  "));
             }
-            eprintln!("[prep] {n} 轮 | {s}");
+            let wait = POLL_NS.load(Ordering::Relaxed) as f64 / POLL_CNT.load(Ordering::Relaxed).max(1) as f64;
+            let round = ROUND_NS.load(Ordering::Relaxed) as f64 / POLL_CNT.load(Ordering::Relaxed).max(1) as f64;
+            let served = SERVED.load(Ordering::Relaxed) as f64 / n as f64;
+            eprintln!(
+                "[prep] {n} 轮 | {s}| wait {wait:.0}  = 已计 {:.0}  / 本轮 {round:.0}  | 差 {:.0}  | 每轮 {served:.1} 条",
+                sum, round - sum - wait
+            );
         }
+    }
+}
+
+/// 本轮 `service_ready` 服务了几条连接。
+#[inline]
+pub fn note_served(n: usize) {
+    if on() {
+        SERVED.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
