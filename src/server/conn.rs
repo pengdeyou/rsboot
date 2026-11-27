@@ -139,6 +139,8 @@ pub struct Conn {
     /// 加上 `set_nodelay` 的 setsockopt 就是其中两刀。现在写响应直接取
     /// 这里面的 fd。
     reader: BufReader<coio::CoIo>,
+    /// 对端地址，建连时算一次（`getpeername` 不该每请求一次）。
+    peer_addr: Option<String>,
     /// 当前请求的头原文。按连接复用：keep-alive 下每条连接处理成千上万个请求，
     /// 每请求新建一个 `String` 意味着一次 malloc + 数次 realloc（头部有 8 行时
     /// 容量要长两三轮）。空闲时由 `trim_idle` 把被撑大的容量还回去。
@@ -214,9 +216,14 @@ impl Conn {
         // 真正的空闲上限仍由 `read_head` 里的 elapsed 判定。
         let _ = stream.set_nodelay(nodelay_on());
         tune_bufs(&stream);
+        // 对端地址是**连接级**信息，建连时查一次就够。原来每个请求都
+        // `peer_addr()` + `to_string()`：一次 `getpeername` 系统调用加一次
+        // 分配/格式化，而它发生在 READ 段之前，剖面里完全看不见。
+        let peer_addr = stream.peer_addr().ok().map(|a| a.to_string());
         let reader = BufReader::with_capacity(read_buf_bytes(), coio::CoIo::new(stream)?);
         Ok(Self {
             reader,
+            peer_addr,
             head_buf: String::with_capacity(HEAD_BUF_BYTES),
             line_buf: Vec::with_capacity(LINE_BUF_BYTES),
             out_buf: Vec::with_capacity(OUT_BUF_BYTES),
@@ -240,8 +247,9 @@ impl Conn {
         self.out_buf.shrink_to(OUT_BUF_BYTES);
     }
 
+    /// 对端地址，建连时算好、此后只做一次 `String` clone。
     pub fn peer(&self) -> Option<String> {
-        self.reader.get_ref().get_ref().peer_addr().ok().map(|a| a.to_string())
+        self.peer_addr.clone()
     }
 
     /// 原始 fd，给 worker 的 `poll` 用。
