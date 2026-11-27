@@ -151,6 +151,9 @@ pub struct Conn {
     /// 同样属于每请求一次的固定税。
     out_buf: Vec<u8>,
     served: usize,
+    /// 连接自增 id。生成的 trace id 用它做第二段，于是不必再每请求抢
+    /// 一个全局计数器（3 个 worker 抢同一条 cache line，那是跨核流量）。
+    id: u64,
 }
 
 /// 处理完一个请求之后的去向。
@@ -228,6 +231,7 @@ impl Conn {
             line_buf: Vec::with_capacity(LINE_BUF_BYTES),
             out_buf: Vec::with_capacity(OUT_BUF_BYTES),
             served: 0,
+            id: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -424,7 +428,7 @@ impl Conn {
                     trace_buf[..s.len()].copy_from_slice(s.as_bytes());
                     s.len()
                 }
-                None => write_trace_id(&mut trace_buf),
+                None => write_trace_id(&mut trace_buf, self.id, self.served),
             },
         };
         let trace: Option<&[u8]> = if trace_len == 0 {
@@ -695,8 +699,15 @@ fn push_hex(out: &mut [u8], mut v: u64) -> usize {
 }
 
 /// 生成 `<epoch>-<seq>` 到 `out`，返回长度。**不分配**。
-fn write_trace_id(out: &mut [u8]) -> usize {
-    static SEQ: AtomicU64 = AtomicU64::new(1);
+/// 全局连接序号。每**连接**取一次，摊到每请求上是零。
+static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
+
+/// 生成一个 trace id：`epoch-连接id-请求序号`。
+///
+/// 原来第二段来自一个全局 `fetch_add`，**每请求**一次。三个 worker 抢同一条
+/// cache line 就是跨核流量，而这种 id 只需要"能区分"就够了——连接 id 建连时
+/// 取一次、请求序号用 `served`（本来就在递增），于是热路径上没有任何原子操作。
+fn write_trace_id(out: &mut [u8], conn: u64, seq: usize) -> usize {
     static EPOCH: OnceLock<u64> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(|| {
         SystemTime::now()
@@ -704,11 +715,13 @@ fn write_trace_id(out: &mut [u8]) -> usize {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     });
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut n = push_hex(out, epoch);
     out[n] = b'-';
     n += 1;
-    n + push_hex(&mut out[n..], seq)
+    n += push_hex(&mut out[n..], conn);
+    out[n] = b'-';
+    n += 1;
+    n + push_hex(&mut out[n..], seq as u64)
 }
 
 #[cfg(test)]
@@ -893,8 +906,8 @@ mod tests {
     fn trace_ids_are_unique() {
         let mut a = [0u8; TRACE_MAX];
         let mut b = [0u8; TRACE_MAX];
-        let an = write_trace_id(&mut a);
-        let bn = write_trace_id(&mut b);
+        let an = write_trace_id(&mut a, 1, 0);
+        let bn = write_trace_id(&mut b, 2, 0);
         assert_ne!(&a[..an], &b[..bn]);
         assert!(an > 3 && an <= TRACE_MAX);
     }
