@@ -131,13 +131,28 @@ impl Config {
     pub fn get_bool(&self, key: &str) -> Result<Option<bool>> {
         match self.get(key) {
             None => Ok(None),
-            Some(v) => match v.to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => Ok(Some(true)),
-                "0" | "false" | "no" | "off" => Ok(Some(false)),
-                _ => Err(Error::Config(format!(
-                    "配置项 `{key}` 应为布尔值（true/false/1/0），实际是 `{v}`"
-                ))),
-            },
+            // 不再 `to_ascii_lowercase()`：那是一次每调用一次的堆分配，而
+            // `http.envelope` 这个开关是**每请求**都查的。大小写不敏感用
+            // `eq_ignore_ascii_case` 逐字比，零分配。
+            Some(v) => {
+                let truthy = v.eq_ignore_ascii_case("1")
+                    || v.eq_ignore_ascii_case("true")
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("on");
+                let falsy = v.eq_ignore_ascii_case("0")
+                    || v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("no")
+                    || v.eq_ignore_ascii_case("off");
+                if truthy {
+                    Ok(Some(true))
+                } else if falsy {
+                    Ok(Some(false))
+                } else {
+                    Err(Error::Config(format!(
+                        "配置项 `{key}` 应为布尔值（true/false/1/0），实际是 `{v}`"
+                    )))
+                }
+            }
         }
     }
 
