@@ -540,7 +540,7 @@ fn write_error<W: Write>(out: &mut W, err: ApiError, close: bool) -> std::io::Re
 fn read_head<R: BufRead, F: Fn() -> bool>(
     reader: &mut R,
     head: &mut String,
-    line: &mut Vec<u8>,
+    _line: &mut Vec<u8>,
     should_stop: &F,
     idle: Duration,
 ) -> Result<(), HeadError> {
@@ -553,13 +553,22 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
     let started_ns = super::clock::now_ns();
     let idle_ns = idle.as_nanos() as u64;
 
+    // 一次看住一整个缓冲，而不是逐行 `read_until` + `push_str`。
+    //
+    // 原来那套是**同一个字节走两遍**：`read_until` 从 `BufReader` 抄进
+    // `line: Vec<u8>`，再 `push_str` 抄进 `head`，中间还有每行一次
+    // `clear` + `ends_with` + `from_utf8`。这里改成在缓冲上直接扫
+    // `\r\n\r\n`，命中就整段 `extend`，一个字节只拷一次。
+    //
+    // 扫描窗口必须兼顾**跨缓冲段**的结束标记（上一段以 `\r\n\r` 收尾、
+    // 本段以 `\n` 开头），所以段首先只检查 head 尾 1..3 字节与本段首
+    // 1..3 字节的三种切分，再在段内扫。
     loop {
         if should_stop() {
             return Err(HeadError::Stopped);
         }
-        line.clear();
-        let n = match reader.read_until(b'\n', line) {
-            Ok(n) => n,
+        let buf = match reader.fill_buf() {
+            Ok(b) => b,
             Err(e) => match e.kind() {
                 // socket 设的读超时是轮询间隔（250ms），不是真正的超时；
                 // 真正超时由 elapsed 判定，这样才能在等待期间响应 shutdown。
@@ -573,28 +582,82 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
                 _ => return Err(HeadError::Eof),
             },
         };
-        if n == 0 {
+        if buf.is_empty() {
             return Err(HeadError::Eof);
         }
 
-        if !line.ends_with(b"\r\n") {
-            return Err(HeadError::Malformed(
-                "行必须以 CRLF 结尾（不接受裸 LF，否则会出现解析器差异）",
-            ));
-        }
-        let content = &line[..line.len() - 2];
-        if content.len() > MAX_REQUEST_LINE {
-            return Err(HeadError::TooLarge);
-        }
-        let s = std::str::from_utf8(content)
-            .map_err(|_| HeadError::Malformed("请求行/头部必须是 ASCII/UTF-8"))?;
+        let hlen = head.len();
+        // 上一行已经积了多少字节：从 head 尾往前找最近的 CRLF。反向搜，
+        // 几乎一两个字节就命中。
+        let mut row = match head.rfind("\r\n") {
+            Some(i) => hlen - (i + 2),
+            None => hlen,
+        };
+        let mut cut: Option<usize> = None;
 
-        head.push_str(s);
-        head.push_str("\r\n");
-        if head.len() > budget {
+        // 1) 结束标记跨段
+        if hlen > 0 {
+            let hb = head.as_bytes();
+            let mut k = 1usize;
+            while k <= 3 && k <= hlen {
+                let need = 4 - k;
+                if buf.len() >= need
+                    && hb[hlen - k..] == b"\r\n\r\n"[..k]
+                    && buf[..need] == b"\r\n\r\n"[k..]
+                {
+                    cut = Some(need);
+                    break;
+                }
+                k += 1;
+            }
+        }
+
+        // 2) 段内：找结束，同时校验裸 LF 与单行长度
+        if cut.is_none() {
+            let mut prev_cr = hlen > 0 && head.as_bytes()[hlen - 1] == b'\r';
+            let mut i = 0usize;
+            while i < buf.len() {
+                let c = buf[i];
+                if c == b'\r' {
+                    if i + 3 < buf.len()
+                        && buf[i + 1] == b'\n'
+                        && buf[i + 2] == b'\r'
+                        && buf[i + 3] == b'\n'
+                    {
+                        cut = Some(i + 4);
+                        break;
+                    }
+                    prev_cr = true;
+                    row += 1;
+                } else if c == b'\n' {
+                    if !prev_cr {
+                        return Err(HeadError::Malformed(
+                            "行必须以 CRLF 结尾（不接受裸 LF，否则会出现解析器差异）",
+                        ));
+                    }
+                    prev_cr = false;
+                    row = 0;
+                } else {
+                    prev_cr = false;
+                    row += 1;
+                    if row > MAX_REQUEST_LINE {
+                        return Err(HeadError::TooLarge);
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        let take = cut.unwrap_or(buf.len());
+        let seg = std::str::from_utf8(&buf[..take])
+            .map_err(|_| HeadError::Malformed("请求行/头部必须是 ASCII/UTF-8"))?;
+        if hlen + seg.len() > budget {
             return Err(HeadError::TooLarge);
         }
-        if s.is_empty() {
+        head.push_str(seg);
+        // `seg` 用完，buf 的借用到此结束，可以消费了。
+        reader.consume(take);
+        if cut.is_some() {
             return Ok(());
         }
     }
@@ -711,6 +774,81 @@ mod tests {
             read_head(&mut r, &mut head, &mut line, &stop, Duration::from_secs(5)),
             Err(HeadError::Stopped)
         ));
+    }
+
+    /// 每次 `fill_buf` 只吐 `step` 字节，逼出"结束标记跨缓冲段"那条路径。
+    struct Chunked {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+    }
+
+    impl std::io::Read for Chunked {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            let end = (self.pos + self.step).min(self.data.len());
+            let n = end - self.pos;
+            b[..n].copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Ok(n)
+        }
+    }
+
+    impl std::io::BufRead for Chunked {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            let end = (self.pos + self.step).min(self.data.len());
+            Ok(&self.data[self.pos..end])
+        }
+        fn consume(&mut self, n: usize) {
+            self.pos = (self.pos + n).min(self.data.len());
+        }
+    }
+
+    fn read_head_chunked(bytes: &[u8], step: usize) -> Result<String, HeadError> {
+        let mut r = Chunked {
+            data: bytes.to_vec(),
+            pos: 0,
+            step,
+        };
+        let mut head = String::new();
+        let mut line = Vec::new();
+        read_head(&mut r, &mut head, &mut line, &|| false, Duration::from_secs(5))?;
+        Ok(head)
+    }
+
+    #[test]
+    fn blank_line_spanning_buffer_fills() {
+        // step 取 1..3：`\r\n\r\n` 的每一种跨段切分都要走一遍
+        for step in 1..=3 {
+            let head =
+                read_head_chunked(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nBODY", step).unwrap();
+            assert_eq!(head, "GET / HTTP/1.1\r\nHost: a\r\n\r\n", "step={step}");
+        }
+    }
+
+    #[test]
+    fn bare_lf_spanning_buffer_fills_is_malformed() {
+        for step in 1..=3 {
+            assert!(
+                matches!(
+                    read_head_chunked(b"GET / HTTP/1.1\nX: 1\n\n", step),
+                    Err(HeadError::Malformed(_))
+                ),
+                "step={step}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_line_spanning_buffer_fills_is_too_large() {
+        let mut bytes = b"GET /".to_vec();
+        bytes.extend_from_slice(&vec![b'a'; MAX_REQUEST_LINE + 100]);
+        bytes.extend_from_slice(b"\r\n\r\n");
+        for step in 1..=3 {
+            assert!(
+                matches!(read_head_chunked(&bytes, step), Err(HeadError::TooLarge)),
+                "step={step}"
+            );
+        }
     }
 
     #[test]
