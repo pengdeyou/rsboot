@@ -259,6 +259,7 @@ so you never pay for what you do not use:
 | `rsboot-form` | `Form<T>` for `application/x-www-form-urlencoded` | `serde_urlencoded` |
 | `rsboot-static` | static files: ETag / 304 / single-range 206 / traversal guard / index | none |
 | `rsboot-view` | Smarty-style templates: `{$x}`, `{if}`, `{foreach}`, `{include}`, pipe modifiers | `serde_json` |
+| `rsboot-sse` | Server-Sent Events: `Event` framing (multi-line `data`, `id`/`event` sanitising) + configurable heartbeat, built on the core `ChunkSink` | none |
 
 ```rust,ignore
 use rsboot_ops as ops;
@@ -276,6 +277,45 @@ let r = Router::new()
 The core exposes just two generic hooks for them: `Headers::append` (a response may
 carry several `Set-Cookie` lines) and `web::stats` (a `fn(u16, u64)` observer that
 costs one atomic load when nothing is installed).
+
+### Streaming and chunked responses
+
+`Response` normally carries a materialised `body: Vec<u8>`. For a response whose size
+is only known while it is being produced, build it with `Response::stream` instead and
+write straight into the connection:
+
+```rust,ignore
+use rsboot::web::http::Status;
+use rsboot::web::response::Response;
+
+let r = Response::stream(Status::OK, |sink| {
+    sink.send(b"first\n")?;   // one chunk per send
+    sink.send(b"second\n")?;
+    Ok(())
+});
+```
+
+The write path switches to `transfer-encoding: chunked`, drops `content-length`, and
+never materialises the body into the output buffer — so the first byte leaves as soon
+as the handler calls `send`. HTTP/1.0 has no chunked encoding, so a stream there
+degrades to "write and close", with EOF delimiting the body.
+
+`rsboot-sse` wraps this into Server-Sent Events:
+
+```rust,ignore
+use rsboot_sse::{Event, Sse};
+
+let (tx, rx) = std::sync::mpsc::channel::<Event>();
+
+// send from any thread (a crawler, a DB change feed, another worker)
+tx.send(Event::new("tick"))?;
+
+let r = Sse::new().heartbeat(std::time::Duration::from_secs(15)).stream(rx);
+```
+
+The heartbeat is a `try_recv` + 50 ms coroutine-aware poll, not a blocking
+`recv_timeout`: an idle stream must yield the worker, not freeze it until the next
+event arrives.
 
 ### Static files
 
@@ -338,6 +378,9 @@ let r = Router::new().get("/orders", {
 | `{$x\|escape}` `\|raw` `\|upper` `\|lower` `\|trim` `\|default:"-"` `\|length` `\|truncate:20` `\|json` `\|join:", "` `\|nl2br` | modifiers, chainable |
 | `{include "x.tpl"}` / `{include file="x.tpl"}` | pull in a sub-template sharing the parent scope |
 | `{literal}...{/literal}` `{* ... *}` | verbatim output / comment |
+| `{extends "layout.tpl"}` | inherit a parent template; expanded at compile time, cycle-detected (`a → b → a`) |
+| `{block name="content"}...{/block}` | named overridable region; a child template's `block` replaces the parent's body |
+| `{assign var="x" value=$expr}` | write into the innermost scope |
 | `{myfunc a=$x}` | call a function registered with `Engine::func` |
 
 Two intentional differences from Smarty: **auto-escaping is on by default** (Smarty
@@ -409,12 +452,19 @@ fn main() -> rsboot::Result<()> {
 
 Stated plainly, because a framework that hides its gaps is worse than one that lists them:
 
-- SSE, WebSocket and JSON-RPC 2.0 are not implemented yet (planned as S11–S13)
+- WebSocket and JSON-RPC 2.0 are not implemented yet (planned as S12–S13)
 - gRPC is explicitly out of scope: it needs HTTP/2, which means pulling in `h2` and giving up the zero-runtime-dependency claim
 - Authentication stops at `Bearer` / `ApiKey` extractors — there is no full role/permission system
 - Coroutine stacks are a fixed 64 KB, so 10 k concurrent requests cost roughly 640 MB of stack memory
 - Client-side **connect** is still blocking; only reads/writes after connect yield
 - Reading request headers and bodies on the main path can still block a worker
+
+## Roadmap
+
+Where this is going — P0 chasing the remaining 3.3% against actix-web, P1 stability and
+soak testing, P2 capability crates, plus the list of things already measured and
+rejected — is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md). Performance numbers and
+the measurement protocol live in [`docs/perf-log.md`](docs/perf-log.md).
 
 ## License
 

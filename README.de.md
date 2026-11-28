@@ -14,7 +14,7 @@ Ein im Rust-Ökosystem beheimatetes Anwendungsframework — deklaratives Routing
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)
 
-**Status: Alpha (`0.1.0-alpha.1`).** Die Kernkette — HTTP, Routing, Extraktoren, einheitliche Antwort-Hülle, einheitliche Fehlerbehandlung, OpenAPI, Modul-Lebenszyklus, kontrolliertes Herunterfahren, Coroutine-Scheduling, Datenbank-Sockets — ist implementiert und durch Tests abgedeckt. SSE / WebSocket / JSON-RPC fehlen noch; siehe [Bekannte Einschränkungen](#bekannte-einschränkungen).
+**Status: Alpha (`0.1.0-alpha.1`).** Die Kernkette — HTTP, Routing, Extraktoren, einheitliche Antwort-Hülle, einheitliche Fehlerbehandlung, OpenAPI, Modul-Lebenszyklus, kontrolliertes Herunterfahren, Coroutine-Scheduling, Datenbank-Sockets — ist implementiert und durch Tests abgedeckt. WebSocket / JSON-RPC fehlen noch; siehe [Bekannte Einschränkungen](#bekannte-einschränkungen).
 
 `rsboot` ist das Anwendungsframework, [rsbatis](https://github.com/pengdeyou/rsbatis) ist das ORM. Getrennte Crates, getrennte Repositories, unabhängige Versionen.
 
@@ -147,12 +147,18 @@ fn main() -> rsboot::Result<()> {
 
 Klar benannt, denn ein Framework, das seine Lücken verbirgt, ist schlechter als eines, das sie auflistet:
 
-- SSE, WebSocket und JSON-RPC 2.0 sind noch nicht implementiert (geplant als S11–S13)
+- WebSocket und JSON-RPC 2.0 sind noch nicht implementiert (geplant als S12–S13)
 - gRPC ist bewusst außerhalb des Umfangs: Es benötigt HTTP/2, was `h2` in den Baum zieht und die Behauptung „keine Laufzeitabhängigkeiten“ aufgibt
 - Authentifizierung endet bei den Extraktoren `Bearer` / `ApiKey` — ein vollständiges Rollen- und Rechte-System fehlt
 - Coroutine-Stacks sind fest 64 KB, 10 000 gleichzeitige Anfragen kosten also rund 640 MB Stack-Speicher
 - Das **Verbinden** auf Client-Seite blockiert weiterhin; erst Lesen/Schreiben nach dem Verbindungsaufbau gibt frei
 - Das Lesen von Anfrage-Headern und -Bodies auf dem Hauptpfad kann einen Worker noch blockieren
+
+## Roadmap
+
+Alle nächsten Schritte — P0 (die restlichen 3,3 % gegenüber actix-web),
+P1 (Stabilität), P2 (neue Crates), plus die Liste der gemessen und verworfenen
+Experimente — stehen in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Lizenz
 

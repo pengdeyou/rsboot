@@ -14,7 +14,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)
 
-**状态：alpha（`0.1.0-alpha.1`）。** 核心链路——HTTP、路由、提取器、统一响应体、统一异常、OpenAPI、模块生命周期、优雅下线、协程调度、数据库 socket——已实现并有测试覆盖。SSE / WebSocket / JSON-RPC 尚未建设，见文末「已知限制」。
+**状态：alpha（`0.1.0-alpha.1`）。** 核心链路——HTTP、路由、提取器、统一响应体、统一异常、OpenAPI、模块生命周期、优雅下线、协程调度、数据库 socket——已实现并有测试覆盖。WebSocket / JSON-RPC 尚未建设，见文末「已知限制」。
 
 `rsboot` 是应用框架，[rsbatis](https://github.com/pengdeyou/rsbatis) 是 ORM。两者独立 crate、独立仓库、独立版本。
 
@@ -257,6 +257,7 @@ ApiError::upstream("第三方超时")       // 等价于 code = 5001
 | `rsboot-form` | `Form<T>`：`application/x-www-form-urlencoded` 提取器 | `serde_urlencoded` |
 | `rsboot-static` | 静态文件：ETag / 304 / 单区间 206 / 穿越防护 / index | 无 |
 | `rsboot-view` | Smarty 风格模板引擎：`{$x}`、`{if}`、`{foreach}`、`{include}`、管道修饰符 | `serde_json` |
+| `rsboot-sse` | Server-Sent Events：`Event` 编解码（多行 `data`、`id`/`event` 防拆帧）+ 可配心跳，基于核心 `ChunkSink` | 无 |
 
 ```rust,ignore
 use rsboot_ops as ops;
@@ -278,6 +279,40 @@ let r = Router::new()
 
 核心侧只留两个**通用**钩子给它们用：`Headers::append`（`Set-Cookie` 允许重名
 多条）和 `web::stats`（`fn(u16, u64)` 观察者，默认不装、装了才读时钟）。
+
+### 流式响应与 SSE
+
+`Response` 平时带的是物化好的 `body: Vec<u8>`。响应体大小要到生成时才知道的场合，
+改用 `Response::stream` 直接写进连接：
+
+```rust,ignore
+use rsboot::web::http::Status;
+use rsboot::web::response::Response;
+
+let r = Response::stream(Status::OK, |sink| {
+    sink.send(b"first\n")?;   // 每次 send 一块
+    sink.send(b"second\n")?;
+    Ok(())
+});
+```
+
+写回层会自动切到 `transfer-encoding: chunked`、去掉 `content-length`，
+而且不会把 body 物化进输出缓冲——handler 第一次 `send` 发生，字节就往外走。
+HTTP/1.0 没有 chunked，流式在那里降级为「写完即断」，靠 EOF 界定 body。
+
+`rsboot-sse` 把它包成 Server-Sent Events：
+
+```rust,ignore
+use rsboot_sse::{Event, Sse};
+
+let (tx, rx) = std::sync::mpsc::channel::<Event>();
+tx.send(Event::new("tick"))?;   // 任意线程都能发：抓取任务、数据库变更流、别的 worker
+
+let r = Sse::new().heartbeat(std::time::Duration::from_secs(15)).stream(rx);
+```
+
+心跳是 `try_recv` + 50 ms 的让出式轮询，不是阻塞的 `recv_timeout`：
+空转的流必须把 worker 让出来，而不是把它冻到下一个事件到来。
 
 ### 静态文件
 
@@ -337,6 +372,9 @@ let r = Router::new().get("/orders", {
 | `{$x\|escape}` `\|raw` `\|upper` `\|lower` `\|trim` `\|default:"-"` `\|length` `\|truncate:20` `\|json` `\|join:", "` `\|nl2br` | 修饰符，可链式 |
 | `{include "x.tpl"}` / `{include file="x.tpl"}` | 引入子模板，共享父作用域 |
 | `{literal}…{/literal}` `{* … *}` | 原样输出 / 注释 |
+| `{extends "layout.tpl"}` | 继承父模板，编译期展开；环形继承报 `a → b → a` |
+| `{block name="content"}…{/block}` | 具名可覆盖区；子模板的同名 block 替换父模板该区域 |
+| `{assign var="x" value=$expr}` | 写入最内层作用域 |
 | `{myfunc a=$x}` | 调 `Engine::func` 注册的函数 |
 
 两处与 Smarty 有意不同：**默认开自动转义**（Smarty 默认关），因为忘记
@@ -406,12 +444,18 @@ fn main() -> rsboot::Result<()> {
 
 如实列出，因为一个藏起短板的框架比一个写明短板的框架更糟：
 
-- SSE、WebSocket、JSON-RPC 2.0 尚未实现（规划中的 S11–S13）
+- WebSocket、JSON-RPC 2.0 尚未实现（规划中的 S12–S13）
 - gRPC 明确不做：它要 HTTP/2，等于把 `h2` 拉进来，与「零第三方运行时依赖」冲突
 - 认证只到 `Bearer` / `ApiKey` 两个提取器，没有完整的角色与权限体系
 - 协程栈固定 64 KB，1 万并发约需 640 MB 栈内存
 - 客户端**建连**仍是阻塞的，连接建立之后的读写才走协程
 - 主路径上读请求头与请求体仍可能阻塞 worker
+
+## 路线图
+
+下一步全部方向——P0 追平 actix-web 剩下的 3.3%、P1 稳定性与长跑、P2 能力补齐，
+以及「哪些已经测过、别再试」的清单——都记在 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+性能数字与测量协议见 [`docs/perf-log.md`](docs/perf-log.md)。
 
 ## 许可
 

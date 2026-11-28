@@ -14,7 +14,7 @@ Un framework applicatif natif de l'écosystème Rust — routage déclaratif à 
 
 [English](README.md) · [中文](README.zh-CN.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [العربية](README.ar.md) · [Русский](README.ru.md)
 
-**Statut : alpha (`0.1.0-alpha.1`).** La chaîne principale — HTTP, routage, extracteurs, enveloppe de réponse unifiée, gestion d'erreurs unifiée, OpenAPI, cycle de vie des modules, arrêt gracieux, ordonnancement des coroutines, sockets de base de données — est implémentée et couverte par des tests. SSE / WebSocket / JSON-RPC restent à faire ; voir [Limites connues](#limites-connues).
+**Statut : alpha (`0.1.0-alpha.1`).** La chaîne principale — HTTP, routage, extracteurs, enveloppe de réponse unifiée, gestion d'erreurs unifiée, OpenAPI, cycle de vie des modules, arrêt gracieux, ordonnancement des coroutines, sockets de base de données — est implémentée et couverte par des tests. WebSocket / JSON-RPC restent à faire ; voir [Limites connues](#limites-connues).
 
 `rsboot` est le framework applicatif, [rsbatis](https://github.com/pengdeyou/rsbatis) est l'ORM. Crates séparés, dépôts séparés, versions indépendantes.
 
@@ -147,12 +147,18 @@ fn main() -> rsboot::Result<()> {
 
 Énoncées clairement, car un framework qui cache ses manques vaut moins qu'un framework qui les liste :
 
-- SSE, WebSocket et JSON-RPC 2.0 ne sont pas encore implémentés (prévus en S11–S13)
+- WebSocket et JSON-RPC 2.0 ne sont pas encore implémentés (prévus en S12–S13)
 - gRPC est explicitement hors périmètre : il exige HTTP/2, donc tirer `h2` et renoncer à l'absence de dépendance de runtime
 - L'authentification s'arrête aux extracteurs `Bearer` / `ApiKey` — pas de système complet de rôles et permissions
 - Les piles de coroutines font 64 Ko fixes : 10 000 requêtes simultanées coûtent environ 640 Mo de piles
 - La **connexion** côté client reste bloquante ; seules les lectures/écritures après connexion cèdent le worker
 - La lecture des en-têtes et corps de requête sur le chemin principal peut encore bloquer un worker
+
+## Roadmap
+
+Toutes les prochaines étapes — P0 (les 3,3 % restants face à actix-web),
+P1 (stabilité), P2 (nouvelles crates), ainsi que la liste des expériences mesurées
+et rejetées — sont dans [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Licence
 
