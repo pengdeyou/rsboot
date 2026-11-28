@@ -3,13 +3,16 @@
 零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端全在仓库里。
 
 ```
-cargo test -p rsboot-claw          # 37 项（31 单测 + 5 e2e + 1 doctest）
+cargo test -p rsboot-claw          # 48 项（40 单测 + 7 e2e + 1 doctest）
 ```
 
 ## 快速开始
 
 ```rust
-use rsboot_claw::{follow_internal, Crawler};
+use std::sync::Arc;
+use rsboot_claw::{follow_internal, Crawler, JsonlSink};
+
+let sink = Arc::new(JsonlSink::create("pages.jsonl")?);   // 一行一页 JSON
 
 let stats = Crawler::new()
     .seed("http://127.0.0.1:9001/")
@@ -18,6 +21,8 @@ let stats = Crawler::new()
     .obey_robots(true)       // 读 robots.txt，遵守 Crawl-delay
     .delay(Duration::from_millis(200))
     .max_pages(1000)
+    .sitemap(true)           // 先抓 robots 的 Sitemap: + /sitemap.xml 当种子
+    .sink(sink.clone())      // 旁路落盘，和"下一步抓什么"解耦
     .run(|page| {
         println!("{} {} {}", page.status, page.url, page.title);
         follow_internal(page)     // 返回要跟进的地址
@@ -39,6 +44,7 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 | Downloader | `http.rs` | HTTP/1.1 GET、keep-alive 复用、重定向、chunked |
 | Parser | `html.rs` | 链接 / 标题 / 描述 / canonical / `<base>` / 可见文本 |
 | Policy | `robots.rs` | Allow / Disallow / Crawl-delay / Sitemap |
+| Pipeline | `pipeline.rs` | 结果旁路：`Sink` trait + `JsonlSink`（一行一页）+ `CollectSink` |
 | Item | `lib.rs` `Page` | 交给 handler 的结果 |
 
 ## 从哪些实现里 fork 了什么
@@ -46,7 +52,7 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 调研了 Rust 侧四个主流实现，**fork 的是架构而不是代码**：
 
 - [`spider`](https://github.com/spider-rs/spider)（MIT，Rust 生态最主流）：fork 它的 **frontier + robots + sitemap** 思路——按 host 组织队列、礼貌限速、robots 最长匹配。它是 tokio async，rsboot 是 thread-per-core + 栈协程，async 的调度器搬不过来。
-- [`spider-lib`](https://crates.io/crates/spider-lib)：fork 它的 **Scrapy 分层**（Scheduler / Middleware / Pipeline / Stats）和"checkpoint 可恢复"的设计取向。v0.1 只落了 Scheduler 与 Stats，Middleware/Pipeline 留到后面。
+- [`spider-lib`](https://crates.io/crates/spider-lib)：fork 它的 **Scrapy 分层**（Scheduler / Middleware / Pipeline / Stats）和"checkpoint 可恢复"的设计取向。v0.1 落了 Scheduler 与 Stats，v0.2 补上 Pipeline（`Sink`），Middleware 留到后面。
 - `kumo`：Scrapy-for-Rust 的另一条路线，参考它"用 trait 描述 Spider"的做法，但这里用闭包 `Fn(&Page)` 更贴近 rsboot 的 handler 风格。
 - `fastCRW`：只借了它的"结果即 `Page`"命名。
 
@@ -61,6 +67,8 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **keep-alive**：每个工作线程一个 `Client`，per-host 一条连接复用；复用到已被对端关掉的连接会自动重连一次（这是真实世界最常见的坑）。
 - **body 形态**：`Content-Length` / `chunked` / 读到 EOF 三种都支持，超过 `max_body_bytes` 直接报错而不是把内存吃光。
 - **HTML**：一趟扫描不建树，跳过 `<script>`/`<style>`/注释，解常见实体 + 数字实体。
+- **sitemap**：`.sitemap(true)` 先抓 `robots.txt` 的 `Sitemap:` 和 `/sitemap.xml`，把清单里的地址当种子；`sitemapindex` 往下走两层（真实站点很少更深，而"不限层数"等于把递归交给对面）。
+- **落盘**：`Sink` 是旁路——handler 决定"下一步抓什么"，sink 决定"抓到的往哪写"，两者生命周期不同。`JsonlSink` 写一行一页 JSON（`text` 截断 2000 字），手写转义而不引 `serde_json`。
 
 ## 明确不做
 
@@ -68,6 +76,7 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **gzip / brotli**：请求里发 `Accept-Encoding: identity`，服务端就不会压。
 - **JS 渲染**：不做 headless browser（那就是引 chromium 了）。
 - **分布式 / 断点续传**：`Frontier` 是内存里的，重启即从种子重来。需要持久化就把 `seen` 换成一个可写后端——`Frontier` 已经把"去重判定"和"调度"分开，替换点是明确的。
+- **`sitemap.xml.gz`**：解 gzip 要引库，遇到这种只能跳过（`.sitemap(true)` 静默忽略非 200 的分片）。
 - **cookie / 登录态**：需要的话在 handler 外面自己维护，v0.1 的 `Client` 没有 cookie jar。
 
 ## 和 rsboot 一起用
@@ -90,4 +99,4 @@ router.get("/crawl/start", |_, _| {
 
 - `url` / `html` / `robots` / `frontier`：纯逻辑单测，含等价写法去重、最长匹配、通配符、`$` 锚定、慢站不阻塞快站。
 - `http`：用真 `TcpListener` 起假服务器，覆盖 chunked、短读、keep-alive 复用、复用死连接重试、重定向成环、body 上限。
-- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、连不上时不挂死。
+- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、连不上时不挂死。

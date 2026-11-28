@@ -37,7 +37,9 @@
 pub mod frontier;
 pub mod html;
 pub mod http;
+pub mod pipeline;
 pub mod robots;
+pub mod sitemap;
 pub mod url;
 
 use std::collections::HashMap;
@@ -47,8 +49,10 @@ use std::time::{Duration, Instant};
 
 pub use frontier::{Frontier, Item, Pop, Push};
 pub use html::{scan, Document, Link};
+pub use pipeline::{JsonlSink, Sink};
 pub use http::Client;
 pub use robots::Robots;
+pub use sitemap::Sitemap;
 pub use url::Url;
 
 /// 一次抓取的全部结果。handler 拿到的就是这个。
@@ -95,6 +99,75 @@ impl Page {
     pub fn text(&self) -> &str {
         &self.doc.text
     }
+
+    /// 一行 JSON，给它做落盘/喂消息队列用。
+    ///
+    /// 手写而不是 derive：核心零依赖，`serde_json` 进不来；
+    /// 而这里只需要"把几个字段转义成合法 JSON"这一件事。
+    /// `text` 截断到 [`Self::JSON_TEXT_LIMIT`] 字符，正文整段塞进日志没有意义。
+    pub fn to_json(&self) -> String {
+        let mut s = String::with_capacity(256);
+        s.push_str("{\"url\":");
+        s.push_str(&json_string(&self.url.to_string()));
+        s.push_str(",\"status\":");
+        s.push_str(&self.status.to_string());
+        s.push_str(",\"depth\":");
+        s.push_str(&self.depth.to_string());
+        s.push_str(",\"title\":");
+        s.push_str(&json_string(&self.title));
+        s.push_str(",\"description\":");
+        s.push_str(&json_string(&self.description));
+        s.push_str(",\"canonical\":");
+        match &self.canonical {
+            Some(c) => s.push_str(&json_string(c)),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"links\":");
+        s.push_str(&self.doc.links.len().to_string());
+        s.push_str(",\"headings\":");
+        s.push_str(&self.doc.headings.len().to_string());
+        s.push_str(",\"text_len\":");
+        s.push_str(&self.doc.text.chars().count().to_string());
+        s.push_str(",\"bytes\":");
+        s.push_str(&self.body_len.to_string());
+        s.push_str(",\"ms\":");
+        s.push_str(&format!("{:.1}", self.elapsed.as_secs_f64() * 1000.0));
+        s.push_str(",\"text\":");
+        let text: String = self
+            .doc
+            .text
+            .chars()
+            .take(Self::JSON_TEXT_LIMIT)
+            .collect();
+        s.push_str(&json_string(&text));
+        s.push('}');
+        s
+    }
+
+    /// `to_json` 里 `text` 的截断长度。
+    pub const JSON_TEXT_LIMIT: usize = 2000;
+}
+
+/// 把一段文本转成 JSON 字符串字面量（含两端引号）。
+///
+/// 转义的是 JSON 规范要求的最小集合：`"` `\\` 和 0x00–0x1F。
+/// `/` 不转义（合法）、非 ASCII 不转（合法且省字节）。
+pub fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// 一次 `run` 的汇总。
@@ -154,6 +227,8 @@ pub struct Crawler {
     same_host_only: bool,
     timeout: Duration,
     max_body_bytes: usize,
+    sitemap: bool,
+    sink: Option<Arc<dyn Sink>>,
 }
 
 impl Crawler {
@@ -169,6 +244,8 @@ impl Crawler {
             same_host_only: true,
             timeout: Duration::from_secs(10),
             max_body_bytes: 4 * 1024 * 1024,
+            sitemap: false,
+            sink: None,
         }
     }
 
@@ -231,6 +308,22 @@ impl Crawler {
         self
     }
 
+    /// 开跑前先抓 `robots.txt` 里的 `Sitemap:` 与 `/sitemap.xml`，把清单里的
+    /// 地址当种子塞进队列（`sitemapindex` 会往下走两层）。
+    ///
+    /// 比爬链接快得多：一个 sitemap 就是站点自己给的全量清单。
+    pub fn sitemap(mut self, yes: bool) -> Self {
+        self.sitemap = yes;
+        self
+    }
+
+    /// 每抓完一页调一次。和 handler 的区别：sink 是"旁路"，拿不到返回的链接、
+    /// 也不影响调度；它用来落盘/打点，多个 worker 共享一个。
+    pub fn sink(mut self, s: Arc<dyn Sink>) -> Self {
+        self.sink = Some(s);
+        self
+    }
+
     /// 开跑。handler 在每个工作线程里被同步调用，返回要跟进的地址
     /// （相对地址按当前页面解析）。
     pub fn run<H>(self, handler: H) -> Stats
@@ -239,9 +332,28 @@ impl Crawler {
     {
         let start = Instant::now();
         let frontier = Arc::new(Mutex::new(Frontier::new(self.max_depth, self.delay)));
+
+        // sitemap 要在开跑**之前**抓完：它是种子级的输入，跑起来之后再抓
+        // 会让"种子为什么这么少"变得不可解释。
+        let extra_seeds = if self.sitemap {
+            self.seed_from_sitemaps()
+        } else {
+            Vec::new()
+        };
+
         {
             let now = Instant::now();
             let mut f = frontier.lock().unwrap();
+            for u in &extra_seeds {
+                f.push(
+                    Item {
+                        url: u.clone(),
+                        depth: 0,
+                        referer: Some("sitemap".to_string()),
+                    },
+                    now,
+                );
+            }
             for s in &self.seeds {
                 f.push(
                     Item {
@@ -308,6 +420,9 @@ impl Crawler {
                             Ok(r) => r,
                             Err(e) => {
                                 counters.lock().unwrap().note_error(&e);
+                                if let Some(sink) = &cfg.sink {
+                                    sink.on_error(&item.url, &e.to_string());
+                                }
                                 continue;
                             }
                         };
@@ -342,6 +457,9 @@ impl Crawler {
                             c.bytes += resp.body.len();
                         }
 
+                        if let Some(sink) = &cfg.sink {
+                            sink.on_page(&page);
+                        }
                         let next = handler(&page);
                         let now = Instant::now();
                         let mut f = frontier.lock().unwrap();
@@ -389,6 +507,69 @@ impl Crawler {
             },
             elapsed,
         }
+    }
+}
+
+impl Crawler {
+    /// 抓 `robots.txt` 的 `Sitemap:` + `/sitemap.xml`，展开成种子。
+    ///
+    /// `sitemapindex` 往下走两层：真实站点的分片基本不会更深，
+    /// 而"不限层数"等于把递归交给对面控制。
+    fn seed_from_sitemaps(&self) -> Vec<Url> {
+        let mut out = Vec::new();
+        let mut client = Client::new()
+            .user_agent(self.user_agent.clone())
+            .timeout(self.timeout)
+            .max_body_bytes(self.max_body_bytes);
+
+        for seed in &self.seeds {
+            let host = seed.host_header();
+            let mut queue: Vec<String> = Vec::new();
+
+            if let Some(u) = Url::parse(&format!("http://{host}/robots.txt")) {
+                if let Ok(r) = client.get(&u) {
+                    if r.status == 200 {
+                        queue.extend(Robots::parse(&r.text(), &self.user_agent).sitemaps);
+                    }
+                }
+            }
+            queue.push(format!("http://{host}/sitemap.xml"));
+
+            for _depth in 0..2 {
+                if queue.is_empty() {
+                    break;
+                }
+                let mut next = Vec::new();
+                for loc in std::mem::take(&mut queue) {
+                    let Some(u) = Url::parse(&loc) else { continue };
+                    let Ok(r) = client.get(&u) else { continue };
+                    if r.status != 200 {
+                        continue;
+                    }
+                    let sm = sitemap::parse(&r.text());
+                    if sm.is_index {
+                        next.extend(sm.locs());
+                    } else {
+                        for l in sm.locs() {
+                            if let Some(u) = Url::parse(&l) {
+                                out.push(u);
+                            }
+                        }
+                    }
+                }
+                queue = next;
+            }
+        }
+
+        if self.same_host_only {
+            let hosts: Vec<(String, u16)> = self
+                .seeds
+                .iter()
+                .map(|s| (s.host.clone(), s.real_port()))
+                .collect();
+            out.retain(|u| hosts.iter().any(|(h, p)| *h == u.host && *p == u.real_port()));
+        }
+        out
     }
 }
 

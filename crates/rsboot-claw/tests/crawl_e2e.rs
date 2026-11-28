@@ -23,8 +23,7 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-fn serve(router: Router) -> (String, Arc<AtomicBool>) {
-    let addr = format!("127.0.0.1:{}", free_port());
+fn serve_at(addr: String, router: Router) -> (String, Arc<AtomicBool>) {
     let stop = Arc::new(AtomicBool::new(false));
     let (s2, a2) = (Arc::clone(&stop), addr.clone());
     std::thread::spawn(move || {
@@ -55,7 +54,15 @@ fn serve(router: Router) -> (String, Arc<AtomicBool>) {
 /// `/b` 绕回首页（测回环去重）、`/private/x` 被 robots 禁止、
 /// 还有一个站外链接和一个 `mailto:`（都该被丢掉）。
 fn site() -> (String, Arc<AtomicBool>) {
-    let router = Router::new()
+    site_with_sitemap(false)
+}
+
+/// `with_sitemap` 时额外提供 `/sitemap.xml`，里面有 `/s1` `/s2` 两个
+/// **没有任何页面链到**的地址——正好验证"sitemap 能不能当种子用"。
+fn site_with_sitemap(with_sitemap: bool) -> (String, Arc<AtomicBool>) {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let a = addr.clone();
+    let mut router = Router::new()
         .get("/", |_, _| {
             Response::html(
                 r##"<html><head><title>首页</title>
@@ -95,7 +102,20 @@ fn site() -> (String, Arc<AtomicBool>) {
             Response::new(Status::FOUND).with_header("location", "/c")
         })
         .unwrap();
-    serve(router)
+    if with_sitemap {
+        router = router
+            .get("/sitemap.xml", move |_, _| {
+                Response::text(format!(
+                    r#"<urlset><url><loc>http://{a}/s1</loc></url><url><loc>http://{a}/s2</loc></url></urlset>"#
+                ))
+            })
+            .unwrap()
+            .get("/s1", |_, _| Response::text("s1"))
+            .unwrap()
+            .get("/s2", |_, _| Response::text("s2"))
+            .unwrap();
+    }
+    serve_at(addr, router)
 }
 
 #[test]
@@ -174,6 +194,47 @@ fn max_pages_stops_early() {
         .run(follow_internal);
     stop.store(true, Ordering::Relaxed);
     assert_eq!(stats.pages, 2, "{stats:?}");
+}
+
+#[test]
+fn sitemap_is_used_as_seeds() {
+    let (addr, stop) = site_with_sitemap(true);
+    // 首页一个链接都没有指向 /s1 /s2，所以这俩必须来自 sitemap
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(0) // 只抓种子：/ + sitemap 里的两条
+        .workers(2)
+        .sitemap(true)
+        .run(|_| Vec::new());
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(stats.pages, 3, "{stats:?}");
+    assert_eq!(stats.errors, 0, "{:?}", stats.error_kinds);
+}
+
+#[test]
+fn sink_gets_pages_and_errors() {
+    let (addr, stop) = site();
+    let dir = std::env::temp_dir().join(format!("claw-e2e-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("pages.jsonl");
+    let sink = std::sync::Arc::new(rsboot_claw::JsonlSink::create(&path).unwrap());
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(2)
+        .workers(2)
+        .sink(sink.clone())
+        .run(follow_internal);
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(sink.rows(), stats.pages, "每页一行，不该少");
+    let content = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), stats.pages);
+    assert!(lines[0].starts_with("{\"url\":"), "{:?}", lines[0]);
+    assert!(
+        lines.iter().any(|l| l.contains("\"title\":\"首页\"")),
+        "标题要落进 jsonl"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

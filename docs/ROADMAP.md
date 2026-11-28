@@ -16,7 +16,7 @@
 | 性能 | 4 worker / 客户端 4 线程 p16：rsboot 999.4k，actix-web 4 1033.2k，**落后 3.27%**，胜场 1:19 |
 | 流式 | `Response::stream` + `ChunkSink` + chunked 写回；HTTP/1.0 降级为"写完即断" |
 | 模板 | `{extends}` / `{block}` / `{assign}` / `{if}` / `{foreach}`，编译期展开继承 |
-| 测试 | `cargo test --workspace` 364 passed |
+| 测试 | `cargo test --workspace` 415 passed |
 
 任何性能项必须走 `ab5.sh` 两批反序（AB / BA 各 10 轮 × 8s），噪声底 **±0.35%**；单批同向才算收益，两批反向即噪声。
 
@@ -166,8 +166,9 @@ v0.1 的定位是"能独立跑起来、礼貌、可测"，架构 fork Scrapy 的
 - [x] `robots`（RFC 9309）：最长匹配、等长 Allow 胜、`*` 通配与 `$` 锚定、按 UA 前缀选组
 - [x] `Crawler`：`std::thread::scope` 多 worker 抢一把 `Mutex<Frontier>`，handler 同步调用，`Stats` 汇总（页数/字节/错误分类/robots 拦截/去重/超深）
 - [x] e2e：用 rsboot 自己起站点再爬它（robots 拦截、重定向归属、回环去重、`max_pages`、连不上不挂死）
-- [ ] v0.2 Middleware / Pipeline：请求前改写（UA 轮换、代理、重试策略）与结果后处理（去重入库、字段抽取）
-- [ ] v0.2 `sitemap.xml`：解析 `<urlset>` / `<sitemapindex>`，作为种子批量入队（`Robots::sitemaps` 已经解析出来，还没用上）
+- [x] v0.2 `sitemap.xml`：`sitemap::parse` 解 `<urlset>` / `<sitemapindex>`；`.sitemap(true)` 把 robots 的 `Sitemap:` + `/sitemap.xml` 当种子，index 往下两层；`.xml.gz` 不支持（解 gzip 要引库）
+- [x] v0.2 Pipeline：`Sink` trait（`on_page` / `on_error`）+ `JsonlSink`（一行一页，手写 JSON 转义）+ `CollectSink`；`Crawler::sink(Arc<dyn Sink>)` 走旁路，不影响调度
+- [ ] v0.2 Middleware：请求前改写（UA 轮换 / 代理 / 重试策略）——Scrapy 分层里唯一还没落的一层
 - [ ] v0.2 checkpoint：`seen` 集合落盘（换掉内存 `HashSet`），支持中断续爬
 - [ ] v0.2 HTTPS：作为**可选 feature**（`tls`，引 rustls），默认关闭以守住零依赖；不做就在 `Error::UnsupportedScheme` 上让调用方决定
 - 不做：JS 渲染（要 headless browser）、gzip 解压（请求侧直接 `identity`）、分布式调度（单机爬虫不做分布式协调）
