@@ -3,14 +3,14 @@
 零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端全在仓库里。
 
 ```
-cargo test -p rsboot-claw          # 56 项（46 单测 + 9 e2e + 1 doctest）
+cargo test -p rsboot-claw          # 61 项（50 单测 + 10 e2e + 1 doctest）
 ```
 
 ## 快速开始
 
 ```rust
 use std::sync::Arc;
-use rsboot_claw::{follow_internal, Crawler, JsonlSink, RetryPolicy, RotateUserAgent};
+use rsboot_claw::{follow_internal, Crawler, JsonlSink, Proxy, RetryPolicy, RotateUserAgent};
 
 let sink = Arc::new(JsonlSink::create("pages.jsonl")?);   // 一行一页 JSON
 
@@ -25,7 +25,9 @@ let stats = Crawler::new()
     .sink(sink.clone())      // 旁路落盘，和"下一步抓什么"解耦
     .retry_backoff(Duration::from_millis(200))
     .middleware(Arc::new(RetryPolicy::new().retries(2)))     // 5xx/429/网络错误重试
-    .middleware(Arc::new(RotateUserAgent::new(["claw/1", "claw/2"])))
+    .middleware(Arc::new(RotateUserAgent::new(["claw/1", "claw/2")))
+    .checkpoint("crawl.wal")          // 断了接着爬：中断时队列里没抓的在里面
+    // .proxy(Proxy::parse("http://user:pass@10.0.0.1:3128"))
     .run(|page| {
         println!("{} {} {}", page.status, page.url, page.title);
         follow_internal(page)     // 返回要跟进的地址
@@ -72,6 +74,8 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **body 形态**：`Content-Length` / `chunked` / 读到 EOF 三种都支持，超过 `max_body_bytes` 直接报错而不是把内存吃光。
 - **HTML**：一趟扫描不建树，跳过 `<script>`/`<style>`/注释，解常见实体 + 数字实体。
 - **sitemap**：`.sitemap(true)` 先抓 `robots.txt` 的 `Sitemap:` 和 `/sitemap.xml`，把清单里的地址当种子；`sitemapindex` 往下走两层（真实站点很少更深，而"不限层数"等于把递归交给对面）。
+- **代理**：明文 http 代理（absolute-form 请求行），带凭据就直接带 `Proxy-Authorization: Basic …`，不吃"先 407 再重试"那一趟。池的键带代理地址，换代理不会复用旧连接。
+- **断点续爬**：`.checkpoint("crawl.wal")` 把队列写成 WAL（`+ 深度 key` 入队、`- key` 抓完）。恢复时 `seen` 取所有 `+`、待抓取"有 `+` 无 `-`"的按原序重放。只记 `seen` 是不够的——中断时队列里"已入队没抓"的 URL 会丢，恢复后从种子重来还会因为种子在 `seen` 里直接空队列。
 - **中间件**：三个钩子 `before` / `after` / `on_error`，返回 `Continue` / `Retry` / `Skip`。多个按注册顺序串联——任一 `Skip` 短路、任一 `Retry` 重试，重试次数有硬上限 5（中间件写错也拖不死 worker）。退避由 `Crawler::retry_backoff` 统一控制，中间件只决定"要不要再试一次"，两处都配会打架。
 - **落盘**：`Sink` 是旁路——handler 决定"下一步抓什么"，sink 决定"抓到的往哪写"，两者生命周期不同。`JsonlSink` 写一行一页 JSON（`text` 截断 2000 字），手写转义而不引 `serde_json`。
 
@@ -80,9 +84,9 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **HTTPS**：要 TLS 就得引 `rustls`/`native-tls`，和零依赖冲突。`https://` 会返回 `Error::UnsupportedScheme`，调用方自己决定跳过还是报错。真需要 HTTPS，在这个 crate 外面套一层支持 TLS 的 Downloader 即可——`Client` 的接口只有一个 `get(&Url) -> Result<Response>`。
 - **gzip / brotli**：请求里发 `Accept-Encoding: identity`，服务端就不会压。
 - **JS 渲染**：不做 headless browser（那就是引 chromium 了）。
-- **分布式 / 断点续传**：`Frontier` 是内存里的，重启即从种子重来。需要持久化就把 `seen` 换成一个可写后端——`Frontier` 已经把"去重判定"和"调度"分开，替换点是明确的。
+- **分布式调度**：单机爬虫，不做跨机器的 URL 分配和去重共识。断点续爬是单机维度的（见上），两件事别混。
 - **`sitemap.xml.gz`**：解 gzip 要引库，遇到这种只能跳过（`.sitemap(true)` 静默忽略非 200 的分片）。
-- **代理**：HTTP 代理要么 `CONNECT` 隧道、要么把请求行改成绝对 URI，还要处理 `407`；这是连接层的事，`Middleware` 只能改头改不了连接目标。需要就走"在 `Client` 外面套一层"的路。
+- **`CONNECT` 隧道（https 代理）**：那是给 TLS 用的，claw 不做 TLS，所以只支持明文 http 代理。
 - **cookie / 登录态**：需要的话在 handler 外面自己维护，v0.1 的 `Client` 没有 cookie jar。
 
 ## 和 rsboot 一起用
@@ -105,4 +109,4 @@ router.get("/crawl/start", |_, _| {
 
 - `url` / `html` / `robots` / `frontier`：纯逻辑单测，含等价写法去重、最长匹配、通配符、`$` 锚定、慢站不阻塞快站。
 - `http`：用真 `TcpListener` 起假服务器，覆盖 chunked、短读、keep-alive 复用、复用死连接重试、重定向成环、body 上限。
-- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、连不上时不挂死。
+- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、断点续爬（中断 → 恢复 → 再跑一遍应零抓取）、连不上时不挂死。

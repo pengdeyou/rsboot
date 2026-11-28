@@ -111,6 +111,81 @@ impl Response {
     }
 }
 
+/// HTTP 代理。
+///
+/// 只支持**明文 http 代理**（请求行用绝对 URI 的那种），这是最简单也最通用
+/// 的形态：连到代理、把 `GET http://target/path HTTP/1.1` 发过去。不做
+/// `CONNECT` 隧道——那是给 https 用的，而 claw 本来就不做 TLS。
+///
+/// 带凭据时直接在每个请求里带 `Proxy-Authorization: Basic …`，而不是
+/// 先吃一个 `407` 再重试：多一次往返省不下什么，代码还多一条分支。
+#[derive(Debug, Clone)]
+pub struct Proxy {
+    pub host: String,
+    pub port: u16,
+    /// `Basic base64(user:pass)`，没凭据是 `None`
+    auth: Option<String>,
+}
+
+impl Proxy {
+    /// 解析 `http://host:port` 或 `http://user:pass@host:port`。
+    pub fn parse(spec: &str) -> Option<Self> {
+        let spec = spec.trim();
+        let rest = spec
+            .strip_prefix("http://")
+            .or_else(|| spec.strip_prefix("https://"))
+            .unwrap_or(spec);
+        let (userinfo, hostport) = match rest.rsplit_once('@') {
+            Some((u, h)) => (Some(u), h),
+            None => (None, rest),
+        };
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+            None => (hostport.to_string(), 8080),
+        };
+        if host.is_empty() {
+            return None;
+        }
+        let auth = userinfo.map(|u| format!("Basic {}", base64(u.as_bytes())));
+        Some(Self {
+            host,
+            port,
+            auth,
+        })
+    }
+
+    pub fn addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+/// 标准 base64（RFC 4648），只为 `Proxy-Authorization` 服务。
+fn base64(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len() * 4 / 3 + 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// 一个线程一个 `Client`，内含 per-host 的 keep-alive 连接。
 pub struct Client {
     user_agent: String,
@@ -120,6 +195,7 @@ pub struct Client {
     pool: HashMap<String, BufReader<TcpStream>>,
     /// 累计建立的连接数，用来确认 keep-alive 真的生效了
     connects: usize,
+    proxy: Option<Proxy>,
 }
 
 impl Client {
@@ -131,7 +207,15 @@ impl Client {
             max_body: 8 * 1024 * 1024,
             pool: HashMap::new(),
             connects: 0,
+            proxy: None,
         }
+    }
+
+    /// 走代理。传 `None` 等于直连。
+    pub fn proxy(mut self, p: Option<Proxy>) -> Self {
+        self.proxy = p;
+        self.pool.clear(); // 旧池里的连接是直连的，换目标就作废
+        self
     }
 
     pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
@@ -188,7 +272,7 @@ impl Client {
         if url.scheme != "http" {
             return Err(Error::UnsupportedScheme(url.scheme.clone()));
         }
-        let key = url.host_header();
+        let key = self.pool_key(url);
         let pooled = self.pool.remove(&key);
         let reused = pooled.is_some();
         let mut reader = match pooled {
@@ -226,11 +310,23 @@ impl Client {
     }
 
     fn drop_pool(&mut self, url: &Url) {
-        self.pool.remove(&url.host_header());
+        let key = self.pool_key(url);
+        self.pool.remove(&key);
+    }
+
+    /// 池的键：有代理时还要带上代理地址——不然换了代理会复用旧连接。
+    fn pool_key(&self, url: &Url) -> String {
+        match &self.proxy {
+            Some(p) => format!("{}|{}", p.addr(), url.host_header()),
+            None => url.host_header(),
+        }
     }
 
     fn connect(&mut self, url: &Url) -> Result<BufReader<TcpStream>> {
-        let addr = format!("{}:{}", url.host, url.real_port());
+        let addr = match &self.proxy {
+            Some(p) => p.addr(),
+            None => format!("{}:{}", url.host, url.real_port()),
+        };
         let addrs: Vec<_> = addr
             .to_socket_addrs()
             .map_err(|e| Error::Connect(format!("{addr}: {e}")))?
@@ -283,11 +379,23 @@ impl Client {
             extra_lines.push_str(v);
             extra_lines.push_str("\r\n");
         }
+        // 直连用 origin-form（`/path`），走代理用 absolute-form（`http://host/path`）
+        let target = match &self.proxy {
+            Some(_) => url.to_string(),
+            None => url.request_target(),
+        };
+        let proxy_auth = self
+            .proxy
+            .as_ref()
+            .and_then(|p| p.auth.as_ref())
+            .map(|a| format!("Proxy-Authorization: {a}\r\n"))
+            .unwrap_or_default();
         let req = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Encoding: identity\r\n{}Connection: keep-alive\r\n\r\n",
-            url.request_target(),
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Encoding: identity\r\n{}{}Connection: keep-alive\r\n\r\n",
+            target,
             url.host_header(),
             ua,
+            proxy_auth,
             extra_lines
         );
         {
@@ -600,6 +708,63 @@ mod tests {
         let mut c = Client::new();
         let extra = vec![("X-Bad".to_string(), "a\r\nX-Evil: 1".to_string())];
         assert_eq!(c.get_with(&url(&addr, "/"), &extra).unwrap().text(), "clean");
+    }
+
+    #[test]
+    fn base64_matches_rfc4648() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"a"), "YQ==");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b"abc"), "YWJj");
+        assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn proxy_spec_parsing() {
+        let p = Proxy::parse("http://127.0.0.1:8888").unwrap();
+        assert_eq!(p.addr(), "127.0.0.1:8888");
+        assert!(p.auth.is_none());
+        let q = Proxy::parse("http://u:p@proxy.local:3128").unwrap();
+        assert_eq!(q.addr(), "proxy.local:3128");
+        assert_eq!(q.auth.as_deref(), Some("Basic dTpw"));
+        assert_eq!(Proxy::parse("proxy.local").unwrap().port, 8080, "缺端口按 8080");
+        assert!(Proxy::parse("").is_none());
+    }
+
+    #[test]
+    fn proxied_request_uses_absolute_uri_and_auth() {
+        use std::sync::{Arc, Mutex};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let s2 = seen.clone();
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut req = String::new();
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap() == 0 || line.trim_end().is_empty() {
+                        break;
+                    }
+                    req.push_str(&line);
+                }
+                *s2.lock().unwrap() = req;
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        let mut c = Client::new().proxy(Some(Proxy::parse(&format!("http://u:p@{addr}")).unwrap()));
+        let u = Url::parse("http://example.invalid/path?q=1").unwrap();
+        assert_eq!(c.get(&u).unwrap().text(), "ok");
+        let req = seen.lock().unwrap().clone();
+        assert!(
+            req.starts_with("GET http://example.invalid/path?q=1 HTTP/1.1"),
+            "走代理必须用 absolute-form：{req}"
+        );
+        assert!(req.contains("Host: example.invalid"), "{req}");
+        assert!(req.contains("Proxy-Authorization: Basic dTpw"), "{req}");
     }
 
     #[test]

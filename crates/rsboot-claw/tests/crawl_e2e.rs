@@ -342,6 +342,51 @@ fn sink_gets_pages_and_errors() {
 }
 
 #[test]
+fn checkpoint_resumes_after_interruption() {
+    let (addr, stop) = site();
+    let dir = std::env::temp_dir().join(format!("claw-wal-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let wal = dir.join("crawl.wal");
+    let _ = std::fs::remove_file(&wal);
+    let seed = format!("http://{addr}/");
+
+    // 第一次只抓 2 页就"停机"
+    let first = Crawler::new()
+        .seed(&seed)
+        .max_depth(3)
+        .workers(2)
+        .max_pages(2)
+        .checkpoint(&wal)
+        .run(follow_internal);
+    assert_eq!(first.pages, 2, "{first:?}");
+
+    // 第二次用同一个 WAL：上一轮已入队没抓完的必须回来
+    let second = Crawler::new()
+        .seed(&seed)
+        .max_depth(3)
+        .workers(2)
+        .checkpoint(&wal)
+        .run(follow_internal);
+    assert!(second.resumed > 0, "应当恢复出待抓的条目：{second:?}");
+    assert!(second.pages >= 1, "{second:?}");
+
+    // 第三次：全抓过了，一页都不该再抓
+    let third = Crawler::new()
+        .seed(&seed)
+        .max_depth(3)
+        .workers(2)
+        .checkpoint(&wal)
+        .run(follow_internal);
+    assert_eq!(third.pages, 0, "断点日志应当把见过的都挡住：{third:?}");
+    assert_eq!(third.errors, 0);
+
+    let wal_text = std::fs::read_to_string(&wal).unwrap();
+    assert!(wal_text.lines().any(|l| l.starts_with("+ ")), "WAL 里要能直接看到进度");
+    let _ = std::fs::remove_dir_all(&dir);
+    stop.store(true, Ordering::Relaxed);
+}
+
+#[test]
 fn unreachable_host_is_an_error_not_a_hang() {
     let port = free_port();
     let stats = Crawler::new()

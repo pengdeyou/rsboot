@@ -10,6 +10,9 @@
 //! 只有在**所有**站都没到点时才真睡。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::url::Url;
@@ -50,6 +53,69 @@ struct Bucket {
     delay: Option<Duration>,
 }
 
+/// 断点日志（WAL）。
+///
+/// 只记两种事件：`+ <depth> <key>`（入队）和 `- <key>`（抓完）。恢复时
+/// `seen` 取所有 `+`，`pending` 取"有 `+` 没有 `-`"的那些，按原顺序重放。
+///
+/// 为什么记两行而不是只记去重集合：只记 `seen` 的话，中断时队列里
+/// 那些"已入队但没抓"的 URL 就丢了——恢复后从种子重新开始，如果种子在
+/// `seen` 里，队列直接空掉，等于白爬。
+struct Journal {
+    file: File,
+}
+
+/// 回放结果：`(seen, pending)`。pending 保持日志里的入队顺序。
+type Replayed = (HashSet<String>, Vec<(u32, String)>);
+
+impl Journal {
+    fn open_append(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: OpenOptions::new().create(true).append(true).open(path)?,
+        })
+    }
+
+    fn load(path: &Path) -> std::io::Result<Replayed> {
+        let mut seen = HashSet::new();
+        let mut pending: Vec<(u32, String)> = Vec::new();
+        match File::open(path) {
+            Ok(f) => {
+                for line in BufReader::new(f).lines() {
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(_) => continue, // 中断时最后一行可能是半截的
+                    };
+                    let mut it = line.splitn(3, ' ');
+                    match (it.next(), it.next(), it.next()) {
+                        (Some("+"), Some(depth), Some(key)) => {
+                            if let Ok(d) = depth.parse::<u32>() {
+                                if seen.insert(key.to_string()) {
+                                    pending.push((d, key.to_string()));
+                                }
+                            }
+                        }
+                        (Some("-"), Some(key), None) => {
+                            pending.retain(|(_, k)| k != key);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok((seen, pending))
+    }
+
+    fn note_pushed(&mut self, depth: u32, key: &str) {
+        let _ = writeln!(self.file, "+ {depth} {key}");
+    }
+
+    fn note_done(&mut self, key: &str) {
+        let _ = writeln!(self.file, "- {key}");
+    }
+}
+
 /// 见 `module docs`。
 pub struct Frontier {
     buckets: HashMap<Box<str>, Bucket>,
@@ -61,6 +127,7 @@ pub struct Frontier {
     len: usize,
     dup: usize,
     too_deep: usize,
+    journal: Option<Journal>,
 }
 
 impl Frontier {
@@ -74,6 +141,55 @@ impl Frontier {
             len: 0,
             dup: 0,
             too_deep: 0,
+            journal: None,
+        }
+    }
+
+    /// 从断点日志恢复。返回 `(队列, 恢复出的待抓条数)`。
+    ///
+    /// 日志不存在等于从头开始；存在则 `seen` 与 `pending` 都按日志重建，
+    /// 之后的行为和"没中断过"一致（继续写日志、继续去重）。
+    pub fn resume(
+        path: impl AsRef<Path>,
+        max_depth: u32,
+        delay: Option<Duration>,
+    ) -> std::io::Result<(Self, usize)> {
+        let path = path.as_ref();
+        let (seen, pending) = Journal::load(path)?;
+        let n = pending.len();
+        let now = Instant::now();
+        let mut f = Self {
+            seen: seen.into_iter().map(|k| k.into_boxed_str()).collect(),
+            journal: Some(Journal::open_append(path)?),
+            ..Self::new(max_depth, delay)
+        };
+        for (depth, key) in pending {
+            if let Some(url) = Url::parse(&key) {
+                f.push_restored(
+                    Item {
+                        url,
+                        depth,
+                        referer: Some("checkpoint".to_string()),
+                    },
+                    now,
+                );
+            }
+        }
+        Ok((f, n))
+    }
+
+    /// 恢复专用：跳过 `seen` 检查（`seen` 已经包含它了）。
+    fn push_restored(&mut self, item: Item, now: Instant) {
+        let host: Box<str> = item.url.host_header().into_boxed_str();
+        let b = self.buckets.entry(host.clone()).or_insert_with(|| Bucket {
+            items: VecDeque::new(),
+            next_at: now,
+            delay: None,
+        });
+        b.items.push_back(item);
+        self.len += 1;
+        if !self.ready.contains(&host) {
+            self.ready.push_back(host);
         }
     }
 
@@ -83,7 +199,8 @@ impl Frontier {
             self.too_deep += 1;
             return Push::TooDeep;
         }
-        let key: Box<str> = item.url.key().into_boxed_str();
+        let key_str = item.url.key();
+        let key: Box<str> = key_str.clone().into_boxed_str();
         if !self.seen.insert(key) {
             self.dup += 1;
             return Push::Duplicate;
@@ -94,6 +211,9 @@ impl Frontier {
             next_at: now, // 新站立刻可抓
             delay: None,
         });
+        if let Some(j) = &mut self.journal {
+            j.note_pushed(item.depth, &key_str);
+        }
         b.items.push_back(item);
         self.len += 1;
         // 冷却中的站也排进 ready：`pop` 会检查时间并跳过，靠"只在能抓时重复排"
@@ -130,6 +250,9 @@ impl Frontier {
                 Some(i) => i,
                 None => continue,
             };
+            if let Some(j) = &mut self.journal {
+                j.note_done(&item.url.key());
+            }
             bucket.next_at = now + bucket.delay.or(self.delay).unwrap_or_default();
             if !bucket.items.is_empty() {
                 self.ready.push_back(host);
@@ -262,6 +385,38 @@ mod tests {
             Pop::Ready(it) => assert_eq!(it.url.host, "slow.com"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_replays_only_unfinished() {
+        let dir = std::env::temp_dir().join(format!("claw-fr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("journal");
+        let _ = std::fs::remove_file(&path);
+        let now = Instant::now();
+        {
+            let (mut f, n) = Frontier::resume(&path, 5, None).unwrap();
+            assert_eq!(n, 0, "没有日志就是从头开始");
+            f.push(item("http://a.com/1", 0), now);
+            f.push(item("http://a.com/2", 0), now);
+            match f.pop(now) {
+                Pop::Ready(it) => assert_eq!(it.url.path, "/1"),
+                other => panic!("{other:?}"),
+            }
+        } // 模拟进程退出（队列丢了）
+
+        let (mut f, n) = Frontier::resume(&path, 5, None).unwrap();
+        assert_eq!(n, 1, "只该恢复没抓完的那条");
+        assert_eq!(f.len(), 1);
+        assert!(
+            f.has_seen(&Url::parse("http://a.com/1").unwrap()),
+            "抓过的不能在恢复后又抓一遍"
+        );
+        match f.pop(Instant::now()) {
+            Pop::Ready(it) => assert_eq!(it.url.path, "/2"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub mod sitemap;
 pub mod url;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -190,6 +191,8 @@ pub struct Stats {
     pub retries: usize,
     /// 中间件要求跳过的页数
     pub skipped: usize,
+    /// 从断点日志恢复出的待抓条数（没开 checkpoint 就是 0）
+    pub resumed: usize,
     /// 网络错误详情（每类一条，最多 32 条）
     pub error_kinds: Vec<String>,
     pub elapsed: Duration,
@@ -239,6 +242,7 @@ pub struct Crawler {
     sink: Option<Arc<dyn Sink>>,
     middlewares: Vec<Arc<dyn Middleware>>,
     retry_backoff: Duration,
+    checkpoint: Option<PathBuf>,
 }
 
 impl Crawler {
@@ -258,6 +262,7 @@ impl Crawler {
             sink: None,
             middlewares: Vec::new(),
             retry_backoff: Duration::from_millis(200),
+            checkpoint: None,
         }
     }
 
@@ -344,6 +349,15 @@ impl Crawler {
         self
     }
 
+    /// 开断点续爬：把队列写进一个 WAL 文件（`+ 深度 key` 入队、`- key` 抓完）。
+    ///
+    /// 下次用同一个文件启动，未抓完的 URL 会自动回到队列，抓过的不会重抓。
+    /// 日志是追加写的纯文本，一行一条，可以直接 `grep` 看进度。
+    pub fn checkpoint(mut self, path: impl Into<PathBuf>) -> Self {
+        self.checkpoint = Some(path.into());
+        self
+    }
+
     /// 重试的退避基数：第 n 次重试前睡 `n * base`（线性，不做指数——
     /// 爬虫的重试窗口本来就短，指数退避只会让一次抓取拖到超时）。
     pub fn retry_backoff(mut self, d: Duration) -> Self {
@@ -358,7 +372,20 @@ impl Crawler {
         H: Fn(&Page) -> Vec<String> + Sync,
     {
         let start = Instant::now();
-        let frontier = Arc::new(Mutex::new(Frontier::new(self.max_depth, self.delay)));
+        let (frontier, resumed) = match &self.checkpoint {
+            Some(path) => match Frontier::resume(path, self.max_depth, self.delay) {
+                Ok((f, n)) => (Arc::new(Mutex::new(f)), n),
+                // 日志读不出来（权限/损坏）不该让整次抓取失败：退回"从头开始"
+                Err(_) => (
+                    Arc::new(Mutex::new(Frontier::new(self.max_depth, self.delay))),
+                    0,
+                ),
+            },
+            None => (
+                Arc::new(Mutex::new(Frontier::new(self.max_depth, self.delay))),
+                0,
+            ),
+        };
 
         // sitemap 要在开跑**之前**抓完：它是种子级的输入，跑起来之后再抓
         // 会让"种子为什么这么少"变得不可解释。
@@ -589,6 +616,7 @@ impl Crawler {
             too_deep: deep,
             retries: c.retries,
             skipped: c.skipped,
+            resumed,
             error_kinds: c.error_kinds,
             pages_per_sec: if elapsed.as_secs_f64() > 0.0 {
                 c.pages as f64 / elapsed.as_secs_f64()
