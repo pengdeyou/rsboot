@@ -59,6 +59,18 @@ impl ApiError {
         e
     }
 
+    /// 补上定位（`422` 的 `loc`）并把 `kind` 记为 `value_error`。
+    ///
+    /// 给核心之外的提取器（如 `rsboot-form` 的 `Form`）用：它们负责解析，
+    /// 但错误体的形状交给 `ApiError`，不必自己拼 `loc`。
+    pub fn at(mut self, where_: &str, name: &str) -> Self {
+        self.loc = Some((where_.to_string(), name.to_string()));
+        if self.kind.is_none() {
+            self.kind = Some("value_error".to_string());
+        }
+        self
+    }
+
     /// 服务异常（`500` + `5000`）：逻辑 bug、依赖挂掉这类"服务端自己的问题"。
     pub fn service(detail: impl Into<String>) -> Self {
         Self::with_code(crate::web::code::INTERNAL, detail)

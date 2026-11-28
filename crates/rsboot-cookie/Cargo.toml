@@ -1,0 +1,11 @@
+[package]
+name = "rsboot-cookie"
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Cookie reading and Set-Cookie writing for rsboot."
+repository = "https://github.com/pengdeyou/rsboot"
+
+[dependencies]
+rsboot = { path = "../.." }

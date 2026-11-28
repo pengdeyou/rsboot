@@ -208,6 +208,21 @@ impl<'a> Headers<'a> {
         true
     }
 
+    /// 追加一条同名头，**不替换**已有的（`set-cookie` 允许出现多次）。
+    ///
+    /// `insert` 是"一个名字一个值"的语义，`set-cookie` 是唯一的例外：
+    /// 一个响应带两条 `Set-Cookie` 必须两条都在，用 `insert` 会把前一条冲掉。
+    pub fn append(&mut self, name: &str, value: &str) -> bool {
+        if !is_token(name) || has_crlf(value) {
+            return false;
+        }
+        self.items.push(Hdr {
+            name: Name::Owned(name.to_ascii_lowercase()),
+            value: Val::Owned(value.to_string()),
+        });
+        true
+    }
+
     /// 名字与值都是编译期常量：**零分配**写入。
     ///
     /// 响应头里的 `content-type`、`allow`、`retry-after` 这类全是静态的，

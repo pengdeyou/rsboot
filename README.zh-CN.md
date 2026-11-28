@@ -245,6 +245,38 @@ ApiError::upstream("第三方超时")       // 等价于 code = 5001
 
 **协议层的早失败走同一套形状**。400（畸形请求）、413（body 超限）、414（请求行过长）、431（头部过大）、501（未知方法）、505（版本不支持）都由解析器直接拒绝，响应体同样是 `{"code":<码>,"message":"..."}` 并带 `connection: close`——客户端不需要为"还没进 handler 的错误"准备第二套解析。
 
+## 扩展模块
+
+核心只放协议、路由、提取器、错误这四件事。运维端点、Cookie、表单这类
+“有人用、有人不用”的能力做成独立子 crate（同一 workspace），不用就不编译：
+
+| crate | 能力 | 依赖 |
+| --- | --- | --- |
+| `rsboot-ops` | `/healthz`、`/readyz`（带依赖明细）、`/metrics`（Prometheus 文本） | `serde_json` |
+| `rsboot-cookie` | Cookie 读取、`Set-Cookie`（`SameSite` / `HttpOnly` / `Secure` / `Max-Age`） | 无 |
+| `rsboot-form` | `Form<T>`：`application/x-www-form-urlencoded` 提取器 | `serde_urlencoded` |
+
+```rust,ignore
+use rsboot_ops as ops;
+use rsboot_cookie::{self as cookie, SetCookie, SameSite};
+use rsboot_form::Form;
+
+ops::Metrics::install();          // 想在 /metrics 看请求数与时延才装，不装则热路径零成本
+
+let r = Router::new()
+    .get("/healthz", |_, _| ops::healthz())?
+    .get("/readyz", |_, ctx: &Context| ops::readyz(ctx))?
+    .get("/metrics", |_, _| ops::Metrics::scrape())?
+    .post("/login", |req: &mut Request, _| {
+        let mut resp = Res::success("ok");
+        SetCookie::new("sid", "abc").path("/").http_only().same_site(SameSite::Lax).apply(&mut resp);
+        resp
+    })?;
+```
+
+核心侧只留两个**通用**钩子给它们用：`Headers::append`（`Set-Cookie` 允许重名
+多条）和 `web::stats`（`fn(u16, u64)` 观察者，默认不装、装了才读时钟）。
+
 ## 设计亮点
 
 1. **零第三方运行时。** HTTP/1.1 解析、keep-alive 连接管理、`writev` 批量写、poll 循环、M:N 调度器全部在仓库内。依赖层级是 serde 级，不是 tokio 级。少一层活动部件，也不用把版本绑在某个异步运行时的内部实现上。

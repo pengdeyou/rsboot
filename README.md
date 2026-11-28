@@ -246,6 +246,35 @@ ApiError::upstream("third-party timeout")  // same as code = 5001
 
 **Early rejections in the protocol layer use the same shape.** 400 (malformed), 413 (body too large), 414 (request line too long), 431 (headers too large), 501 (unknown method) and 505 (unsupported version) are refused by the parser, but the body is still `{"code":<n>,"message":"..."}` with `connection: close` — clients do not need a second parser for errors that never reached a handler.
 
+## Extension crates
+
+The core carries only four things: the protocol, the router, extractors and errors.
+Capabilities that only some apps need live in separate crates of the same workspace,
+so you never pay for what you do not use:
+
+| crate | what it gives you | extra deps |
+| --- | --- | --- |
+| `rsboot-ops` | `/healthz`, `/readyz` (per-database detail), `/metrics` (Prometheus text) | `serde_json` |
+| `rsboot-cookie` | cookie reading, `Set-Cookie` (`SameSite` / `HttpOnly` / `Secure` / `Max-Age`) | none |
+| `rsboot-form` | `Form<T>` for `application/x-www-form-urlencoded` | `serde_urlencoded` |
+
+```rust,ignore
+use rsboot_ops as ops;
+use rsboot_cookie::{self as cookie, SetCookie, SameSite};
+use rsboot_form::Form;
+
+ops::Metrics::install();          // opt-in: without it the hot path pays nothing
+
+let r = Router::new()
+    .get("/healthz", |_, _| ops::healthz())?
+    .get("/readyz", |_, ctx: &Context| ops::readyz(ctx))?
+    .get("/metrics", |_, _| ops::Metrics::scrape())?;
+```
+
+The core exposes just two generic hooks for them: `Headers::append` (a response may
+carry several `Set-Cookie` lines) and `web::stats` (a `fn(u16, u64)` observer that
+costs one atomic load when nothing is installed).
+
 ## Design highlights
 
 1. **No third-party runtime.** HTTP/1.1 parsing, keep-alive connection handling, `writev` batching, the poll loop and the M:N scheduler are all in-tree. The dependency list is serde-level, not tokio-level. Fewer moving parts, no version-lock to an async runtime's internals.

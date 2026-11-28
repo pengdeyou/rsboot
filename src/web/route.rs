@@ -326,6 +326,7 @@ impl Router {
 
     /// 分派。
     pub fn handle(&self, req: &mut Request, ctx: &Context) -> Response {
+        let stats_t0 = crate::web::stats::begin();
         // before：顺序执行，任一个返回 Some 就短路（后续中间件与 handler 都不跑）
         //
         // `entered` 记录"实际进入过"的层数：没进入的层不该在 after 里改一个
@@ -357,6 +358,7 @@ impl Router {
         // `content-length`，HEAD 的响应头变成 `content-length: 0`——客户端
         // 以为 GET 只会拿到 0 字节。语义该由写回层负责（它有 `head_only`，
         // 逐字节决定发不发 body），路由层只管把真实长度留在 `Response` 上。
+        crate::web::stats::end(stats_t0, resp.status.0);
         resp
     }
 

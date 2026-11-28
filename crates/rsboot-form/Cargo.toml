@@ -1,0 +1,13 @@
+[package]
+name = "rsboot-form"
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "application/x-www-form-urlencoded extractor for rsboot."
+repository = "https://github.com/pengdeyou/rsboot"
+
+[dependencies]
+rsboot = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_urlencoded = "0.7"

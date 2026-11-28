@@ -12,7 +12,7 @@
 //! let list = Res::data(items);            // {"code":200,"message":"success","data":[...]}
 //! let biz = Res::fail(4003, "库存不足");   // 400 + {"code":4003,"message":"库存不足"}
 //! let down = Res::fail(5001, "下游超时");  // 500 + {"code":5001,"message":"下游超时"}
-//! # std::hint::black_box((ok, list, bad));
+//! # std::hint::black_box((ok, list, biz, down));
 //! # }
 //! ```
 //!

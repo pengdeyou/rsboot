@@ -729,6 +729,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsboot-cookie"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "rsboot",
+]
+
+[[package]]
+name = "rsboot-form"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "rsboot",
+ "serde",
+ "serde_urlencoded",
+]
+
+[[package]]
+name = "rsboot-ops"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "rsboot",
+ "serde_json",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

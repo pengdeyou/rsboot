@@ -17,6 +17,7 @@ pub mod request;
 pub mod res;
 pub mod response;
 pub mod route;
+pub mod stats;
 
 pub use envelope::{Api, Envelope};
 pub use exception::{ApiResult, IntoApiError};
