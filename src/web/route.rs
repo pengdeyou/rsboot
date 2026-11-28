@@ -331,19 +331,24 @@ impl Router {
         //
         // `entered` 记录"实际进入过"的层数：没进入的层不该在 after 里改一个
         // 它没参与过的响应。这是洋葱语义——只 unwind 已经进栈的那些。
-        let mut entered = 0;
-        let mut short = None;
-        for m in &self.middlewares {
-            entered += 1;
-            if let Some(r) = m.before(req, ctx) {
-                short = Some(r);
-                break;
+        let (entered, short) = {
+            let _mw = crate::server::profile::start(crate::server::profile::HL_MW);
+            let mut entered = 0;
+            let mut short = None;
+            for m in &self.middlewares {
+                entered += 1;
+                if let Some(r) = m.before(req, ctx) {
+                    short = Some(r);
+                    break;
+                }
             }
-        }
+            (entered, short)
+        };
         let resp = match short {
             Some(r) => r,
             None => self.dispatch(req, ctx),
         };
+        let _end = crate::server::profile::start(crate::server::profile::HL_END);
         let mut resp = self.finalize(resp, req, ctx);
 
         // after：逆序（外层最后跑）。4xx/5xx 也过一遍——
@@ -351,6 +356,7 @@ impl Router {
         for m in self.middlewares.iter().take(entered).rev() {
             resp = m.after(req, ctx, resp);
         }
+        drop(_end);
 
         // HEAD 不再在这里清 body。
         //
@@ -406,6 +412,9 @@ impl Router {
 
         let mut allowed: Vec<Method> = Vec::new();
         let mut hit: Option<Response> = None;
+        // 计时区间只包住"沿树走 + 匹配"，attempt 里的 handler 单独记
+        // `HL_USER`，打印时再从这一段里减掉，避免同一段时间被数两遍。
+        let _match = crate::server::profile::start(crate::server::profile::HL_MATCH);
         Node::visit(&self.tree, trimmed, &mut |idxs| {
             match self.attempt(idxs, req, req.method, ctx, path, &mut allowed) {
                 Some(resp) => {
@@ -415,6 +424,7 @@ impl Router {
                 None => false,
             }
         });
+        drop(_match);
         if let Some(resp) = hit {
             return resp;
         }
@@ -492,9 +502,11 @@ impl Router {
             // 一个 handler panic 不能让 worker 线程退出。捕获后请求对象直接丢弃：
             // panic 之后它的内部状态不可信，继续用等于在赌。
             let trace = req.request_id().map(|s| s.to_string());
+            let _user = crate::server::profile::start(crate::server::profile::HL_USER);
             let outcome = exception::with_trace_owned(trace, || {
                 exception::guard(|| (r.handler)(req, ctx))
             });
+            drop(_user);
             let resp = match outcome {
                 Ok(resp) => resp,
                 Err(payload) => exception::panic_response(payload),

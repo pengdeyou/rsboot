@@ -26,7 +26,16 @@ pub const WRITE: usize = 4;
 /// `WRITE` 里再拆两层：组头 / 真正写出去。短连接下这两者的比例很不一样。
 pub const HEAD: usize = 5;
 pub const FLUSH: usize = 6;
-const STAGES: usize = 7;
+
+// `HANDLE` 是七段里最模糊的一段：它把中间件、路由匹配、用户 handler、出口收尾
+// 全包在一起，只给一个 ~555 ns 的总数。3% 的差距 ≈ 150 ns，落在这四者中的哪一个
+// 完全看不出来，所以历史上所有"应该会快"的改动都只能盲改。
+// 这四层只用于定位，**不参与七段合计**（`HL_MATCH` 包含 `HL_USER`，直接相加会重复）。
+pub const HL_MW: usize = 7;
+pub const HL_MATCH: usize = 8;
+pub const HL_USER: usize = 9;
+pub const HL_END: usize = 10;
+const STAGES: usize = 11;
 
 #[inline(always)]
 fn tsc() -> u64 {
@@ -131,6 +140,10 @@ pub fn finish_request() {
             let per = |i: usize| v[i] as f64 / n as f64;
             let wc = WRITE_CALLS.with(|c| c.get());
             let we = WRITE_EAGAIN.with(|c| c.get());
+            // `匹配` 要减掉 `用户`：`HL_MATCH` 的区间包住 handler 调用，
+            // 不减就是同一段时间数了两遍。
+            let user = per(HL_USER);
+            let matched = (per(HL_MATCH) - user).max(0.0);
             eprintln!(
                 "[profile] {} req | read {:.0}  parse {:.0}  build {:.0}  handle {:.0}  write {:.0} (head {:.0} + flush {:.0})  = {:.0} ns  wr {:.2}/req eagain {:.2}",
                 n,
@@ -144,6 +157,14 @@ pub fn finish_request() {
                 per(READ) + per(PARSE) + per(BUILD) + per(HANDLE) + per(WRITE),
                 wc as f64 / n as f64,
                 we as f64 / n as f64
+            );
+            eprintln!(
+                "[handle] 中间件 {:.0}  匹配 {:.0}  用户 handler {:.0}  收尾 {:.0}  = {:.0} ns",
+                per(HL_MW),
+                matched,
+                user,
+                per(HL_END),
+                per(HL_MW) + matched + user + per(HL_END)
             );
             acc.set([0; STAGES]);
             WRITE_CALLS.with(|c| c.set(0));
