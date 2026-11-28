@@ -5,10 +5,11 @@
 //!
 //! 语法层换成 Smarty 的：`{$var}`、`{if}`、`{foreach}`、`|escape`。
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 模板语法错误。`line` 从 1 起。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SyntaxError {
     pub line: usize,
     pub msg: String,
@@ -30,7 +31,7 @@ impl SyntaxError {
 }
 
 /// 变量访问的一段：`$user.name` → `[Key("user"), Key("name")]`。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Access {
     Key(String),
     Index(Box<Expr>),
@@ -39,7 +40,7 @@ pub enum Access {
     Prop(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -56,7 +57,7 @@ pub enum BinOp {
     Or,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Lit(Value),
     Var(Vec<Access>),
@@ -71,7 +72,7 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Stmt {
     Text(String),
     /// 行号标记。不输出任何东西，只在执行到时把 `Rt` 的当前行号更新掉，

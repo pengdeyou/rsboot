@@ -778,6 +778,7 @@ name = "rsboot-view"
 version = "0.1.0"
 dependencies = [
  "rsboot",
+ "serde",
  "serde_json",
 ]
 

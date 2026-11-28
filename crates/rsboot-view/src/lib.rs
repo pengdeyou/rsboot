@@ -26,7 +26,8 @@
 //! | `{for $i=1 to 5 step 2}…{forelse}…{/for}` | 数字区间；默认步长 1，倒着数写 `step -1` |
 //! | `{capture name="x"}…{/capture}` / `append=true` | 把渲染片段存进变量（回显要 `\|raw`） |
 //! | `{assign var="x" value=$y}` | 往当前作用域写变量 |
-//! | `{include file="x.tpl" item=$it}` | 引入子模板；参数进子作用域，父作用域只读 |
+//! | `{include file="x.tpl" item=$it}` | 引用子模板；参数进子作用域，父作用域只读 |
+//! | `{include "./row.tpl"}` / `{include "../shared/h.tpl"}` | 相对当前模板目录引用，不许跑出模板根 |
 //! | `{extends "layout"}` + `{block name="x"}` | 模板继承，编译期展开 |
 //! | `{cycle values="odd,even"}` | 按出现次序轮转取值（斑马纹、左右分栏） |
 //! | `{html_select name="c" options=$list selected=$cur empty="请选择"}` | 直接产出 `<select>`，内部强制转义 |
@@ -38,11 +39,24 @@
 //! `replace:"a":"b"` `split:","` `join:sep` `pad:n:"0"` `repeat:n`
 //! `number_format:2` `date:"%Y-%m-%d"` `urlencode` `strip_tags` `json`。
 //!
+//! 内建变量：`$smarty.now`（渲染时刻的 unix 秒）、`$smarty.now_date`（UTC 串）、
+//! `$smarty.tpl`（当前模板名）、`$smarty.version`；带请求上下文渲染时还有
+//! `$smarty.get` / `$smarty.params` / `$smarty.path` / `$smarty.method`
+//! （见 [`Engine::render_request`] 与 [`request_context`]）。
+//!
 //! ## 错误定位
 //!
 //! 语法错误在 `add`/`add_dir` 时就报（带行号）；运行期错误（除零、缺模板、
 //! 修饰符参数不对）也会带 `模板:行`——每个标签在 AST 里留了一个行号标记，
 //! 执行到就更新，出错直接取当前值。
+//!
+//! ## 引用与继承的时机
+//!
+//! `{extends}`/`{block}` 在编译期展开；`{include}` 的**字面量名字**也在编译期
+//! 解析成正式模板名，并校验"存在 + 不成环"，错误在启动时就暴露，而不是等
+//! 某个页面被访问。运行期仍是一次 `HashMap` 查找（几十纳秒），不复制子模板
+//! AST——`header.tpl` 被 50 个页面引用也只占一份内存。
+//! 动态名字（`{include file=$x}`）只能留到运行期，靠 32 层深度兜底。
 //!
 //! ## 为什么不是"引一个模板引擎"
 //!
@@ -62,16 +76,20 @@
 
 mod parse;
 mod render;
+mod store;
 
 pub use parse::SyntaxError;
 pub use render::escape_html;
+pub use store::now_secs;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use parse::{Expr, Stmt};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use store::{AstEntry, Hot, Store};
 
 /// 模板函数：参数按名字树传进来，返回要输出的值。
 pub type Func = Box<dyn Fn(&[(&str, Value)]) -> Result<Value, String> + Send + Sync>;
@@ -118,36 +136,39 @@ impl rsboot::web::IntoResponse for Error {
 
 /// 编译好的模板集合。
 ///
-/// 构造完就是只读的：所有模板在 `add` / `add_dir` 时编译一遍，
-/// 渲染期只查表，不需要锁。放进 `Arc` 就能跨 worker 共享。
+/// 快照放在 `RwLock<Arc<Store>>` 后面：渲染只借一瞬就克隆 `Arc`（一次原子加），
+/// 之后整段渲染都不持锁；热重载换的是整个 `Arc`，运行中的渲染继续用旧快照，
+/// 不存在"读到一半模板被换掉"的中间态。
 pub struct Engine {
-    /// 原始 AST：`add` 进来的样子，含 `{extends}` 与顶层 `{block}` 定义。
-    raw: HashMap<String, Arc<Src>>,
-    /// 展开后的 AST：`{extends}` 已换成父模板节点、`{block}` 已套上子模板的覆盖。
-    /// 渲染只看这一份，所以运行期既没有锁，也没有"父模板还没到"的中间态。
-    templates: HashMap<String, Arc<Vec<Stmt>>>,
+    store: RwLock<Arc<Store>>,
+    /// `add` 进来的源码。重建时要用它重算（目录模式下为空）。
+    srcs: HashMap<String, Vec<Stmt>>,
     funcs: HashMap<String, Func>,
     /// 每次渲染都会先铺进根作用域的常量（站点名、版本号之类）。
     globals: HashMap<String, Value>,
     auto_escape: bool,
-}
-
-/// 一份模板拆出来的三件事。
-struct Src {
-    /// 没有 `{extends}` 时就是完整节点列表；有的话这份内容会被丢弃，
-    /// 只剩 `blocks` 起作用（Smarty 的语义：子模板除 block 外不输出）。
-    nodes: Vec<Stmt>,
-    extends: Option<String>,
-    blocks: HashMap<String, Vec<Stmt>>,
+    /// `add_dir` 的根目录，热重载与缓存都靠它。
+    dir_root: Option<PathBuf>,
+    /// `.tplc` 缓存文件路径。
+    cache: Option<PathBuf>,
+    hot: Option<Hot>,
+    /// 上一次构建的 AST，热重载时用来做增量。
+    ast: HashMap<String, AstEntry>,
+    /// 热重载失败的原因（只记最近一次），运维接口可以取出来。
+    reload_error: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.store.read().map(|s| s.len()).unwrap_or(0);
         f.debug_struct("Engine")
-            .field("templates", &self.templates.len())
+            .field("templates", &n)
+            .field("srcs", &self.srcs.len())
             .field("funcs", &self.funcs.len())
             .field("globals", &self.globals.len())
             .field("auto_escape", &self.auto_escape)
+            .field("hot_reload", &self.hot.is_some())
+            .field("cache", &self.cache)
             .finish()
     }
 }
@@ -161,13 +182,20 @@ impl Default for Engine {
 impl Engine {
     pub fn new() -> Self {
         Self {
-            raw: HashMap::new(),
-            templates: HashMap::new(),
+            store: RwLock::new(Arc::new(Store::default())),
+            srcs: HashMap::new(),
             funcs: HashMap::new(),
             globals: HashMap::new(),
             auto_escape: true,
+            dir_root: None,
+            cache: None,
+            hot: None,
+            ast: HashMap::new(),
+            reload_error: Mutex::new(None),
         }
     }
+
+    // ---- 构建 ----
 
     /// 是否自动做 HTML 转义（默认开，见模块文档）。
     pub fn auto_escape(mut self, on: bool) -> Self {
@@ -190,9 +218,8 @@ impl Engine {
 
     /// 注册一份模板源码。
     ///
-    /// 立刻展开一次，所以 `{extends}` 指向的父模板必须**已经**注册。
-    /// 顺序不好控制时（比如自定义加载顺序）用 [`Engine::add_dir`]，
-    /// 它先把目录里的模板全登记完，最后统一展开一次。
+    /// 每 `add` 一次全量重建：几十个模板、毫秒级，换来"`add` 顺序无关"。
+    /// `{extends}` / `{include}` 指向的模板可以后注册——重建时会重新校验。
     pub fn add(mut self, name: impl Into<String>, src: &str) -> Result<Self, Error> {
         let name = name.into();
         let nodes = parse::parse(src).map_err(|e| Error {
@@ -200,40 +227,69 @@ impl Engine {
             line: e.line,
             msg: e.msg,
         })?;
-        self.raw.insert(name.clone(), Arc::new(split_src(&name, nodes)?));
+        self.srcs.insert(name, nodes);
         self.rebuild()?;
         Ok(self)
     }
 
     /// 递归加载目录下的 `*.tpl` / `*.html`，模板名用相对路径（`/` 分隔）。
     ///
-    /// 启动期一次编译完，运行期零 IO——模板热更新不在这个版本的目标里，
-    /// 重启换模板反而避免了"一半进程用旧模板"的中间态。
+    /// 启动期一次编译完，运行期零 IO。要"改了模板不重启"用
+    /// [`Engine::hot_reload`]；缓存文件默认写到 `<root>/.tplc`，可用
+    /// [`Engine::cache_dir`] 改位置或关掉。
     pub fn add_dir(mut self, root: impl AsRef<Path>) -> Result<Self, Error> {
-        let root = root.as_ref();
-        let mut files = Vec::new();
-        collect(root, root, &mut files).map_err(|e| Error {
-            template: root.display().to_string(),
-            line: 0,
-            msg: format!("读取目录失败：{e}"),
-        })?;
-        // 先全部登记，最后只展开一次：文件系统的遍历顺序不可控，
-        // 逐个 `add` 会因为"父模板还没读到"而误报。
-        for (name, path) in files {
-            let src = std::fs::read_to_string(&path).map_err(|e| Error {
-                template: name.clone(),
-                line: 0,
-                msg: format!("读取失败：{e}"),
-            })?;
-            let nodes = parse::parse(&src).map_err(|e| Error {
-                template: name.clone(),
-                line: e.line,
-                msg: e.msg,
-            })?;
-            self.raw.insert(name.clone(), Arc::new(split_src(&name, nodes)?));
-        }
-        self.rebuild()?;
+        let root = root.as_ref().to_path_buf();
+        let cache = root.join(".tplc");
+        let (st, ast) = store::build(&root, Some(&cache), None)?;
+        self.dir_root = Some(root);
+        self.cache = Some(cache);
+        *self.store.get_mut().unwrap_or_else(|e| e.into_inner()) = Arc::new(st);
+        self.ast = ast;
         Ok(self)
+    }
+
+    /// 不用缓存 / 换缓存位置（`None` 表示不写）。
+    ///
+    /// 缓存的是 **AST**，不是可执行代码：省掉词法 + 语法解析，继承展开与
+    /// 引用校验照做。文件由引擎自己写，别提交进版本库。
+    pub fn cache_dir(mut self, path: Option<impl AsRef<Path>>) -> Result<Self, Error> {
+        let path = path.map(|p| p.as_ref().to_path_buf());
+        let Some(root) = self.dir_root.clone() else {
+            return Err(Error {
+                template: "<engine>".to_string(),
+                line: 0,
+                msg: "`cache_dir` 只能配合 `add_dir` 使用".to_string(),
+            });
+        };
+        let (st, ast) = store::build(&root, path.as_deref(), None)?;
+        self.cache = path;
+        *self.store.get_mut().unwrap_or_else(|e| e.into_inner()) = Arc::new(st);
+        self.ast = ast;
+        Ok(self)
+    }
+
+    /// 打开模板热重载：默认 1 秒检查一次目录，有变化就重建。
+    ///
+    /// 检查是 `stat` 一遍目录，几百个模板也就几十微秒，所以放在渲染前做，
+    /// 不需要后台线程和 watcher。代价是"最多晚一个检查间隔生效"。
+    pub fn hot_reload(mut self, on: bool) -> Self {
+        self.hot = if on {
+            self.dir_root
+                .clone()
+                .map(|r| Hot::new(r, Duration::from_secs(1), self.ast.clone()))
+        } else {
+            None
+        };
+        self
+    }
+
+    /// 热重载的检查间隔。间隔越短越"实时"，`stat` 越频繁。
+    pub fn hot_reload_interval(mut self, d: Duration) -> Self {
+        self.hot = self
+            .dir_root
+            .clone()
+            .map(|r| Hot::new(r, d, self.ast.clone()));
+        self
     }
 
     /// 注册一个模板函数，模板里写 `{名字 参数="值"}`。
@@ -245,39 +301,151 @@ impl Engine {
         self
     }
 
+    /// 从内存源码重建（`add` 模式）。
+    fn rebuild(&mut self) -> Result<(), Error> {
+        let st = store::build_srcs(&self.srcs)?;
+        *self.store.get_mut().unwrap_or_else(|e| e.into_inner()) = Arc::new(st);
+        Ok(())
+    }
+
+    /// 立刻重读目录并替换快照（部署后手动触发，或测试用）。
+    pub fn reload(&self) -> Result<(), Error> {
+        let Some(root) = self.dir_root.clone() else {
+            return Ok(());
+        };
+        let (s, ast) = store::build(&root, self.cache.as_deref(), None)?;
+        *self.store.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(s);
+        if let Some(h) = &self.hot {
+            let mut st = h.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.ast = ast;
+            st.stamps = store::stamps_of(&root).unwrap_or_default();
+            st.primed = true;
+            st.last = std::time::Instant::now();
+        }
+        Ok(())
+    }
+
+    /// 最近一次热重载失败的原因。模板语法写错时旧快照继续服务，这里留个痕。
+    pub fn reload_error(&self) -> Option<String> {
+        self.reload_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 取当前快照；开了热重载就先检查一遍。
+    ///
+    /// 到了检查时间点时只有一个线程去 `stat`，其余线程直接拿旧快照——
+    /// 这把锁只保护"上次检查时间"，不参与渲染。
+    fn snapshot(&self) -> Arc<Store> {
+        if let Some(h) = &self.hot {
+            let due = {
+                let st = h.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.last.elapsed() >= h.interval
+            };
+            if due {
+                self.maybe_reload(h);
+            }
+        }
+        self.store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn maybe_reload(&self, h: &Hot) {
+        let mut st = h.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 双检：多个线程同时发现"到点了"时，只有一个真的去扫目录
+        if st.last.elapsed() < h.interval {
+            return;
+        }
+        st.last = std::time::Instant::now();
+        let Some(stamps) = store::stamps_of(&h.root) else {
+            return;
+        };
+        if !st.primed {
+            st.stamps = stamps;
+            st.primed = true;
+            return;
+        }
+        if stamps == st.stamps {
+            return;
+        }
+        match store::build(&h.root, self.cache.as_deref(), Some(&st.ast)) {
+            Ok((s, ast)) => {
+                *self.store.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(s);
+                st.ast = ast;
+                st.stamps = stamps;
+                *self.reload_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            Err(e) => {
+                // 旧快照继续服务：一个模板写错不该让线上 500 一片
+                *self.reload_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(e.to_string());
+            }
+        }
+    }
+
+    // ---- 渲染 ----
+
     pub fn template(&self, name: &str) -> Option<Template<'_>> {
-        // `get_key_value` 拿到的键生命周期挂在 `self` 上，模板名因此
-        // 不必克隆一份——`Template` 只借，不持。
-        let (key, nodes) = self.templates.get_key_value(name)?;
+        let store = self.snapshot();
+        if !store.templates.contains_key(name) {
+            return None;
+        }
         Some(Template {
             engine: self,
-            name: key.as_str(),
-            nodes,
+            store,
+            name: name.to_string(),
         })
     }
 
     /// 一步渲染。
     pub fn render(&self, name: &str, data: &Value) -> Result<String, Error> {
+        self.render_with(name, data, &Value::Null)
+    }
+
+    /// 带请求上下文渲染。`ctx` 会并进 `$smarty`（`get` / `params` / `path` …）。
+    ///
+    /// 上下文只属于这一次渲染，不落进 `Engine`，所以同一个 `Engine`
+    /// 可以被所有请求共享。
+    pub fn render_with(&self, name: &str, data: &Value, ctx: &Value) -> Result<String, Error> {
         match self.template(name) {
-            Some(t) => t.render(data),
-            None => Err(Error {
-                template: name.to_string(),
-                line: 0,
-                msg: "找不到模板".to_string(),
-            }),
+            Some(t) => t.render_with(data, ctx),
+            None => Err(not_found(name)),
         }
     }
 
     /// 渲染到已有缓冲区：高频路径（列表页、SSE 片段）能省一次 `String` 分配。
     pub fn render_into(&self, name: &str, data: &Value, out: &mut String) -> Result<(), Error> {
+        self.render_into_with(name, data, &Value::Null, out)
+    }
+
+    pub fn render_into_with(
+        &self,
+        name: &str,
+        data: &Value,
+        ctx: &Value,
+        out: &mut String,
+    ) -> Result<(), Error> {
         match self.template(name) {
-            Some(t) => t.render_into(data, out),
-            None => Err(Error {
-                template: name.to_string(),
-                line: 0,
-                msg: "找不到模板".to_string(),
-            }),
+            Some(t) => t.render_into_with(data, ctx, out),
+            None => Err(not_found(name)),
         }
+    }
+
+    /// 用请求渲染：把 query / 路径参数 / path / method 装进 `$smarty`。
+    ///
+    /// 只读 `Request`，不碰 body：模板里要回显表单字段就自己传 `data`——
+    /// 表单原始 body 直接进模板是 XSS 与隐私双重风险，不在这里开口子。
+    pub fn render_request(
+        &self,
+        name: &str,
+        data: &Value,
+        req: &rsboot::web::Request<'_>,
+    ) -> Result<String, Error> {
+        let ctx = request_context(req);
+        self.render_with(name, data, &ctx)
     }
 
     /// 渲染成可以直接返回的 HTML 响应。
@@ -293,13 +461,19 @@ impl Engine {
         Ok(rsboot::web::Response::html(html))
     }
 
-    /// 渲染层要拿这层常量，不能用同一个名字的 builder 方法，故另起名。
-    pub(crate) fn global_values(&self) -> &HashMap<String, Value> {
-        &self.globals
+    /// 带请求上下文 + 直接给 HTML 响应。页面型 handler 最常用的一条路。
+    pub fn render_request_response(
+        &self,
+        name: &str,
+        data: &Value,
+        req: &rsboot::web::Request<'_>,
+    ) -> Result<rsboot::web::Response, Error> {
+        let html = self.render_request(name, data, req)?;
+        Ok(rsboot::web::Response::html(html))
     }
 
-    pub(crate) fn nodes(&self, name: &str) -> Option<&[Stmt]> {
-        self.templates.get(name).map(|n| n.as_slice())
+    pub(crate) fn global_values(&self) -> &HashMap<String, Value> {
+        &self.globals
     }
 
     pub(crate) fn lookup_func(&self, name: &str) -> Option<&Func> {
@@ -309,27 +483,112 @@ impl Engine {
     pub(crate) fn is_auto_escape(&self) -> bool {
         self.auto_escape
     }
+}
 
-    /// 把所有模板重新展开一遍。
-    ///
-    /// 每 `add` 一次全量重建，看起来浪费，实际是几十个模板、毫秒级的事，
-    /// 换来的是"`add` 顺序无关"和"渲染期零 IO 零锁"。真要几百个模板，
-    /// 改成增量展开也只影响这一处。
-    fn rebuild(&mut self) -> Result<(), Error> {
-        let names: Vec<String> = self.raw.keys().cloned().collect();
-        let mut out = HashMap::with_capacity(names.len());
-        for name in names {
-            let mut stack = Vec::new();
-            let nodes = compose(&self.raw, &name, &mut stack)?;
-            out.insert(name, Arc::new(nodes));
-        }
-        self.templates = out;
-        Ok(())
+fn not_found(name: &str) -> Error {
+    Error {
+        template: name.to_string(),
+        line: 0,
+        msg: "找不到模板".to_string(),
     }
 }
 
-/// 从解析结果里拆出 `{extends}` 与顶层 `{block}`。
-fn split_src(name: &str, nodes: Vec<Stmt>) -> Result<Src, Error> {
+/// 把请求里能被模板安全读到的部分转成 `$smarty` 上下文的 JSON。
+///
+/// `get` 是 query 参数（百分号解码、`+` 当空格），`params` 是路径参数。
+/// 同名多值只保留第一个——模板不是处理表单数组的地方。
+pub fn request_context(req: &rsboot::web::Request<'_>) -> Value {
+    let mut get = Map::new();
+    for pair in req.query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode_plus(k);
+        if key.is_empty() || get.contains_key(&key) {
+            continue;
+        }
+        get.insert(key, Value::String(percent_decode_plus(v)));
+    }
+    let mut params = Map::new();
+    for (k, v) in &req.params {
+        params.insert(k.clone(), Value::String(v.clone()));
+    }
+
+    let mut sm = Map::new();
+    sm.insert("get".into(), Value::Object(get));
+    sm.insert("params".into(), Value::Object(params));
+    sm.insert("path".into(), Value::String(req.path.to_string()));
+    sm.insert("method".into(), Value::String(req.method.to_string()));
+    if let Some(id) = req.request_id() {
+        sm.insert("request_id".into(), Value::String(id.to_string()));
+    }
+    Value::Object(sm)
+}
+
+/// query 里的 `+` 是空格（`application/x-www-form-urlencoded` 的约定）。
+fn percent_decode_plus(s: &str) -> String {
+    if s.contains('+') {
+        rsboot::web::path::percent_decode(&s.replace('+', " "))
+    } else {
+        rsboot::web::path::percent_decode(s)
+    }
+}
+
+/// 一份模板的渲染入口。
+///
+/// 持有的是**快照**而不是 `Engine` 的锁：`Template` 活得再久，也不会挡住热重载。
+pub struct Template<'a> {
+    engine: &'a Engine,
+    store: Arc<Store>,
+    name: String,
+}
+
+impl Template<'_> {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn render(&self, data: &Value) -> Result<String, Error> {
+        self.render_with(data, &Value::Null)
+    }
+
+    pub fn render_with(&self, data: &Value, ctx: &Value) -> Result<String, Error> {
+        let mut out = String::with_capacity(1024);
+        self.render_into_with(data, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// 渲染追加到已有缓冲区（模板片段拼接、SSE 分片输出都用它）。
+    pub fn render_into(&self, data: &Value, out: &mut String) -> Result<(), Error> {
+        self.render_into_with(data, &Value::Null, out)
+    }
+
+    pub fn render_into_with(
+        &self,
+        data: &Value,
+        ctx: &Value,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        let nodes = self.store.nodes(self.name.as_str()).unwrap_or(&[]);
+        let mut rt = render::Rt::new(self.engine, &self.store, &self.name, data, ctx);
+        rt.run_into(nodes, out)
+    }
+}
+
+// ---- 编译期展开（继承 + 引用解析）----
+
+/// 一份模板拆出来的三件事。
+pub(crate) struct Src {
+    /// 没有 `{extends}` 时就是完整节点列表；有的话这份内容会被丢弃，
+    /// 只剩 `blocks` 起作用（Smarty 的语义：子模板除 block 外不输出）。
+    pub(crate) nodes: Vec<Stmt>,
+    pub(crate) extends: Option<String>,
+    pub(crate) blocks: HashMap<String, Vec<Stmt>>,
+}
+
+/// 从解析结果里拆出 `{extends}` 与顶层 `{block}`，并把静态引用的相对路径归一化。
+pub(crate) fn split_src(name: &str, nodes: Vec<Stmt>) -> Result<Src, Error> {
     let mut extends = None;
     for n in &nodes {
         if let Stmt::Extends(e) = n {
@@ -352,6 +611,7 @@ fn split_src(name: &str, nodes: Vec<Stmt>) -> Result<Src, Error> {
             }
         }
     }
+    let nodes = resolve_paths(name, nodes)?;
     if extends.is_none() {
         // 没有继承：`{block}` 只是个透明容器，留在原位置照常渲染。
         return Ok(Src {
@@ -377,8 +637,83 @@ fn split_src(name: &str, nodes: Vec<Stmt>) -> Result<Src, Error> {
     })
 }
 
-/// 递归展开一个模板。
-fn compose(
+/// 把静态 `{include "./x.tpl"}` 的模板名换成归一化后的名字。
+///
+/// 只动字面量：动态名字在编译期根本不知道是什么，留到运行期。
+fn resolve_paths(tpl: &str, nodes: Vec<Stmt>) -> Result<Vec<Stmt>, Error> {
+    nodes.into_iter().map(|n| resolve_one(tpl, n)).collect()
+}
+
+fn resolve_one(tpl: &str, n: Stmt) -> Result<Stmt, Error> {
+    Ok(match n {
+        Stmt::Include { tpl: e, params } => Stmt::Include {
+            tpl: fix_include_name(tpl, e)?,
+            params,
+        },
+        Stmt::If { arms, else_ } => Stmt::If {
+            arms: arms
+                .into_iter()
+                .map(|(c, b)| Ok((c, resolve_paths(tpl, b)?)))
+                .collect::<Result<Vec<_>, Error>>()?,
+            else_: resolve_paths(tpl, else_)?,
+        },
+        Stmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+            else_,
+        } => Stmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: resolve_paths(tpl, body)?,
+            else_: resolve_paths(tpl, else_)?,
+        },
+        Stmt::ForEach {
+            iter,
+            key,
+            val,
+            body,
+            else_,
+        } => Stmt::ForEach {
+            iter,
+            key,
+            val,
+            body: resolve_paths(tpl, body)?,
+            else_: resolve_paths(tpl, else_)?,
+        },
+        Stmt::Capture { name, append, body } => Stmt::Capture {
+            name,
+            append,
+            body: resolve_paths(tpl, body)?,
+        },
+        Stmt::Block { name, body } => Stmt::Block {
+            name,
+            body: resolve_paths(tpl, body)?,
+        },
+        other => other,
+    })
+}
+
+fn fix_include_name(tpl: &str, e: Expr) -> Result<Expr, Error> {
+    match e {
+        Expr::Lit(Value::String(s)) => {
+            let full = store::resolve_ref(tpl, &s).map_err(|m| Error {
+                template: tpl.to_string(),
+                line: 0,
+                msg: m,
+            })?;
+            Ok(Expr::Lit(Value::String(full)))
+        }
+        other => Ok(other),
+    }
+}
+
+/// 递归展开一个模板（`{extends}`）。
+pub(crate) fn compose(
     raw: &HashMap<String, Arc<Src>>,
     name: &str,
     stack: &mut Vec<String>,
@@ -393,7 +728,13 @@ fn compose(
     let Some(parent) = &src.extends else {
         return Ok(src.nodes.clone());
     };
-    if !raw.contains_key(parent) {
+    // `{extends "./layout.tpl"}` 也要按当前模板目录解析
+    let parent = store::resolve_ref(name, parent).map_err(|m| Error {
+        template: name.to_string(),
+        line: 0,
+        msg: m,
+    })?;
+    if !raw.contains_key(&parent) {
         return Err(Error {
             template: name.to_string(),
             line: 0,
@@ -411,7 +752,7 @@ fn compose(
         });
     }
     stack.push(name.to_string());
-    let r = compose(raw, parent, stack);
+    let r = compose(raw, &parent, stack);
     stack.pop();
     let parent_nodes = r?;
     Ok(replace_blocks(&parent_nodes, &src.blocks))
@@ -479,52 +820,6 @@ fn replace_blocks(nodes: &[Stmt], overrides: &HashMap<String, Vec<Stmt>>) -> Vec
         .collect()
 }
 
-/// 一份模板的渲染入口。
-pub struct Template<'a> {
-    engine: &'a Engine,
-    name: &'a str,
-    nodes: &'a Arc<Vec<Stmt>>,
-}
-
-impl Template<'_> {
-    pub fn name(&self) -> &str {
-        self.name
-    }
-
-    pub fn render(&self, data: &Value) -> Result<String, Error> {
-        let mut out = String::with_capacity(1024);
-        self.render_into(data, &mut out)?;
-        Ok(out)
-    }
-
-    /// 渲染追加到已有缓冲区（模板片段拼接、SSE 分片输出都用它）。
-    pub fn render_into(&self, data: &Value, out: &mut String) -> Result<(), Error> {
-        let mut rt = render::Rt::new(self.engine, self.name, data);
-        rt.run_into(self.nodes, out)
-    }
-}
-
-fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect(root, &path, out)?;
-        } else {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext.eq_ignore_ascii_case("tpl") || ext.eq_ignore_ascii_case("html") {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.push((rel, path));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +827,26 @@ mod tests {
 
     fn engine() -> Engine {
         Engine::new()
+    }
+
+    /// 每个测试一个临时目录，名字带 pid + 用途，并行跑不会撞。
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "rsboot-view-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(dir: &Path, name: &str, src: &str) {
+        let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, src).unwrap();
     }
 
     #[test]
@@ -635,10 +950,21 @@ mod tests {
     }
 
     #[test]
-    fn include_cycle_is_a_clear_error() {
-        let e = engine().add("a", "{include \"a\"}").unwrap();
-        let err = e.render("a", &json!({})).unwrap_err();
-        assert!(err.msg.contains("嵌套太深"), "{err}");
+    fn include_cycle_is_caught_at_registration() {
+        // 自引用在 `add` 时就报，不必等某个页面被访问
+        let err = engine().add("a", "{include \"a\"}").unwrap_err();
+        assert!(err.msg.contains("成环"), "{err}");
+    }
+
+    /// 两个模板互相 include：目录模式下一次构建就能看出环。
+    #[test]
+    fn include_cycle_across_two_templates() {
+        let dir = tmpdir("cycle");
+        write(&dir, "a.tpl", "{include \"b.tpl\"}");
+        write(&dir, "b.tpl", "{include \"a.tpl\"}");
+        let err = Engine::new().add_dir(&dir).unwrap_err();
+        assert!(err.msg.contains("成环"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -735,11 +1061,9 @@ mod tests {
     fn extends_cycle_is_an_error() {
         // 逐个 `add` 时环一定先撞上"未注册"，环检测只在 add_dir
         // 全量登记后才有机会上场——这里正是那个场景。
-        let dir = std::env::temp_dir().join(format!("rsboot-view-cycle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.tpl"), "{extends \"b.tpl\"}").unwrap();
-        std::fs::write(dir.join("b.tpl"), "{extends \"a.tpl\"}").unwrap();
+        let dir = tmpdir("extcycle");
+        write(&dir, "a.tpl", "{extends \"b.tpl\"}");
+        write(&dir, "b.tpl", "{extends \"a.tpl\"}");
         let err = Engine::new().add_dir(&dir).unwrap_err();
         assert!(err.msg.contains("成环"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -956,5 +1280,180 @@ mod tests {
         let err = e.render("a", &json!({"x": 1})).unwrap_err();
         let resp = rsboot::web::IntoResponse::into_response(err);
         assert_eq!(resp.status.0, 500);
+    }
+
+    // ---- v1.1：引用 / smarty / 缓存 / 热重载 ----
+
+    #[test]
+    fn relative_include_resolves_against_current_template() {
+        let e = engine()
+            .add("admin/row.tpl", "<{$v}>")
+            .unwrap()
+            .add("admin/list.tpl", "{include file=\"./row.tpl\" v=1}")
+            .unwrap();
+        assert_eq!(e.render("admin/list.tpl", &json!({})).unwrap(), "<1>");
+    }
+
+    #[test]
+    fn include_can_walk_up_one_directory() {
+        let e = engine()
+            .add("shared/h.tpl", "[{$t}]")
+            .unwrap()
+            .add("admin/part/x.tpl", "{include file=\"../../shared/h.tpl\" t=\"上级\"}")
+            .unwrap();
+        assert_eq!(e.render("admin/part/x.tpl", &json!({})).unwrap(), "[上级]");
+    }
+
+    #[test]
+    fn static_include_of_missing_template_fails_at_registration() {
+        let err = engine()
+            .add("a.tpl", "{include file=\"./nope.tpl\"}")
+            .unwrap_err();
+        assert!(err.msg.contains("未注册"), "{err}");
+    }
+
+    #[test]
+    fn add_dir_supports_relative_include_and_same_template_twice() {
+        let dir = tmpdir("reldir");
+        write(&dir, "list.tpl", "{include file=\"./row.tpl\" n=1}{include file=\"./row.tpl\" n=2}");
+        write(&dir, "row.tpl", "({$n})");
+        let e = Engine::new().add_dir(&dir).unwrap();
+        assert_eq!(e.render("list.tpl", &json!({})).unwrap(), "(1)(2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn smarty_exposes_time_template_and_version() {
+        let e = engine()
+            .add("p", "{$smarty.tpl}|{$smarty.version}|{$smarty.now}")
+            .unwrap();
+        let out = e.render("p", &json!({})).unwrap();
+        let expect = format!("p|{}|", env!("CARGO_PKG_VERSION"));
+        assert!(out.starts_with(&expect), "{out}");
+        // 后面那截是 unix 秒，至少得是 2024 年以后
+        let ts: i64 = out.rsplit('|').next().unwrap().trim().parse().unwrap();
+        assert!(ts > 1_700_000_000, "{ts}");
+    }
+
+    #[test]
+    fn smarty_now_date_is_utc_and_formattable() {
+        // ctx 覆盖 `now`：测试要固定时间，不能靠读时钟
+        let e = engine()
+            .add("p", "{$smarty.now_date}|{$smarty.now|date:\"%Y-%m-%d\"}")
+            .unwrap();
+        let out = e
+            .render_with("p", &json!({}), &json!({"now": 1_704_067_200}))
+            .unwrap();
+        assert_eq!(out, "2024-01-01 00:00:00|2024-01-01");
+    }
+
+    #[test]
+    fn request_context_decodes_query_and_params() {
+        let mut req = rsboot::web::Request::new(rsboot::web::Method::Get, "/u/7")
+            .with_query("q=%E4%B8%AD+文&page=2&q=dup&empty");
+        req.params.push(("id".into(), "7".into()));
+
+        assert_eq!(request_context(&req)["get"]["q"], json!("中 文"));
+        assert_eq!(request_context(&req)["get"]["page"], json!("2"));
+        // 同名只留第一个；没值的键是空串
+        assert_eq!(request_context(&req)["get"]["empty"], json!(""));
+        assert_eq!(request_context(&req)["params"]["id"], json!("7"));
+        assert_eq!(request_context(&req)["path"], json!("/u/7"));
+        assert_eq!(request_context(&req)["method"], json!("GET"));
+    }
+
+    #[test]
+    fn render_request_puts_query_into_smarty_get() {
+        let e = engine()
+            .add("p", "{$smarty.path}?page={$smarty.get.page}")
+            .unwrap();
+        let req = rsboot::web::Request::new(rsboot::web::Method::Get, "/list")
+            .with_query("page=3");
+        assert_eq!(e.render_request("p", &json!({}), &req).unwrap(), "/list?page=3");
+    }
+
+    #[test]
+    fn add_dir_writes_and_reuses_the_ast_cache() {
+        let dir = tmpdir("cache");
+        write(&dir, "a.tpl", "hi {$name}");
+        let cache = dir.join(".tplc");
+        let e = Engine::new().add_dir(&dir).unwrap();
+        assert!(cache.exists(), "add_dir 默认写 {:?}", cache);
+        assert_eq!(
+            e.render("a.tpl", &json!({"name": "小明"})).unwrap(),
+            "hi 小明"
+        );
+        // 缓存文件本身是合法 JSON，且记了 crate 版本
+        let text = std::fs::read_to_string(&cache).unwrap();
+        assert!(text.contains("\"format\":1"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_cache_is_ignored_not_fatal() {
+        let dir = tmpdir("badcache");
+        write(&dir, "a.tpl", "ok");
+        std::fs::write(dir.join(".tplc"), "{ not json").unwrap();
+        let e = Engine::new().add_dir(&dir).unwrap();
+        assert_eq!(e.render("a.tpl", &json!({})).unwrap(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_dir_none_disables_the_file() {
+        let dir = tmpdir("nocache");
+        write(&dir, "a.tpl", "x");
+        let e = Engine::new()
+            .add_dir(&dir)
+            .unwrap()
+            .cache_dir(None::<PathBuf>)
+            .unwrap();
+        assert_eq!(e.render("a.tpl", &json!({})).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hot_reload_picks_up_an_edit_without_restart() {
+        let dir = tmpdir("hot");
+        write(&dir, "a.tpl", "one");
+        let e = Engine::new()
+            .add_dir(&dir)
+            .unwrap()
+            .hot_reload_interval(Duration::from_millis(40));
+        assert_eq!(e.render("a.tpl", &json!({})).unwrap(), "one");
+
+        // 长度变化保证检测得到（不依赖 mtime 精度）
+        write(&dir, "a.tpl", "two!!");
+        std::thread::sleep(Duration::from_millis(90));
+        assert_eq!(e.render("a.tpl", &json!({})).unwrap(), "two!!");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_syntax_error_while_hot_keeps_the_old_snapshot() {
+        let dir = tmpdir("hotbad");
+        write(&dir, "a.tpl", "good");
+        let e = Engine::new()
+            .add_dir(&dir)
+            .unwrap()
+            .hot_reload_interval(Duration::from_millis(40));
+        assert_eq!(e.render("a.tpl", &json!({})).unwrap(), "good");
+
+        write(&dir, "a.tpl", "{if $x}");
+        std::thread::sleep(Duration::from_millis(90));
+        // 旧快照继续服务，错误只留痕
+        assert_eq!(e.render("a.tpl", &json!({})).unwrap(), "good");
+        assert!(e.reload_error().unwrap_or_default().contains("a.tpl"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extends_keeps_working_from_a_subdirectory() {
+        let dir = tmpdir("extsub");
+        write(&dir, "layout.tpl", "<body>{block name=\"main\"}默认{/block}</body>");
+        write(&dir, "sub/page.tpl", "{extends \"../layout.tpl\"}{block name=\"main\"}子{/block}");
+        let e = Engine::new().add_dir(&dir).unwrap();
+        assert_eq!(e.render("sub/page.tpl", &json!({})).unwrap(), "<body>子</body>");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

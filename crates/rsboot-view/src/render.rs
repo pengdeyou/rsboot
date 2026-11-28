@@ -9,11 +9,15 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::parse::{Access, BinOp, Expr, Stmt};
+use crate::store::Store;
 use crate::{Engine, Error};
 
 /// 单次渲染的上下文。
 pub(crate) struct Rt<'a> {
     engine: &'a Engine,
+    /// 本次渲染用的快照。`{include}` 从这里取子模板，热重载换走整份 `Arc`
+    /// 也不影响这一趟——渲染全程看到的是同一份模板集合。
+    store: &'a Store,
     scopes: Vec<HashMap<String, Value>>,
     /// 当前模板名，出错时报给使用者。
     current: String,
@@ -32,8 +36,43 @@ const MAX_DEPTH: usize = 32;
 /// 但 `step` 是运行期算出来的，只能在跑够次数后拦住，别让一个模板把 worker 卡死。
 const MAX_ITER: usize = 1_000_000;
 
+/// `$smarty` 的内建字段 + 调用方给的请求上下文。
+///
+/// 顺序是"内建先写、上下文后覆盖"：`ctx` 里带 `now` 就按调用方的来——
+/// 测试要固定时间、或者页面要按用户时区显示时，它会覆盖掉默认值。
+fn smarty(tpl: &str, ctx: &Value) -> Value {
+    // ctx 里的 `now` 优先：`now_date` 必须跟着它走，否则两个字段自相矛盾
+    let now = ctx
+        .get("now")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(crate::now_secs);
+    let mut m = serde_json::Map::new();
+    m.insert("now".into(), Value::Number(now.into()));
+    m.insert(
+        "now_date".into(),
+        Value::String(format_date(now, "%Y-%m-%d %H:%M:%S")),
+    );
+    m.insert("tpl".into(), Value::String(tpl.to_string()));
+    m.insert(
+        "version".into(),
+        Value::String(env!("CARGO_PKG_VERSION").to_string()),
+    );
+    if let Value::Object(extra) = ctx {
+        for (k, v) in extra {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    Value::Object(m)
+}
+
 impl<'a> Rt<'a> {
-    pub(crate) fn new(engine: &'a Engine, name: &str, data: &Value) -> Self {
+    pub(crate) fn new(
+        engine: &'a Engine,
+        store: &'a Store,
+        name: &str,
+        data: &Value,
+        ctx: &Value,
+    ) -> Self {
         let mut root = HashMap::new();
         // 全局变量先铺一层，业务数据后面覆盖：`{$site.name}` 这类站点级常量
         // 不必每个 handler 都往 data 里塞一遍。
@@ -45,8 +84,10 @@ impl<'a> Rt<'a> {
                 root.insert(k.clone(), v.clone());
             }
         }
+        root.insert("smarty".to_string(), smarty(name, ctx));
         Self {
             engine,
+            store,
             scopes: vec![root],
             current: name.to_string(),
             line: 0,
@@ -193,7 +234,7 @@ impl<'a> Rt<'a> {
                             )))
                         }
                     };
-                    let Some(nodes) = self.engine.nodes(&name) else {
+                    let Some(nodes) = self.store.nodes(&name) else {
                         return Err(self.err(format!("找不到模板 `{name}`")));
                     };
                     if self.depth >= MAX_DEPTH {
@@ -878,7 +919,7 @@ const MONTH_LONG: [&str; 12] = [
 /// 时间戳按 **UTC** 格式化。为什么不做本地时区：模板引擎不该读进程环境
 /// （`TZ` 一变输出就变，缓存和测试都没法稳定）。要本地时间就在数据里传
 /// 已经算好的字符串，或者传本地偏移后的时间戳。
-fn format_date(ts: i64, fmt: &str) -> String {
+pub(crate) fn format_date(ts: i64, fmt: &str) -> String {
     let days = ts.div_euclid(86_400);
     let secs = ts.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);

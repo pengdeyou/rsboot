@@ -141,10 +141,11 @@ Mac 本机交替 5 轮 A/B（加流式前后）落在 57k–73k QPS、同代码�
 
 - [ ] `rsboot-static`：Linux `sendfile`（大文件零拷贝）+ 预压缩旁路（`.gz` / `.br` 存在就直接发，配 `content-encoding`）
 - [ ] `rsboot-static`：`Vary: Accept-Encoding`、`If-Modified-Since` 与 `If-None-Match` 并存时的优先级、目录列表默认关闭的显式参数
-- [x] `rsboot-view` v1.0：`{for}`/`{capture}`/循环属性（`$it@index` 等）/带参 `include`/`{cycle}`/`{html_select}`/`globals`/`render_response`，修饰符补 `|date` `|number_format` `|substr` `|replace` `|split` `|pad` `|repeat` `|capitalize` `|urlencode` `|strip_tags`，运行期错误带 `模板:行`
-- [ ] `rsboot-view`：内建变量 `$smarty.now` / `$smarty.get` / `$smarty.const`（`Engine::globals` 已能覆盖大部分场景）
-- [ ] `rsboot-view`：模板热重载（dev 模式 mtime 检测，复用 `config/watcher` 的机制）
-- [ ] `rsboot-view`：编译产物缓存落盘（`.tplc`），避免每次启动重解析
+- [x] `rsboot-view` v1.1（含 v1.0）：`{for}`/`{capture}`/循环属性（`$it@index` 等）/带参 `include`/`{cycle}`/`{html_select}`/`globals`/`render_response`，修饰符补 `|date` `|number_format` `|substr` `|replace` `|split` `|pad` `|repeat` `|capitalize` `|urlencode` `|strip_tags`，运行期错误带 `模板:行`
+- [x] `rsboot-view` v1.1：内建变量 `$smarty.now`/`now_date`/`tpl`/`version`，请求上下文 `$smarty.get`/`params`/`path`/`method`（`render_request` + `request_context`，query 百分号解码）
+- [x] `rsboot-view` v1.1：模板热重载（按间隔 `stat` 目录 + 增量重建 + 快照整体替换，重建失败保留旧快照并记 `reload_error`）
+- [x] `rsboot-view` v1.1：`.tplc` AST 缓存落盘（mtime+size → 内容指纹 → 重新解析三级复用，tmp+rename）
+- [x] `rsboot-view` v1.1：模板引用模板——`{include}`/`{extends}` 的 `./`、`../` 相对当前模板解析，编译期校验"存在 + 不成环"，运行期只一次哈希查找（不内联子 AST）
 
 ### 3.6 接口契约与国际化（`web/openapi` 已有 `RouteDoc` + `/openapi.json` + `/docs`）
 

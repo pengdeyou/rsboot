@@ -51,6 +51,23 @@ fn main() {
     });
     println!("{}", engine.render("list", &data).unwrap());
 
+    // `$smarty` 自带当前模板名与时间；`{include "./row.tpl"}` 相对当前模板目录解析
+    let page = Engine::new()
+        .add("views/row.tpl", "<li>{$n}</li>")
+        .unwrap()
+        .add(
+            "views/page.tpl",
+            "<p>{$smarty.tpl} @ {$smarty.now|date:\"%H:%M:%S\"}</p>\
+             <ol>{include file=\"./row.tpl\" n=1}{include file=\"./row.tpl\" n=2}</ol>",
+        )
+        .unwrap();
+    // ctx 覆盖 `now`：示例输出不跟着运行时刻变
+    println!(
+        "{}",
+        page.render_with("views/page.tpl", &json!({}), &json!({"now": 1735689600}))
+            .unwrap()
+    );
+
     // 运行期错误也会指出模板和行号
     let broken = Engine::new().add("bad", "ok\n\n{$x|nope}").unwrap();
     let err = broken.render("bad", &json!({"x": 1})).unwrap_err();
