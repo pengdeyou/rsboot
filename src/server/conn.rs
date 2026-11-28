@@ -68,6 +68,9 @@ enum HeadError {
     /// 另一个该回 503——否则关闭期客户端只看到"连接被断"，不知道能重试。
     Stopped,
     Timeout,
+    /// 请求行超长 → `414`。和 `TooLarge` 分开是因为两者的客户端含义不同：
+    /// 超长 URL 该让客户端缩短 URL，超长头部该让它精简 header。
+    LineTooLong,
     TooLarge,
     Malformed(&'static str),
 }
@@ -352,6 +355,14 @@ impl Conn {
                 let _ = write_closing(self.reader.get_mut());
                 return CLOSED;
             }
+            Err(HeadError::LineTooLong) => {
+                let _ = write_error(
+                    &mut self.out_buf,
+                    ApiError::new(Status(414), "请求行过长"),
+                    true,
+                );
+                return CLOSED;
+            }
             Err(HeadError::TooLarge) => {
                 let _ = write_error(
                     &mut self.out_buf,
@@ -616,6 +627,9 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
             Some(i) => hlen - (i + 2),
             None => hlen,
         };
+        // `head` 里还没有第一个 CRLF，说明整块 head 仍是请求行（跨段也成立，
+        // 因为 `row` 的初值就是从最后一个 CRLF 之后算的）。第一行超长是 414。
+        let mut in_request_line = head.len() == row;
         let mut cut: Option<usize> = None;
 
         // 1) 结束标记跨段
@@ -660,11 +674,16 @@ fn read_head<R: BufRead, F: Fn() -> bool>(
                     }
                     prev_cr = false;
                     row = 0;
+                    in_request_line = false;
                 } else {
                     prev_cr = false;
                     row += 1;
                     if row > MAX_REQUEST_LINE {
-                        return Err(HeadError::TooLarge);
+                        return Err(if in_request_line {
+                            HeadError::LineTooLong
+                        } else {
+                            HeadError::TooLarge
+                        });
                     }
                 }
                 i += 1;
@@ -871,9 +890,25 @@ mod tests {
     }
 
     #[test]
-    fn oversized_line_spanning_buffer_fills_is_too_large() {
+    fn oversized_request_line_spanning_buffer_fills_is_414() {
+        // 请求行太长 → 414。跨段拼接时必须仍然认得出"还在第一行"，
+        // 否则 9 KiB 的 URL 会被当成头部炸弹回 431，客户端就找错方向了。
         let mut bytes = b"GET /".to_vec();
         bytes.extend_from_slice(&vec![b'a'; MAX_REQUEST_LINE + 100]);
+        bytes.extend_from_slice(b"\r\n\r\n");
+        for step in 1..=3 {
+            assert!(
+                matches!(read_head_chunked(&bytes, step), Err(HeadError::LineTooLong)),
+                "step={step}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_header_line_is_431() {
+        // 头行太长 → 431（不是 414）：第一行已经结束，后面的行属于头部。
+        let mut bytes = b"GET / HTTP/1.1\r\nX: ".to_vec();
+        bytes.extend(std::iter::repeat(b'a').take(MAX_REQUEST_LINE + 10));
         bytes.extend_from_slice(b"\r\n\r\n");
         for step in 1..=3 {
             assert!(
@@ -906,11 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn oversized_line_is_too_large() {
+    fn oversized_request_line_is_line_too_long() {
         let mut buf = b"GET /".to_vec();
         buf.extend(std::iter::repeat(b'a').take(MAX_REQUEST_LINE + 10));
         buf.extend_from_slice(b" HTTP/1.1\r\n");
-        assert!(matches!(read_head_from(&buf), Err(HeadError::TooLarge)));
+        assert!(matches!(read_head_from(&buf), Err(HeadError::LineTooLong)));
     }
 
     #[test]
