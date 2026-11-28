@@ -94,15 +94,26 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 
   实测 `examples/https.rs` 打通真实站点：`example.com`、`www.cloudflare.com`、
   `www.rust-lang.org`、`github.com` 全部 HTTP 200（含 Chacha 与 AES-128 两套套件、
-  P-256/P-384/RSA-PSS 三种证书签名）。已知边界：不支持 TLS 1.2，遇到只认 1.2 的
-  站点只能用 `http://`（`www.baidu.com` 就是这类，服务端直接回 alert 70）。
+  P-256/P-384/RSA-PSS 三种证书签名）。
 
-  性能按原语单独计过（release，同一台机器）：x25519 标量乘 418 µs → **47 µs**、
-  RSA-2048 PSS 验签 340 µs → **85 µs**、ECDSA P-384 验签 3.2 ms → **2.0 ms**。
-  x25519 的域元素从 16 个 `i64`（2^16 基数）换成 5 个 51 bit limb，一次乘法从
-  256 次小整数乘降到 25 次；RSA 的 `R² mod n` 按线程缓存（每线程 4 个模数），
-  ECDSA 的坐标从 `Vec` 改成定长数组 + `Mont::mul_into`，验签不再每次 malloc。
-  合起来本机全握手（对 `openssl s_server`，release）2.46 ms → **1.07 ms**。
+  **TLS 1.2 也支持**（`src/tls/tls12.rs`），只为"只有 1.2 的老站点"。范围刻意收窄：
+  只做 ECDHE + AEAD 的四个套件（ECDHE-ECDSA/RSA × AES-128-GCM / ChaCha20-Poly1305），
+  CBC 一个都不列。理由不是省事——CBC 要 HMAC-then-encrypt 加 padding，Lucky13
+  一类侧信道全从那儿长出来，而收益只是多开几个早该淘汰的站。同样不做：重协商、
+  会话复用（不发 `session_ticket` 扩展，session id 每次随机）、压缩、客户端证书、
+  有限域 DHE（要 2048 位模幂）。证书链与主机名和 1.3 走**同一套** `chain::verify`。
+
+  版本协商没有"先试 1.3 失败再重试"：`legacy_version` 固定 `0x0303`
+  （1.2 服务端只读这个字段），`supported_versions` 里同时列 `[0x0304, 0x0303]`，
+  套件列表把 1.3 与 1.2 的编号混在一起。1.3 服务端挑 1.3，只认 1.2 的服务端按规范
+  忽略不认识的扩展、回落到 legacy 版本——**同一个 ClientHello 两边都能谈完**。
+
+  1.2 与 1.3 的实质差别只有两处：密钥派生用 PRF（`P_SHA256`）而不是 HKDF；
+  记录层 nonce/AAD 布局不同（1.2 的 GCM 要写 8 字节显式 nonce，且 AAD 里的
+  length 是**明文长度**而不是记录头里的密文长度，写错就是服务端回 `bad_record_mac`）。
+
+  已知边界：SSLv3 / TLS 1.0 / TLS 1.1 明确不支持（RFC 8996 判死、只有 CBC 套件）；
+  DTLS 与 QUIC 不做（属于另一套传输层）。
 - **会话 cookie**：默认开，per-host 的 jar，`Set-Cookie` 收、下次请求带。认 `Domain` / `Path` / `Secure` / `Max-Age` / `Expires`（RFC 1123 日期手写解析），`HttpOnly` 只记录（不跑 JS，没实际作用）。域名校验是双向的——别人想给 `a.com` 塞 cookie 不收，`a.com` 的 `Domain=.a.com` 才能往子域走。`Client::cookie_jar(false)` 回到无状态。每个 worker 一个 jar，不会出现两个 worker 共享半份登录态。
 - **URL 过滤**：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象是 `path?query`。
 

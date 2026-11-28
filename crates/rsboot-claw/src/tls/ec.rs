@@ -11,6 +11,7 @@
 //! 0.87 ms。
 
 use super::bignum::{self, Mont};
+use core::cmp::Ordering;
 
 /// 坐标/域元素的最大 limb 数（P-384 用 6，P-256 用 4）。
 const MAXL: usize = 8;
@@ -87,6 +88,8 @@ pub struct Curve {
     tm3: F,
     tm4: F,
     tm8: F,
+    /// 曲线方程常数 b（Montgomery 域），ECDHE 验点是否在曲线上要用
+    tb: F,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +110,7 @@ impl Curve {
         let tm3 = to_f(&fp.to_mont(&bignum::from_be(&[3])));
         let tm4 = to_f(&fp.to_mont(&bignum::from_be(&[4])));
         let tm8 = to_f(&fp.to_mont(&bignum::from_be(&[8])));
+        let tb = to_f(&fp.to_mont(&bignum::from_be(&hex(q.b))));
         Curve {
             fp,
             fq,
@@ -123,6 +127,7 @@ impl Curve {
             tm3,
             tm4,
             tm8,
+            tb,
         }
     }
 
@@ -305,6 +310,104 @@ impl Curve {
         let x = self.mul_p(&p.x, &zinv2);
         Some(bignum::to_be(&self.fp.from_mont(&x[..self.k]), self.size))
     }
+
+    /// 仿射坐标（`x ‖ y` 大端），ECDHE 发公钥点用。
+    fn affine_point(&self, p: &Point) -> Option<Vec<u8>> {
+        if self.is_zero(&p.z) {
+            return None;
+        }
+        let zinv = self.inv_p(&p.z);
+        let zinv2 = self.sq_p(&zinv);
+        let zinv3 = self.mul_p(&zinv2, &zinv);
+        let x = self.mul_p(&p.x, &zinv2);
+        let y = self.mul_p(&p.y, &zinv3);
+        let mut out = Vec::with_capacity(self.size * 2);
+        out.extend_from_slice(&bignum::to_be(&self.fp.from_mont(&x[..self.k]), self.size));
+        out.extend_from_slice(&bignum::to_be(&self.fp.from_mont(&y[..self.k]), self.size));
+        Some(out)
+    }
+
+    /// 把大端坐标转换成 Jacobian 点，并验 `y² = x³ − 3x + b`。
+    ///
+    /// 对端给的 ECDHE 点必须验：不验就等于把"点是否在曲线上"的破口交给对方，
+    /// 小群攻击和无效点攻击都是从这儿进的。
+    fn point_from_affine(&self, x_be: &[u8], y_be: &[u8]) -> Option<Point> {
+        if x_be.len() != self.size || y_be.len() != self.size {
+            return None;
+        }
+        let x = to_f(&self.fp.to_mont(&bignum::from_be(x_be)));
+        let y = to_f(&self.fp.to_mont(&bignum::from_be(y_be)));
+        // 坐标必须 < p
+        if self.fp.cmp(&x[..self.k], self.fp.modulus()) == Ordering::Greater
+            || self.fp.cmp(&y[..self.k], self.fp.modulus()) == Ordering::Greater
+        {
+            return None;
+        }
+        let lhs = self.sq_p(&y);
+        let x2 = self.sq_p(&x);
+        let x3 = self.mul_p(&x2, &x);
+        let three_x = self.mul_p(&self.tm3, &x);
+        let rhs = self.add_p(&self.sub_p(&x3, &three_x), &self.tb);
+        if self.equal_mont(&lhs, &rhs) {
+            Some(Point {
+                x,
+                y,
+                z: self.tm1,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// 私钥是否落在 `[1, n−1]`。
+    fn scalar_in_range(&self, k_be: &[u8]) -> bool {
+        let v = bignum::from_be(k_be);
+        if v.iter().all(|&l| l == 0) {
+            return false;
+        }
+        self.fq.cmp(&v, self.fq.modulus()) == Ordering::Less
+    }
+}
+
+/// ECDHE：由 P-256 私钥算未压缩公钥点（`04 ‖ x ‖ y`，65 字节）。
+pub fn p256_public(k_be: &[u8]) -> Option<Vec<u8>> {
+    let c = Curve::p256();
+    if !c.scalar_in_range(k_be) {
+        return None;
+    }
+    let p = c.mul_point(&c.g, &normalize(k_be, 32));
+    let af = c.affine_point(&p)?;
+    let mut out = Vec::with_capacity(65);
+    out.push(0x04);
+    out.extend_from_slice(&af);
+    Some(out)
+}
+
+/// ECDHE：P-256 共享密钥（结果的 x 坐标，32 字节大端）。
+pub fn p256_shared(k_be: &[u8], peer_point: &[u8]) -> Option<Vec<u8>> {
+    let c = Curve::p256();
+    if !c.scalar_in_range(k_be) {
+        return None;
+    }
+    let (x, y) = split_point(peer_point, 32)?;
+    let q = c.point_from_affine(&x, &y)?;
+    let p = c.mul_point(&q, &normalize(k_be, 32));
+    c.affine_x(&p)
+}
+
+/// 拆 `04 ‖ x ‖ y`（或裸 `x ‖ y`）形式的点。
+fn split_point(p: &[u8], coord: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let body = if p.len() == 1 + coord * 2 {
+        if p[0] != 0x04 {
+            return None; // 不支持压缩点
+        }
+        &p[1..]
+    } else if p.len() == coord * 2 {
+        p
+    } else {
+        return None;
+    };
+    Some((body[..coord].to_vec(), body[coord..].to_vec()))
 }
 
 /// 验签。`qx_be`/`qy_be` 是公钥坐标（各 `q.size` 字节大端），`r_be`/`s_be` 是签名。

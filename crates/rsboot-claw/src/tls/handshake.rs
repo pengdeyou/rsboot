@@ -16,6 +16,7 @@ use super::der::Reader;
 use super::ec;
 use super::rsa;
 use super::sha256::{self, hmac_sha256, hkdf_expand, hkdf_extract};
+use super::tls12::{self, Error12};
 use super::x25519;
 use super::x509::{self, Cert};
 
@@ -126,6 +127,70 @@ impl AeadKey {
     }
 }
 
+/// 记录层密钥：1.3 与 1.2 的 nonce 与 AAD 规则不同，这里统一成一套读写接口，
+/// 上层（握手、`TlsStream`）就不用关心版本了。
+enum RecordKey {
+    V13(AeadKey),
+    V12(tls12::Key12),
+}
+
+impl RecordKey {
+    /// 解一条记录，返回 `(内容类型, 明文)`。
+    /// 1.3 要剥掉内部的 content type，1.2 的外层类型就是内容类型。
+    fn open(&self, seq: u64, outer: u8, header: &[u8; 5], body: &[u8]) -> Option<(u8, Vec<u8>)> {
+        match self {
+            RecordKey::V13(k) => {
+                if outer != CT_APPLICATION_DATA {
+                    return None;
+                }
+                let plain = k.open(seq, header, body)?;
+                let mut i = plain.len();
+                while i > 0 && plain[i - 1] == 0 {
+                    i -= 1;
+                }
+                if i == 0 {
+                    return None;
+                }
+                Some((plain[i - 1], plain[..i - 1].to_vec()))
+            }
+            RecordKey::V12(k) => {
+                Some((outer, k.open(seq, outer, body)?))
+            }
+        }
+    }
+
+    /// 封一条记录，返回 `(5 字节头, 记录体)`。头部长度必须先算好，
+    /// 因为它（及其长度字段）本身就是 AAD 的一部分。
+    fn seal(&self, seq: u64, ct: u8, pt: &[u8]) -> ([u8; 5], Vec<u8>) {
+        match self {
+            RecordKey::V13(k) => {
+                let mut inner = Vec::with_capacity(pt.len() + 1);
+                inner.extend_from_slice(pt);
+                inner.push(ct);
+                let mut hdr = [0u8; 5];
+                hdr[0] = CT_APPLICATION_DATA;
+                hdr[1] = 0x03;
+                hdr[2] = 0x03;
+                hdr[3..].copy_from_slice(&((inner.len() + 16) as u16).to_be_bytes());
+                (hdr, k.seal(seq, &hdr, &inner))
+            }
+            RecordKey::V12(k) => {
+                let body = k.seal(seq, ct, pt);
+                let mut hdr = [0u8; 5];
+                hdr[0] = ct;
+                hdr[1] = 0x03;
+                hdr[2] = 0x03;
+                hdr[3..].copy_from_slice(&(body.len() as u16).to_be_bytes());
+                (hdr, body)
+            }
+        }
+    }
+
+    fn is_13(&self) -> bool {
+        matches!(self, RecordKey::V13(_))
+    }
+}
+
 fn nonce_from_iv(iv: &[u8; 12], seq: u64) -> [u8; 12] {
     let mut n = *iv;
     for (i, b) in seq.to_be_bytes().iter().enumerate() {
@@ -139,8 +204,8 @@ fn nonce_from_iv(iv: &[u8; 12], seq: u64) -> [u8; 12] {
 /// 握手完成后的连接。`Read`/`Write` 直接收发明文应用数据。
 pub struct TlsStream {
     stream: TcpStream,
-    read: AeadKey,
-    write: AeadKey,
+    read: RecordKey,
+    write: RecordKey,
     read_seq: u64,
     write_seq: u64,
     /// 已解密但还没被 read() 取走的数据
@@ -165,13 +230,13 @@ impl TlsStream {
     }
 
     pub fn handshake(mut stream: TcpStream, host: &str, roots: Option<&[Cert]>) -> Result<TlsStream> {
-        let (r, w) = Self::perform_handshake(&mut stream, host, roots)?;
+        let (r, w, rseq, wseq) = Self::perform_handshake(&mut stream, host, roots)?;
         Ok(TlsStream {
             stream,
             read: r,
             write: w,
-            read_seq: 0,
-            write_seq: 0,
+            read_seq: rseq,
+            write_seq: wseq,
             pending: Vec::new(),
             eof: false,
         })
@@ -181,7 +246,7 @@ impl TlsStream {
         stream: &mut TcpStream,
         host: &str,
         roots: Option<&[Cert]>,
-    ) -> Result<(AeadKey, AeadKey)> {
+    ) -> Result<(RecordKey, RecordKey, u64, u64)> {
         let roots_owned;
         let roots: &[Cert] = match roots {
             Some(r) => r,
@@ -230,6 +295,39 @@ impl TlsStream {
             }
         }
         let sh = parse_server_hello(&sh_buf)?;
+
+        // 服务端没回 supported_versions 就是只认 1.2：交给 tls12 那段跑完
+        if let ServerHelloKind::V12 {
+            suite,
+            server_random,
+            ems,
+        } = sh.kind
+        {
+            let mut cr = [0u8; 32];
+            cr.copy_from_slice(&random);
+            let r = tls12::handshake(
+                stream,
+                host,
+                roots,
+                &hello,
+                &sh_buf,
+                &cr,
+                &server_random,
+                suite,
+                ems,
+            )
+            .map_err(map12)?;
+            return Ok((
+                RecordKey::V12(r.read),
+                RecordKey::V12(r.write),
+                r.read_seq,
+                r.write_seq,
+            ));
+        }
+        let (suite, server_ks) = match sh.kind {
+            ServerHelloKind::V13 { suite, key_share } => (suite, key_share),
+            ServerHelloKind::V12 { .. } => unreachable!("1.2 在上面已经返回"),
+        };
         // 我们每次都用新的 32 字节 legacy_session_id，服务端必须原样回显；
         // 回显了但长度不同就意味着对面理解成了 session resumption —— 不支持，直接拒
         if sh.session_id.as_deref().map(<[u8]>::len) != Some(32) {
@@ -237,10 +335,10 @@ impl TlsStream {
         }
 
         // ---- 密钥派生
-        let shared = x25519::shared_secret(&sk, &sh.key_share);
+        let shared = x25519::shared_secret(&sk, &server_ks);
         if std::env::var("RSBOOT_TLS_DEBUG").is_ok() {
             eprintln!("sk={}", hex(&sk));
-            eprintln!("peer={}", hex(&sh.key_share));
+            eprintln!("peer={}", hex(&server_ks));
         }
         // RFC 8446 §7.1：Early Secret 的 salt 与 IKM 都是"0"，在 HKDF 里指
         // 32 字节全零（不是空串——空 salt 的 HMAC 结果与 32 个零字节不同）
@@ -254,7 +352,6 @@ impl TlsStream {
         let th_sh = sha256::sha256(&transcript);
         let c_hs = expand_label(&handshake_secret, "c hs traffic", &th_sh, 32);
         let s_hs = expand_label(&handshake_secret, "s hs traffic", &th_sh, 32);
-        let suite = sh.suite;
         if std::env::var("RSBOOT_TLS_DEBUG").is_ok() {
             eprintln!("suite={:?}", suite);
             eprintln!("hello={}", hex(&transcript[..hello.len()]));
@@ -268,11 +365,12 @@ impl TlsStream {
             eprintln!("s_hs={}", hex(&s_hs));
         }
 
-        let read = traffic_key(&s_hs, suite);
+        let read_hs = traffic_key(&s_hs, suite);
         if std::env::var("RSBOOT_TLS_DEBUG").is_ok() {
-            eprintln!("rkey={}", hex(&read.key));
-            eprintln!("riv={}", hex(&read.iv));
+            eprintln!("rkey={}", hex(&read_hs.key));
+            eprintln!("riv={}", hex(&read_hs.iv));
         }
+        let read = RecordKey::V13(read_hs);
         let mut read_seq = 0u64;
 
         // ---- 加密握手：EE / Certificate / CertificateVerify / Finished
@@ -379,7 +477,7 @@ impl TlsStream {
         let mut msg = vec![HS_FINISHED, 0, 0, 32];
         msg.extend_from_slice(&fin);
         transcript.extend_from_slice(&msg);
-        let write = traffic_key(&c_hs, suite);
+        let write = RecordKey::V13(traffic_key(&c_hs, suite));
         let seq_for_write = 0u64;
         write_encrypted(stream, &write, seq_for_write, CT_HANDSHAKE, &msg)?;
 
@@ -388,7 +486,7 @@ impl TlsStream {
         let write_key = traffic_key(&c_ap, suite);
         let _ = (server_finished_key, read_seq as u8);
         // 客户端 handshake 记录用掉 seq 0，应用数据从 0 重新计数
-        Ok((read_key, write_key))
+        Ok((RecordKey::V13(read_key), RecordKey::V13(write_key), 0, 0))
     }
 
     fn read_record_encrypted(&mut self) -> Result<Vec<u8>> {
@@ -480,7 +578,7 @@ fn u24(n: usize) -> [u8; 3] {
     [(n >> 16) as u8, (n >> 8) as u8, n as u8]
 }
 
-fn random_bytes(n: usize) -> Vec<u8> {
+pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     // 零依赖下唯一可靠的熵源：Unix 的 /dev/urandom。
     // 注意不能用 std::fs::read——那会把整个字符设备读到内存耗尽，
     // 必须显式 read_exact。
@@ -510,6 +608,16 @@ fn random_bytes(n: usize) -> Vec<u8> {
     }
 }
 
+/// 1.2 那半边的错误码映射回统一错误。
+fn map12(e: Error12) -> TlsError {
+    match e {
+        Error12::Io(io) => TlsError::Io(io),
+        Error12::Protocol(m) => TlsError::Protocol(m),
+        Error12::Cert(m) => TlsError::Cert(m),
+        Error12::Alert(l, d) => TlsError::Alert(l, d),
+    }
+}
+
 fn x25519_private(seed: &[u8]) -> [u8; 32] {
     let mut k = [0u8; 32];
     let n = seed.len().min(32);
@@ -517,6 +625,13 @@ fn x25519_private(seed: &[u8]) -> [u8; 32] {
     k
 }
 
+/// 一个 ClientHello 同时兼容 1.3 与 1.2。
+///
+/// 关键在 `legacy_version` 与 `supported_versions` 的分工：legacy 固定 0x0303
+/// （1.2 服务端只读这个字段），`supported_versions` 里同时列 1.3 和 1.2。
+/// 1.3 服务端会挑 1.3；只认 1.2 的服务端按规范忽略这个不认识的扩展、回落到
+/// legacy 版本，于是同一个 hello 两边都能谈——不需要"先试 1.3 失败再重试"。
+/// 套件列表同理：1.3 与 1.2 的编号互不认识，各自忽略对方的。
 fn build_client_hello(host: &str, pubkey: &[u8; 32], random: &[u8], session_id: &[u8]) -> Vec<u8> {
     let mut ext = Vec::new();
     // server_name
@@ -525,18 +640,30 @@ fn build_client_hello(host: &str, pubkey: &[u8; 32], random: &[u8], session_id: 
         name.push(0); // host_name
         name.extend_from_slice(&(host.len() as u16).to_be_bytes());
         name.extend_from_slice(host.as_bytes());
-        // ServerNameList = 2 字节总长 || ServerName{type, 2 字节长度, 名字}
         ext.extend_from_slice(&[0x00, 0x00]);
         ext.extend_from_slice(&((name.len() + 2) as u16).to_be_bytes());
         ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
         ext.extend_from_slice(&name);
     }
-    // supported_groups: x25519 与 secp256r1（后者只在 HRR 时用，列上无害）
-    ext.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d]);
-    // signature_algorithms：只列我们真的验得动的
+    // supported_groups: x25519 与 secp256r1。1.3 只用前者；1.2 的 ECDHE 两个都可能
+    // 被选（x25519 在 1.2 里由 RFC 8422 定义，老服务端会退到 secp256r1）
     {
-        // 0403=ECDSA P-256, 0503=ECDSA P-384, 0804=RSA-PSS, 0401=RSA-PKCS1
-        let algs: [u16; 4] = [0x0403, 0x0503, 0x0804, 0x0401];
+        let groups: [u16; 2] = [0x001d, 0x0017];
+        ext.extend_from_slice(&[0x00, 0x0a]);
+        ext.extend_from_slice(&((groups.len() * 2 + 2) as u16).to_be_bytes());
+        ext.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
+        for g in groups {
+            ext.extend_from_slice(&g.to_be_bytes());
+        }
+    }
+    // ec_point_formats: 只支持 uncompressed。1.2 的某些老服务端缺这个扩展会拒
+    {
+        ext.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+    }
+    // signature_algorithms：1.3 的 CertVerify 与 1.2 的 ServerKeyExchange 共用
+    {
+        // 0403=ECDSA P-256, 0503=ECDSA P-384, 0804=RSA-PSS, 0401/0501/0601=RSA-PKCS1
+        let algs: [u16; 6] = [0x0403, 0x0503, 0x0804, 0x0401, 0x0501, 0x0601];
         ext.extend_from_slice(&[0x00, 0x0d]);
         ext.extend_from_slice(&((algs.len() * 2 + 2) as u16).to_be_bytes());
         ext.extend_from_slice(&((algs.len() * 2) as u16).to_be_bytes());
@@ -544,20 +671,40 @@ fn build_client_hello(host: &str, pubkey: &[u8; 32], random: &[u8], session_id: 
             ext.extend_from_slice(&a.to_be_bytes());
         }
     }
-    // supported_versions
-    ext.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+    // supported_versions: 1.3 与 1.2 都列
+    {
+        ext.extend_from_slice(&[0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03]);
+    }
+    // extended_master_secret（1.2 才有意义，1.3 服务端忽略）。
+    // 有它 master secret 绑定了握手转录，能挡 triple handshake 那一类
+    ext.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
+    // renegotiation_info：空表示"本次是新连接"，1.2 服务端往往要求它存在
+    ext.extend_from_slice(&[0xff, 0x01, 0x00, 0x01, 0x00]);
     // key_share: x25519
     {
         ext.extend_from_slice(&[0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
         ext.extend_from_slice(pubkey);
     }
 
+    // 套件：1.3 两个 + 1.2 的四个 ECDHE-AEAD（CBC 一个都不列）
+    let ciphers: [u16; 6] = [
+        CHACHA20_POLY1305_SHA256,
+        AES_128_GCM_SHA256,
+        tls12::ECDHE_ECDSA_AES128_GCM_SHA256,
+        tls12::ECDHE_RSA_AES128_GCM_SHA256,
+        tls12::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
+        tls12::ECDHE_RSA_CHACHA20_POLY1305_SHA256,
+    ];
+
     let mut body = Vec::new();
-    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version
     body.extend_from_slice(random);
     body.push(session_id.len() as u8);
     body.extend_from_slice(session_id);
-    body.extend_from_slice(&[0x00, 0x04, 0x13, 0x03, 0x13, 0x01]); // cipher suites
+    body.extend_from_slice(&((ciphers.len() * 2) as u16).to_be_bytes());
+    for c in ciphers {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
     body.push(1);
     body.push(0); // null compression
     body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -570,9 +717,19 @@ fn build_client_hello(host: &str, pubkey: &[u8; 32], random: &[u8], session_id: 
 }
 
 struct ServerHello {
-    suite: Suite,
-    key_share: [u8; 32],
+    kind: ServerHelloKind,
     session_id: Option<Vec<u8>>,
+}
+
+/// 服务端到底谈了哪个版本。1.3 的服务端必须回 `supported_versions`，
+/// 没有这个扩展就说明对面只认 1.2（我们发的 legacy_version 是 0x0303）。
+enum ServerHelloKind {
+    V13 { suite: Suite, key_share: [u8; 32] },
+    V12 {
+        suite: tls12::Suite12,
+        server_random: [u8; 32],
+        ems: bool,
+    },
 }
 
 fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
@@ -582,58 +739,92 @@ fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
     let body = r.take(len)?;
     let mut b = Reader::new(body);
     let _legacy = b.take(2)?;
-    let _random = b.take(32)?;
+    let random = b.take(32)?.to_vec();
     let sid_len = b.next_u8()? as usize;
     let session_id = b.take(sid_len)?.to_vec();
     let cs = u16::from_be_bytes([b.next_u8()?, b.next_u8()?]);
-    let suite = match cs {
-        CHACHA20_POLY1305_SHA256 => Suite::Chacha,
-        AES_128_GCM_SHA256 => Suite::Aes128,
-        _ => return Err(TlsError::Protocol("server picked an unsupported cipher suite")),
-    };
     let comp = b.next_u8()?;
     if comp != 0 {
-        return Err(TlsError::Protocol("compression must be null in TLS 1.3"));
+        // 我们只提供 null 压缩，服务端选别的等于协议违规
+        return Err(TlsError::Protocol("compression must be null"));
     }
-    let ext_len = u16::from_be_bytes([b.next_u8()?, b.next_u8()?]) as usize;
-    let exts = b.take(ext_len)?;
-    let mut e = Reader::new(exts);
-    let mut key_share = None;
-    let mut version_ok = false;
-    while !e.is_empty() {
-        let t = u16::from_be_bytes([e.next_u8()?, e.next_u8()?]);
-        let l = u16::from_be_bytes([e.next_u8()?, e.next_u8()?]) as usize;
-        let data = e.take(l)?;
-        match t {
-            43 => {
-                // supported_versions
-                let mut v = Reader::new(data);
-                let ver = u16::from_be_bytes([v.next_u8()?, v.next_u8()?]);
-                version_ok = ver == 0x0304;
-            }
-            51 => {
-                let mut k = Reader::new(data);
-                let group = u16::from_be_bytes([k.next_u8()?, k.next_u8()?]);
-                if group != 0x001d {
-                    return Err(TlsError::Protocol("server picked a key share group we did not offer"));
+
+    let mut version13: Option<u16> = None;
+    let mut key_share: Option<[u8; 32]> = None;
+    let mut ems = false;
+    if !b.is_empty() {
+        let ext_len = u16::from_be_bytes([b.next_u8()?, b.next_u8()?]) as usize;
+        let exts = b.take(ext_len)?;
+        let mut e = Reader::new(exts);
+        while !e.is_empty() {
+            let t = u16::from_be_bytes([e.next_u8()?, e.next_u8()?]);
+            let l = u16::from_be_bytes([e.next_u8()?, e.next_u8()?]) as usize;
+            let data = e.take(l)?;
+            match t {
+                43 => {
+                    let mut v = Reader::new(data);
+                    version13 = Some(u16::from_be_bytes([v.next_u8()?, v.next_u8()?]));
                 }
-                let kl = u16::from_be_bytes([k.next_u8()?, k.next_u8()?]) as usize;
-                let kd = k.take(kl)?;
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&kd[..32]);
-                key_share = Some(arr);
+                51 => {
+                    let mut k = Reader::new(data);
+                    let group = u16::from_be_bytes([k.next_u8()?, k.next_u8()?]);
+                    if group != 0x001d {
+                        return Err(TlsError::Protocol(
+                            "server picked a key share group we did not offer",
+                        ));
+                    }
+                    let kl = u16::from_be_bytes([k.next_u8()?, k.next_u8()?]) as usize;
+                    let kd = k.take(kl)?;
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&kd[..32]);
+                    key_share = Some(arr);
+                }
+                23 => ems = true,
+                _ => {}
             }
-            _ => {}
         }
     }
-    if !version_ok {
-        return Err(TlsError::Protocol("server did not agree on TLS 1.3"));
-    }
-    Ok(ServerHello {
-        suite,
-        key_share: key_share.ok_or(TlsError::Protocol("ServerHello without key_share"))?,
-        session_id: Some(session_id),
-    })
+
+    let kind = match version13 {
+        Some(0x0304) => {
+            let suite = match cs {
+                CHACHA20_POLY1305_SHA256 => Suite::Chacha,
+                AES_128_GCM_SHA256 => Suite::Aes128,
+                _ => return Err(TlsError::Protocol("server picked an unsupported cipher suite")),
+            };
+            ServerHelloKind::V13 {
+                suite,
+                key_share: key_share
+                    .ok_or(TlsError::Protocol("ServerHello without key_share"))?,
+            }
+        }
+        // 服务端回了 supported_versions 但选的是 1.2，或者干脆没回这个扩展：
+        // 两种都当 1.2 处理，套件必须落在我们列的那四个 AEAD 里
+        Some(other) if other == 0x0303 || other == 0x0302 => {
+            let suite = tls12::Suite12::from_id(cs)
+                .ok_or(TlsError::Protocol("server picked an unsupported TLS 1.2 suite"))?;
+            let mut sr = [0u8; 32];
+            sr.copy_from_slice(&random);
+            ServerHelloKind::V12 {
+                suite,
+                server_random: sr,
+                ems,
+            }
+        }
+        Some(_) => return Err(TlsError::Protocol("server agreed on an unsupported TLS version")),
+        None => {
+            let suite = tls12::Suite12::from_id(cs)
+                .ok_or(TlsError::Protocol("server picked an unsupported TLS 1.2 suite"))?;
+            let mut sr = [0u8; 32];
+            sr.copy_from_slice(&random);
+            ServerHelloKind::V12 {
+                suite,
+                server_random: sr,
+                ems,
+            }
+        }
+    };
+    Ok(ServerHello { kind, session_id: Some(session_id) })
 }
 
 /// 证书列表：3 字节总长 + 每项 3 字节长度。
@@ -772,55 +963,35 @@ fn read_record(stream: &mut TcpStream) -> Result<(u8, [u8; 5], Vec<u8>)> {
     Ok((hdr[0], header, body))
 }
 
-/// 解密一条记录，返回 `(inner_content_type, content)`。
-fn read_encrypted(stream: &mut TcpStream, key: &AeadKey, seq: u64) -> Result<(u8, Vec<u8>)> {
+/// 解一条记录，返回 `(内容类型, 明文)`。版本差异全在 `RecordKey` 里。
+fn read_encrypted(stream: &mut TcpStream, key: &RecordKey, seq: u64) -> Result<(u8, Vec<u8>)> {
     let (outer, header, body) = read_record(stream)?;
     if std::env::var("RSBOOT_TLS_DEBUG").is_ok() {
-        eprintln!("rec outer={outer} len={} seq={seq} body={}", body.len(), hex(&body[..body.len().min(96)]));
+        eprintln!(
+            "rec outer={outer} len={} seq={seq} body={}",
+            body.len(),
+            hex(&body[..body.len().min(96)])
+        );
     }
     if outer == CT_CHANGE_CIPHER_SPEC {
         return Ok((CT_CHANGE_CIPHER_SPEC, Vec::new()));
     }
-    if outer != CT_APPLICATION_DATA {
-        // 明文 alert 仍然可能出现在切换点
-        if outer == CT_ALERT {
-            return Ok((CT_ALERT, body));
-        }
-        return Err(TlsError::Protocol("expected encrypted record"));
+    // 明文 alert 可能出现在密钥切换点前后；1.2 的 alert 是加密的，走下面
+    if key.is_13() && outer == CT_ALERT {
+        return Ok((CT_ALERT, body));
     }
-    let plain = key
-        .open(seq, &header, &body)
-        .ok_or(TlsError::Protocol("record decryption failed"))?;
-    // TLSInnerPlaintext = content || 0…0 || content_type
-    let mut i = plain.len();
-    while i > 0 && plain[i - 1] == 0 {
-        i -= 1;
-    }
-    if i == 0 {
-        return Err(TlsError::Protocol("record without content type"));
-    }
-    let ct = plain[i - 1];
-    Ok((ct, plain[..i - 1].to_vec()))
+    key.open(seq, outer, &header, &body)
+        .ok_or(TlsError::Protocol("record decryption failed"))
 }
 
 fn write_encrypted(
     stream: &mut TcpStream,
-    key: &AeadKey,
+    key: &RecordKey,
     seq: u64,
     ct: u8,
     body: &[u8],
 ) -> Result<()> {
-    let mut inner = Vec::with_capacity(body.len() + 1);
-    inner.extend_from_slice(body);
-    inner.push(ct);
-    // 头部要先于加密确定（长度 = 明文长 + 16 字节 tag），因为它就是 AEAD 的附加数据
-    let sealed_len = (inner.len() + 16) as u16;
-    let mut hdr = [0u8; 5];
-    hdr[0] = CT_APPLICATION_DATA;
-    hdr[1] = 0x03;
-    hdr[2] = 0x03;
-    hdr[3..].copy_from_slice(&sealed_len.to_be_bytes());
-    let sealed = key.seal(seq, &hdr, &inner);
+    let (hdr, sealed) = key.seal(seq, ct, body);
     stream.write_all(&hdr)?;
     stream.write_all(&sealed)?;
     stream.flush()?;

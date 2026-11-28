@@ -181,7 +181,8 @@ v0.1 的定位是"能独立跑起来、礼貌、可测"，架构 fork Scrapy 的
 - [x] v1.0 HTTPS 自研 TLS 1.3（零依赖）：`src/tls/` 手写 x25519、ChaCha20-Poly1305、AES-128/256-GCM、SHA-256/384/512、HMAC/HKDF、DER/X.509、RSA（PKCS#1 v1.5 + PSS）、ECDSA（P-256/SHA-256、P-384/SHA-384）、Montgomery 大数、链校验、握手状态机。根证书读系统 bundle（`SSL_CERT_FILE` 或常见路径），另留 `trust_roots()` 注入私有 CA
 - [x] v1.0 链校验的两个真实世界坑：① 服务端发来的根常是「被旧根交叉签过」的形态（`SSL.com TLS ECC Root CA 2022` ← `AAA Certificate Services`），而系统根里是自签形态 —— 只按名字取第一个签发者会走进死路，改成多路径 DFS；② 名字比较必须按 RFC 5280 比属性内容，不能比字节（同一 CN 在不同证书里可能一个是 PrintableString、一个是 UTF8String）
 - [x] v1.0 密码学调试方法论：密钥调度用 RFC 8448 §3 的 early/derived/handshake/s hs 中间值逐段核对，再和本地 `openssl s_server` 的 keylog 逐字节比对；`maskedDB` 左位检查必须在「异或解开前」做（写错位置会导致只在某些模数上失败，本地向量还测不出来）
-- 不做：TLS 1.2（只认 1.2 的站点直接回 alert 70）、P-521/Ed25519 证书（系统根里约 30% 是这两类，但真实站点 leaf/中间证书基本不用）、`CONNECT` 隧道（https 走明文代理还是明确报错）
+- [x] v1.1 TLS 1.2（老站点兼容，零依赖）：`src/tls/tls12.rs` 只做 ECDHE + AEAD 四套件（ECDHE-ECDSA/RSA × AES-128-GCM / ChaCha20-Poly1305），CBC/重协商/会话复用/客户端证书/有限域 DHE 全不做；`ClientHello` 用 `[1.3, 1.2]` 双版本 + 混排套件，一个 hello 直接协商出结果，没有 retry 回退。实测 `www.baidu.com`（只认 1.2）HTTP 200，此前是 alert 70
+- 不做：SSLv3 / TLS 1.0 / TLS 1.1（RFC 8996 判死，且只有 CBC 套件）、DTLS/QUIC、P-521/Ed25519 证书（系统根里约 30% 是这两类，但真实站点 leaf/中间证书基本不用）、`CONNECT` 隧道（https 走明文代理还是明确报错）
 - 不做：JS 渲染（要 headless browser）、gzip 解压（请求侧直接 `identity`）、分布式调度（单机爬虫不做分布式协调）
 
 ---
