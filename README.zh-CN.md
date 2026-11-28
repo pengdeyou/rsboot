@@ -256,7 +256,7 @@ ApiError::upstream("第三方超时")       // 等价于 code = 5001
 | `rsboot-cookie` | Cookie 读取、`Set-Cookie`（`SameSite` / `HttpOnly` / `Secure` / `Max-Age`） | 无 |
 | `rsboot-form` | `Form<T>`：`application/x-www-form-urlencoded` 提取器 | `serde_urlencoded` |
 | `rsboot-static` | 静态文件：ETag / 304 / 单区间 206 / 穿越防护 / index | 无 |
-| `rsboot-view` | Smarty 风格模板引擎：`{$x}`、`{if}`、`{foreach}`、`{include}`、管道修饰符 | `serde_json` |
+| `rsboot-view` | Smarty 风格模板引擎：`{$x}`、`{if}`、带 `@index`/`@first` 的 `{foreach}`、`{for}`、`{capture}`、带参 `{include}`、`{extends}`/`{block}`、`{cycle}`、`{html_select}`、20+ 修饰符、默认自动转义 | `serde_json` |
 | `rsboot-sse` | Server-Sent Events：`Event` 编解码（多行 `data`、`id`/`event` 防拆帧）+ 可配心跳，基于核心 `ChunkSink` | 无 |
 | `rsboot-claw` | 爬虫：per-host frontier + 去重 + 深度、RFC 9309 robots、零依赖 HTML 扫描、带 keep-alive 的 HTTP/1.1 客户端 | 无 |
 

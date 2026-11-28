@@ -19,14 +19,30 @@
 //!
 //! | 写法 | 含义 |
 //! | --- | --- |
-//! | `{$name}` / `{$user.name}` / `{$list[0]}` | 取值，点与下标可混用 |
+//! | `{$name}` / `{$user.name}` / `{$list[0]}` / `{$obj[$k]}` | 取值，点与下标可混用 |
 //! | `{if $a > 1}…{elseif $b}…{else}…{/if}` | 条件；`and`/`or`/`not` 与 `&&`/`\|\|`/`!` 等价 |
 //! | `{foreach $list as $it}` / `as $k => $v` / `{foreachelse}` | 迭代数组或对象 |
-//! | `{$x\|escape}` `\|upper` `\|lower` `\|trim` `\|default:"-"` `\|length` `\|truncate:20` `\|json` `\|join:", "` `\|nl2br` `\|raw` | 修饰符，可链式 |
-//! | `{include "x.tpl"}` / `{include file="x.tpl"}` | 引入子模板（共享父作用域） |
-//! | `{literal}…{/literal}` | 原样输出（里面的 `{` 不当标签） |
-//! | `{* … *}` | 注释 |
+//! | `{$it@index}` `@iteration` `@first` `@last` `@total` `@key` | 循环属性，只在 `foreach` 体内有效 |
+//! | `{for $i=1 to 5 step 2}…{forelse}…{/for}` | 数字区间；默认步长 1，倒着数写 `step -1` |
+//! | `{capture name="x"}…{/capture}` / `append=true` | 把渲染片段存进变量（回显要 `\|raw`） |
+//! | `{assign var="x" value=$y}` | 往当前作用域写变量 |
+//! | `{include file="x.tpl" item=$it}` | 引入子模板；参数进子作用域，父作用域只读 |
+//! | `{extends "layout"}` + `{block name="x"}` | 模板继承，编译期展开 |
+//! | `{cycle values="odd,even"}` | 按出现次序轮转取值（斑马纹、左右分栏） |
+//! | `{html_select name="c" options=$list selected=$cur empty="请选择"}` | 直接产出 `<select>`，内部强制转义 |
+//! | `{literal}…{/literal}` / `{* … *}` | 原样输出 / 注释 |
 //! | `{myfunc a=$x b="y"}` | 调注册函数（见 [`Engine::func`]） |
+//!
+//! 修饰符（可链式）：`escape` `raw` `upper` `lower` `trim` `capitalize`
+//! `nl2br` `default:x` `length`/`count` `truncate:n[:suffix]` `substr:start[:len]`
+//! `replace:"a":"b"` `split:","` `join:sep` `pad:n:"0"` `repeat:n`
+//! `number_format:2` `date:"%Y-%m-%d"` `urlencode` `strip_tags` `json`。
+//!
+//! ## 错误定位
+//!
+//! 语法错误在 `add`/`add_dir` 时就报（带行号）；运行期错误（除零、缺模板、
+//! 修饰符参数不对）也会带 `模板:行`——每个标签在 AST 里留了一个行号标记，
+//! 执行到就更新，出错直接取当前值。
 //!
 //! ## 为什么不是"引一个模板引擎"
 //!
@@ -92,6 +108,14 @@ impl Error {
     }
 }
 
+/// 让 handler 能直接 `?` 掉模板错误：`Result<Response, Error>` 里的 `Err`
+/// 会被转成 500 + 5000 的统一错误体，不会把模板源码或数据泄露给浏览器。
+impl rsboot::web::IntoResponse for Error {
+    fn into_response(self) -> rsboot::web::Response {
+        self.to_api_error().into_response()
+    }
+}
+
 /// 编译好的模板集合。
 ///
 /// 构造完就是只读的：所有模板在 `add` / `add_dir` 时编译一遍，
@@ -103,6 +127,8 @@ pub struct Engine {
     /// 渲染只看这一份，所以运行期既没有锁，也没有"父模板还没到"的中间态。
     templates: HashMap<String, Arc<Vec<Stmt>>>,
     funcs: HashMap<String, Func>,
+    /// 每次渲染都会先铺进根作用域的常量（站点名、版本号之类）。
+    globals: HashMap<String, Value>,
     auto_escape: bool,
 }
 
@@ -120,6 +146,7 @@ impl std::fmt::Debug for Engine {
         f.debug_struct("Engine")
             .field("templates", &self.templates.len())
             .field("funcs", &self.funcs.len())
+            .field("globals", &self.globals.len())
             .field("auto_escape", &self.auto_escape)
             .finish()
     }
@@ -137,6 +164,7 @@ impl Engine {
             raw: HashMap::new(),
             templates: HashMap::new(),
             funcs: HashMap::new(),
+            globals: HashMap::new(),
             auto_escape: true,
         }
     }
@@ -144,6 +172,19 @@ impl Engine {
     /// 是否自动做 HTML 转义（默认开，见模块文档）。
     pub fn auto_escape(mut self, on: bool) -> Self {
         self.auto_escape = on;
+        self
+    }
+
+    /// 注册一批全局常量。业务数据里的同名字段会覆盖它。
+    ///
+    /// 用途很窄但很省事：`{$site.name}`、`{$app.version}` 这种每个页面都要的
+    /// 东西，不必每个 handler 都往 `data` 里塞一遍。
+    pub fn globals(mut self, g: &Value) -> Self {
+        if let Value::Object(m) = g {
+            for (k, v) in m {
+                self.globals.insert(k.clone(), v.clone());
+            }
+        }
         self
     }
 
@@ -225,6 +266,36 @@ impl Engine {
                 msg: "找不到模板".to_string(),
             }),
         }
+    }
+
+    /// 渲染到已有缓冲区：高频路径（列表页、SSE 片段）能省一次 `String` 分配。
+    pub fn render_into(&self, name: &str, data: &Value, out: &mut String) -> Result<(), Error> {
+        match self.template(name) {
+            Some(t) => t.render_into(data, out),
+            None => Err(Error {
+                template: name.to_string(),
+                line: 0,
+                msg: "找不到模板".to_string(),
+            }),
+        }
+    }
+
+    /// 渲染成可以直接返回的 HTML 响应。
+    ///
+    /// handler 里写 `Ok(view.render_response("list", &data)?)` 就够了——错误
+    /// 走 [`Error::to_api_error`]，模板坏了是 500 + 5000，细节不落到浏览器。
+    pub fn render_response(
+        &self,
+        name: &str,
+        data: &Value,
+    ) -> Result<rsboot::web::Response, Error> {
+        let html = self.render(name, data)?;
+        Ok(rsboot::web::Response::html(html))
+    }
+
+    /// 渲染层要拿这层常量，不能用同一个名字的 builder 方法，故另起名。
+    pub(crate) fn global_values(&self) -> &HashMap<String, Value> {
+        &self.globals
     }
 
     pub(crate) fn nodes(&self, name: &str) -> Option<&[Stmt]> {
@@ -383,6 +454,26 @@ fn replace_blocks(nodes: &[Stmt], overrides: &HashMap<String, Vec<Stmt>>) -> Vec
                 body: replace_blocks(body, overrides),
                 else_: replace_blocks(else_, overrides),
             },
+            Stmt::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+                else_,
+            } => Stmt::For {
+                var: var.clone(),
+                start: start.clone(),
+                end: end.clone(),
+                step: step.clone(),
+                body: replace_blocks(body, overrides),
+                else_: replace_blocks(else_, overrides),
+            },
+            Stmt::Capture { name, append, body } => Stmt::Capture {
+                name: name.clone(),
+                append: *append,
+                body: replace_blocks(body, overrides),
+            },
             other => other.clone(),
         })
         .collect()
@@ -401,8 +492,15 @@ impl Template<'_> {
     }
 
     pub fn render(&self, data: &Value) -> Result<String, Error> {
+        let mut out = String::with_capacity(1024);
+        self.render_into(data, &mut out)?;
+        Ok(out)
+    }
+
+    /// 渲染追加到已有缓冲区（模板片段拼接、SSE 分片输出都用它）。
+    pub fn render_into(&self, data: &Value, out: &mut String) -> Result<(), Error> {
         let mut rt = render::Rt::new(self.engine, self.name, data);
-        rt.run(self.nodes)
+        rt.run_into(self.nodes, out)
     }
 }
 
@@ -665,5 +763,198 @@ mod tests {
     fn json_values_render_as_json() {
         let e = engine().add("a", "{$o}").unwrap().auto_escape(false);
         assert_eq!(e.render("a", &json!({"o": {"a": 1}})).unwrap(), "{\"a\":1}");
+    }
+
+    // ---- v1.0：循环属性、for、capture、带参 include、cycle、select、修饰符、globals ----
+
+    #[test]
+    fn for_loop_steps_and_handles_else() {
+        let e = engine().add("a", "{for $i=1 to 5 step 2}{$i},{/for}").unwrap();
+        assert_eq!(e.render("a", &json!({})).unwrap(), "1,3,5,");
+        // 倒着数要显式 `step -1`
+        let e = engine().add("b", "{for $i=3 to 1 step -1}{$i}{forelse}none{/for}").unwrap();
+        assert_eq!(e.render("b", &json!({})).unwrap(), "321");
+        // 不写 step 时方向不自动反转：起点大于终点就是一次都不跑，走 forelse
+        let e = engine().add("c", "{for $i=3 to 1}x{forelse}none{/for}").unwrap();
+        assert_eq!(e.render("c", &json!({})).unwrap(), "none");
+        // step 为 0 是模板写错了，必须报错而不是死循环
+        let e = engine().add("d", "{for $i=1 to 3 step 0}x{/for}").unwrap();
+        assert!(e.render("d", &json!({})).unwrap_err().msg.contains("step"));
+    }
+
+    #[test]
+    fn foreach_loop_properties() {
+        let e = engine()
+            .add(
+                "a",
+                "{foreach $list as $it}{$it@index}/{$it@iteration}/{$it@first}/{$it@last}/{$it@total};{/foreach}",
+            )
+            .unwrap();
+        assert_eq!(
+            e.render("a", &json!({"list": ["x", "y", "z"]})).unwrap(),
+            "0/1/true/false/3;1/2/false/false/3;2/3/false/true/3;"
+        );
+        // 对象迭代时 @key 是字段名
+        let e = engine().add("b", "{foreach $o as $v}{$v@key}={$v};{/foreach}").unwrap();
+        assert_eq!(e.render("b", &json!({"o": {"a": 1}})).unwrap(), "a=1;");
+        // 嵌套同名变量：内层作用域优先
+        let e = engine()
+            .add("c", "{foreach $a as $i}{foreach $b as $i}{$i@index}{/foreach}{/foreach}")
+            .unwrap();
+        assert_eq!(e.render("c", &json!({"a": [1,2], "b": [9]})).unwrap(), "00");
+    }
+
+    #[test]
+    fn capture_stores_rendered_fragment() {
+        let e = engine()
+            .add(
+                "a",
+                "{capture name=\"head\"}<b>{$t}</b>{/capture}[{$head}]",
+            )
+            .unwrap();
+        // capture 存的是**已渲染的 HTML 片段**，回显要 `|raw`：
+        // 自动转义对"已经由引擎渲染过的片段"同样生效，这是有意的——
+        // 否则 capture 就成了绕过转义的暗门。
+        assert_eq!(e.render("a", &json!({"t": "x"})).unwrap(), "[&lt;b&gt;x&lt;/b&gt;]");
+        let e = engine()
+            .add("a2", "{capture name=\"head\"}<b>{$t}</b>{/capture}[{$head|raw}]")
+            .unwrap();
+        assert_eq!(e.render("a2", &json!({"t": "x"})).unwrap(), "[<b>x</b>]");
+        let e = engine()
+            .add("b", "{capture name=\"h\"}a{/capture}{capture name=\"h\" append=true}b{/capture}{$h}")
+            .unwrap();
+        assert_eq!(e.render("b", &json!({})).unwrap(), "ab");
+    }
+
+    #[test]
+    fn include_takes_params_and_does_not_leak_back() {
+        let e = engine()
+            .add("row", "<td>{$label}:{$item.name}</td>")
+            .unwrap()
+            .add("page", "{include file=\"row\" item=$it label=\"名字\"}{$label}")
+            .unwrap();
+        assert_eq!(
+            e.render("page", &json!({"it": {"name": "张三"}})).unwrap(),
+            "<td>名字:张三</td>"
+        );
+        // 子模板里 assign 的东西不回到父层
+        let e = engine()
+            .add("row2", "{assign var=\"tmp\" value=1}")
+            .unwrap()
+            .add("page2", "{include file=\"row2\"}[{$tmp}]")
+            .unwrap();
+        assert_eq!(e.render("page2", &json!({})).unwrap(), "[]");
+    }
+
+    #[test]
+    fn cycle_alternates_and_can_reset() {
+        let e = engine()
+            .add("a", "{for $i=1 to 3}{cycle values=\"odd,even\"},{/for}")
+            .unwrap();
+        assert_eq!(e.render("a", &json!({})).unwrap(), "odd,even,odd,");
+        let e = engine()
+            .add("b", "{cycle values=\"a,b\"}{cycle values=\"a,b\"}")
+            .unwrap();
+        assert_eq!(e.render("b", &json!({})).unwrap(), "ab");
+    }
+
+    #[test]
+    fn html_select_escapes_and_marks_selected() {
+        let e = engine()
+            .add(
+                "a",
+                r#"{html_select name="city" options=$cities selected=$cur empty="请选择"}"#,
+            )
+            .unwrap();
+        let out = e
+            .render(
+                "a",
+                &json!({
+                    "cities": [{"value": 1, "label": "北京"}, {"value": 2, "label": "<上海>"}],
+                    "cur": 2
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            "<select name=\"city\"><option value=\"\">请选择</option>\
+             <option value=\"1\">北京</option>\
+             <option value=\"2\" selected>&lt;上海&gt;</option></select>"
+        );
+        // 没传 selected 时，空选项默认选中
+        let out = e.render("a", &json!({"cities": [1]})).unwrap();
+        assert!(out.contains("<option value=\"\" selected>"));
+    }
+
+    #[test]
+    fn new_modifiers() {
+        let e = engine()
+            .add(
+                "a",
+                r#"{$n|number_format:2}|{$t|date:"%Y-%m-%d"}|{$s|replace:"a":"b"}|{$s|substr:1:2}|{$s|capitalize}|{$i|pad:3}|{$s|repeat:2}|{$u|urlencode}|{$h|strip_tags}"#,
+            )
+            .unwrap();
+        let out = e
+            .render(
+                "a",
+                &json!({
+                    "n": 1234567.891, "t": 1704067200, "s": "abc",
+                    "i": 7, "u": "a b", "h": "<b>x</b>"
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            "1,234,567.89|2024-01-01|bbc|bc|Abc|007|abcabc|a%20b|x"
+        );
+        // split 产出数组，可以直接喂给 foreach
+        let e = engine()
+            .add("b", "{foreach $s|split:\"-\" as $p}[{$p}]{/foreach}")
+            .unwrap();
+        assert_eq!(e.render("b", &json!({"s": "a-b-c"})).unwrap(), "[a][b][c]");
+    }
+
+    #[test]
+    fn globals_are_overridable_by_data() {
+        let e = Engine::new()
+            .globals(&json!({"site": {"name": "rsboot"}}))
+            .add("a", "{$site.name}")
+            .unwrap();
+        assert_eq!(e.render("a", &json!({})).unwrap(), "rsboot");
+        assert_eq!(
+            e.render("a", &json!({"site": {"name": "业务"}})).unwrap(),
+            "业务"
+        );
+    }
+
+    #[test]
+    fn runtime_error_reports_template_and_line() {
+        let e = engine().add("a", "line1\nline2\n{$x|nope}").unwrap();
+        let err = e.render("a", &json!({"x": 1})).unwrap_err();
+        assert_eq!(err.line, 3, "{err}");
+        assert!(err.to_string().starts_with("a:3: "), "{err}");
+    }
+
+    #[test]
+    fn render_into_appends_and_render_response_sets_html() {
+        let e = engine().add("a", "<p>{$x}</p>").unwrap();
+        let mut buf = String::from("<ul>");
+        e.render_into("a", &json!({"x": 1}), &mut buf).unwrap();
+        assert_eq!(buf, "<ul><p>1</p>");
+
+        let resp = e.render_response("a", &json!({"x": 2})).unwrap();
+        assert_eq!(resp.body, b"<p>2</p>".to_vec());
+        assert_eq!(
+            resp.headers.get("content-type").map(|v| v.to_string()),
+            Some("text/html; charset=utf-8".to_string())
+        );
+    }
+
+    #[test]
+    fn error_into_response_is_a_500() {
+        let e = engine().add("a", "{$x|nope}").unwrap();
+        let err = e.render("a", &json!({"x": 1})).unwrap_err();
+        let resp = rsboot::web::IntoResponse::into_response(err);
+        assert_eq!(resp.status.0, 500);
     }
 }

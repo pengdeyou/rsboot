@@ -141,7 +141,8 @@ Mac 本机交替 5 轮 A/B（加流式前后）落在 57k–73k QPS、同代码�
 
 - [ ] `rsboot-static`：Linux `sendfile`（大文件零拷贝）+ 预压缩旁路（`.gz` / `.br` 存在就直接发，配 `content-encoding`）
 - [ ] `rsboot-static`：`Vary: Accept-Encoding`、`If-Modified-Since` 与 `If-None-Match` 并存时的优先级、目录列表默认关闭的显式参数
-- [ ] `rsboot-view`：`{for}`、`{capture}`、内建变量（`$smarty.now` 等）、过滤器 `|date` `|default` `|truncate`（`|escape` `|upper` `|json` 已有）
+- [x] `rsboot-view` v1.0：`{for}`/`{capture}`/循环属性（`$it@index` 等）/带参 `include`/`{cycle}`/`{html_select}`/`globals`/`render_response`，修饰符补 `|date` `|number_format` `|substr` `|replace` `|split` `|pad` `|repeat` `|capitalize` `|urlencode` `|strip_tags`，运行期错误带 `模板:行`
+- [ ] `rsboot-view`：内建变量 `$smarty.now` / `$smarty.get` / `$smarty.const`（`Engine::globals` 已能覆盖大部分场景）
 - [ ] `rsboot-view`：模板热重载（dev 模式 mtime 检测，复用 `config/watcher` 的机制）
 - [ ] `rsboot-view`：编译产物缓存落盘（`.tplc`），避免每次启动重解析
 

@@ -1,10 +1,10 @@
 [package]
 name = "rsboot-view"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-description = "Smarty-style template engine for rsboot: {$var}, {if}, {foreach}, modifiers."
+description = "Smarty-style template engine for rsboot: {$var}, loops with @props, for, capture, include params, template inheritance, modifiers, auto-escape."
 repository = "https://github.com/pengdeyou/rsboot"
 
 [dependencies]
