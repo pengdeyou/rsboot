@@ -186,9 +186,26 @@ fn take_one(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
 }
 ```
 
+**Handlers that return `Response` do not need `Ok(...)`.** With a `-> Response` signature both branches can just return:
+
+```rust
+fn ping(_: &mut Request, _: &Context) -> Response {
+    Res::success("ok")
+}
+
+fn detail(_: &mut Request, _: &Context) -> Response {
+    if miss() {
+        return Res::fail_response("no such record");   // 400 + the same shape
+    }
+    Res::data(row)
+}
+```
+
+No need to turn the whole handler into `Result<..>` just to report one error path.
+
 Three things worth knowing:
 
-- `fail` returns an `ApiError`, not a `Response`, so it drops straight into `Err(...)`.
+- `fail` returns an `ApiError`, `fail_response` returns a `Response` — not a duplicate: two handler signatures, one for each.
 - For these calls the wrapper is **unconditional** — it does not depend on `http.envelope`. A shape you asked for explicitly should not be reshaped by a global switch.
 - `data` serialises into the same buffer (no `serde_json::Value` tree in between), and the field order is byte-identical to what `http.envelope` produces, so turning that switch on does not change a single byte of these responses.
 
