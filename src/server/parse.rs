@@ -23,7 +23,6 @@
 
 use crate::web::http::headers::HeaderSpare;
 use crate::web::http::{Headers, Method, Status};
-use std::sync::Arc;
 
 /// 请求行里的目标：`/path?query`。
 ///
@@ -88,7 +87,7 @@ pub fn parse_head<'a>(head: &'a str, max_body: usize) -> Result<ParsedRequest<'a
 ///
 /// keep-alive 连接上，这条路径能让"每个请求一次 `Vec::with_capacity`"变成
 /// 零分配——连接里存着上一轮那批槽位，这里 `clear` 一下就接着用。
-pub fn parse_head_with<'a>(
+pub(crate) fn parse_head_with<'a>(
     head: &'a str,
     max_body: usize,
     spare: HeaderSpare,

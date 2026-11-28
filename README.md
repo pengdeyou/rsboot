@@ -257,6 +257,8 @@ so you never pay for what you do not use:
 | `rsboot-ops` | `/healthz`, `/readyz` (per-database detail), `/metrics` (Prometheus text) | `serde_json` |
 | `rsboot-cookie` | cookie reading, `Set-Cookie` (`SameSite` / `HttpOnly` / `Secure` / `Max-Age`) | none |
 | `rsboot-form` | `Form<T>` for `application/x-www-form-urlencoded` | `serde_urlencoded` |
+| `rsboot-static` | static files: ETag / 304 / single-range 206 / traversal guard / index | none |
+| `rsboot-view` | Smarty-style templates: `{$x}`, `{if}`, `{foreach}`, `{include}`, pipe modifiers | `serde_json` |
 
 ```rust,ignore
 use rsboot_ops as ops;
@@ -274,6 +276,76 @@ let r = Router::new()
 The core exposes just two generic hooks for them: `Headers::append` (a response may
 carry several `Set-Cookie` lines) and `web::stats` (a `fn(u16, u64)` observer that
 costs one atomic load when nothing is installed).
+
+### Static files
+
+`Static` keeps the root behind an `Arc<OnceLock<Option<PathBuf>>>`, so cloning it is
+one refcount bump and you can hang it straight on a route:
+
+```rust,ignore
+use rsboot_static::Static;
+
+let assets = Static::dir("public").max_age(3600).immutable();
+let files  = Static::dir("uploads").index("index.html");
+
+let r = Router::new()
+    .get("/assets/*path", {
+        let s = assets.clone();
+        move |req: &mut Request, _| s.serve_or_404(req)
+    })?
+    .fallback(files.clone().fallback());
+```
+
+Notes: `If-None-Match` wins over `If-Modified-Since` (`*` counts as a match); multi-range
+`Range` is ignored and served as 200 (assembling the parts costs more than it saves);
+every path segment is `percent_decode`d and rejected if it is `.`, `..`, contains a
+separator or NUL, and after `canonicalize` the result must still `starts_with(root)`,
+so a symlink pointing outside is refused too. A miss returns **404** rather than `None`
+-- "refused" and "not mine" are different answers, and conflating them misleads the layer
+above.
+
+### Templates
+
+`rsboot-view` borrows its architecture from minijinja (no token stream, parse while
+reading, compile once and render many) and its syntax from Smarty. Not pulling in
+`minijinja` or `tera` is simple: it would break the zero-dependency promise, and either
+one speaks Jinja (`{{ }}` / `{% %}`), which is not `{$x}`.
+
+```rust,ignore
+use std::sync::Arc;
+use rsboot_view::Engine;
+
+// compiled once at startup, shared across workers via Arc; rendering only does lookups
+let view = Arc::new(Engine::new().add_dir("templates")?);
+
+let r = Router::new().get("/orders", {
+    let v = view.clone();
+    move |req: &mut Request, _| {
+        let data = serde_json::json!({ "title": "Orders", "items": list });
+        match v.render("orders.tpl", &data) {
+            Ok(html) => Response::html(html),
+            Err(e) => e.to_api_error().into_response(),
+        }
+    }
+})?;
+```
+
+| syntax | meaning |
+| --- | --- |
+| `{$name}` `{$user.name}` `{$list[0]}` | read a value, dots and indexes mix |
+| `{if $a > 1}...{elseif $b}...{else}...{/if}` | conditionals, `and` / `or` / `not` |
+| `{foreach $list as $it}` `as $k => $v` `{foreachelse}` | iterate an array or object |
+| `{$x\|escape}` `\|raw` `\|upper` `\|lower` `\|trim` `\|default:"-"` `\|length` `\|truncate:20` `\|json` `\|join:", "` `\|nl2br` | modifiers, chainable |
+| `{include "x.tpl"}` / `{include file="x.tpl"}` | pull in a sub-template sharing the parent scope |
+| `{literal}...{/literal}` `{* ... *}` | verbatim output / comment |
+| `{myfunc a=$x}` | call a function registered with `Engine::func` |
+
+Two intentional differences from Smarty: **auto-escaping is on by default** (Smarty
+leaves it off), because forgetting `|escape` costs you an XSS while forgetting `|raw`
+only shows a literal `&lt;div&gt;`; and `|json` turns `< > & '` into `\uXXXX`, so
+embedding it in `<script>` or a `data-*` attribute cannot close the tag early. `include`
+is capped at 32 levels, so a cyclic include is a clear error instead of a blown worker
+stack.
 
 ## Design highlights
 

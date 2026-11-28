@@ -255,6 +255,8 @@ ApiError::upstream("第三方超时")       // 等价于 code = 5001
 | `rsboot-ops` | `/healthz`、`/readyz`（带依赖明细）、`/metrics`（Prometheus 文本） | `serde_json` |
 | `rsboot-cookie` | Cookie 读取、`Set-Cookie`（`SameSite` / `HttpOnly` / `Secure` / `Max-Age`） | 无 |
 | `rsboot-form` | `Form<T>`：`application/x-www-form-urlencoded` 提取器 | `serde_urlencoded` |
+| `rsboot-static` | 静态文件：ETag / 304 / 单区间 206 / 穿越防护 / index | 无 |
+| `rsboot-view` | Smarty 风格模板引擎：`{$x}`、`{if}`、`{foreach}`、`{include}`、管道修饰符 | `serde_json` |
 
 ```rust,ignore
 use rsboot_ops as ops;
@@ -276,6 +278,71 @@ let r = Router::new()
 
 核心侧只留两个**通用**钩子给它们用：`Headers::append`（`Set-Cookie` 允许重名
 多条）和 `web::stats`（`fn(u16, u64)` 观察者，默认不装、装了才读时钟）。
+
+### 静态文件
+
+`Static` 拿 `Arc<OnceLock<Option<PathBuf>>>` 存根目录，`clone` 只加一个引用计数，
+直接往路由上挂就行：
+
+```rust,ignore
+use rsboot_static::Static;
+
+let assets = Static::dir("public").max_age(3600).immutable();
+let files  = Static::dir("uploads").index("index.html");
+
+let r = Router::new()
+    .get("/assets/*path", {
+        let s = assets.clone();
+        move |req: &mut Request, _| s.serve_or_404(req)
+    })?
+    .fallback(files.clone().fallback());
+```
+
+要点：`If-None-Match` 优先于 `If-Modified-Since`（`*` 也算命中）；多区间 `Range`
+直接忽略回 200（拼接分段的实现成本远大于收益）；路径逐段 `percent_decode` 后
+拒绝 `.` / `..` / 含分隔符 / NUL 的段，`canonicalize` 之后还要 `starts_with(root)`，
+软链指向外面一样拒绝。`not` 部分命中不了就 **404**，不返回 `None`——"拒绝"与
+"不归我管"是两件事，混在一起会让上层误判。
+
+### 模板引擎
+
+`rsboot-view` 的架构照 minijinja（不建 token 流、边读边解析、AST 编译一次渲染多次），
+语法照 Smarty。**不引第三方引擎**的理由很直接：引 `minijinja` / `tera` 就打破了
+零依赖承诺，而它们说的是 Jinja 语法，跟 `{$x}` 不是一回事。
+
+```rust,ignore
+use std::sync::Arc;
+use rsboot_view::Engine;
+
+// 启动期编译一次，放 Arc 里跨 worker 共享；渲染期只查表，不加锁。
+let view = Arc::new(Engine::new().add_dir("templates")?);
+
+let r = Router::new().get("/orders", {
+    let v = view.clone();
+    move |req: &mut Request, _| {
+        let data = serde_json::json!({ "title": "订单", "items": list });
+        match v.render("orders.tpl", &data) {
+            Ok(html) => Response::html(html),
+            Err(e) => e.to_api_error().into_response(),
+        }
+    }
+})?;
+```
+
+| 写法 | 含义 |
+| --- | --- |
+| `{$name}` `{$user.name}` `{$list[0]}` | 取值，点与下标可混用 |
+| `{if $a > 1}…{elseif $b}…{else}…{/if}` | 条件，`and` / `or` / `not` |
+| `{foreach $list as $it}` `as $k => $v` `{foreachelse}` | 迭代数组或对象 |
+| `{$x\|escape}` `\|raw` `\|upper` `\|lower` `\|trim` `\|default:"-"` `\|length` `\|truncate:20` `\|json` `\|join:", "` `\|nl2br` | 修饰符，可链式 |
+| `{include "x.tpl"}` / `{include file="x.tpl"}` | 引入子模板，共享父作用域 |
+| `{literal}…{/literal}` `{* … *}` | 原样输出 / 注释 |
+| `{myfunc a=$x}` | 调 `Engine::func` 注册的函数 |
+
+两处与 Smarty 有意不同：**默认开自动转义**（Smarty 默认关），因为忘记
+`|escape` 的代价是 XSS，忘记 `|raw` 只是看到一个 `&lt;div&gt;`；`|json`
+会把 `< > & '` 转成 `\uXXXX`，这样塞进 `<script>` 或 `data-*` 都不会提前
+闭合标签。`include` 有 32 层上限，环形 include 报明确的错，而不是把 worker 栈打爆。
 
 ## 设计亮点
 

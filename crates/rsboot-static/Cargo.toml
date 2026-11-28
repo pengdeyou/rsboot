@@ -1,0 +1,11 @@
+[package]
+name = "rsboot-static"
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Static file serving with ETag, 304 and Range for rsboot."
+repository = "https://github.com/pengdeyou/rsboot"
+
+[dependencies]
+rsboot = { path = "../.." }

@@ -456,7 +456,7 @@ impl Conn {
 
         drop(_t);
         let _t = profile::start(profile::HANDLE);
-        let mut resp = router.handle(&mut req, ctx);
+        let resp = router.handle(&mut req, ctx);
         // handler 已经返回，请求头不再有人读：把这批槽位还回连接。
         self.hdr_spare = req.headers.take_spare();
         // 响应头不插了：`fill_head` 直接把它拼到 head 末尾（见 `write.rs`）。

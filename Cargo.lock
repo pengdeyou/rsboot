@@ -753,6 +753,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsboot-static"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "rsboot",
+]
+
+[[package]]
+name = "rsboot-view"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "rsboot",
+ "serde_json",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

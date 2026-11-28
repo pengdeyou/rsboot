@@ -37,4 +37,4 @@ schemars = "1"
 # 扩展模块是独立子 crate：cookie / form / 运维端点。核心保持零额外依赖，
 # 不用这些功能的人连编译都省了。
 [workspace]
-members = ["crates/rsboot-ops", "crates/rsboot-cookie", "crates/rsboot-form"]
+members = ["crates/rsboot-ops", "crates/rsboot-cookie", "crates/rsboot-form", "crates/rsboot-static", "crates/rsboot-view"]
