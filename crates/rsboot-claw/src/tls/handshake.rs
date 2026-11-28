@@ -145,6 +145,8 @@ pub struct TlsStream {
     write_seq: u64,
     /// 已解密但还没被 read() 取走的数据
     pending: Vec<u8>,
+    /// 对端发过 close_notify（或被当成 EOF），之后 read() 一律返回 0
+    eof: bool,
 }
 
 impl TlsStream {
@@ -171,6 +173,7 @@ impl TlsStream {
             read_seq: 0,
             write_seq: 0,
             pending: Vec::new(),
+            eof: false,
         })
     }
 
@@ -395,7 +398,14 @@ impl TlsStream {
             CT_APPLICATION_DATA => Ok(content),
             CT_ALERT => {
                 let mut r = Reader::new(&content);
-                Err(TlsError::Alert(r.next_u8().unwrap_or(0), r.next_u8().unwrap_or(0)))
+                let level = r.next_u8().unwrap_or(2);
+                let desc = r.next_u8().unwrap_or(0);
+                // close_notify(0) 是正常收尾：当成 EOF，别让上层看见一个错误
+                if desc == 0 && level == 1 {
+                    self.eof = true;
+                    return Ok(Vec::new());
+                }
+                Err(TlsError::Alert(level, desc))
             }
             // 握手消息（NewSessionTicket 等）在应用阶段直接忽略
             _ => Ok(Vec::new()),
@@ -409,6 +419,9 @@ fn body_of(msg: &[u8]) -> &[u8] {
 
 impl Read for TlsStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.eof {
+            return Ok(0);
+        }
         if self.pending.is_empty() {
             loop {
                 match self.read_record_encrypted() {

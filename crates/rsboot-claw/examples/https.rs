@@ -25,14 +25,16 @@ fn main() {
             println!("{site}: bad url");
             continue;
         };
+        let t0 = std::time::Instant::now();
         match client.get(&url) {
             Ok(r) => {
                 ok += 1;
                 println!(
-                    "{site}: {} {} bytes, server={}",
+                    "{site}: {} {} bytes, server={}, {} ms",
                     r.status,
                     r.body.len(),
-                    r.header("server").unwrap_or("-")
+                    r.header("server").unwrap_or("-"),
+                    t0.elapsed().as_millis()
                 );
             }
             Err(e) => println!("{site}: ERROR {e}"),
