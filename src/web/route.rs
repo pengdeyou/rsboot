@@ -136,8 +136,15 @@ impl Node {
 /// 路由注册与分派。
 pub struct Router {
     routes: Vec<Route>,
-    /// 段级前缀树，分派只查它。
+    /// 段级前缀树。含参数的路由只能走它。
     tree: Node,
+    /// **纯字面量路径**的快表：`("/users/list" → 该路径上的路由下标)`。
+    ///
+    /// 绝大多数 API 路由没有参数，为它们走前缀树是纯浪费——每层一次哈希、
+    /// 一次递归、一次闭包回调。这里一步到位。
+    /// 命中但方法对不上时**不能直接回 405**：参数分支可能接住
+    /// （`POST /users/list` 落到 `POST /users/{id}`），那一刻仍要回落树。
+    exact: HashMap<Box<str>, Vec<usize>>,
     fallback: Option<HandlerFn>,
     /// 中间件。注册顺序 = 外层到内层；`after` 逆序执行。
     pub(crate) middlewares: Vec<Box<dyn Middleware>>,
@@ -163,6 +170,7 @@ impl Router {
         Self {
             routes: Vec::new(),
             tree: Node::default(),
+            exact: HashMap::new(),
             fallback: None,
             middlewares: Vec::new(),
         }
@@ -194,6 +202,13 @@ impl Router {
             .map(|s| s.map(str::to_string))
             .collect();
         let idx = self.routes.len();
+        // 快表的键必须在 `template` 被移动进 `Route` 之前取出来。
+        // 只有纯字面量路径才进快表：带参数的必须留给前缀树。
+        let literal: Option<Box<str>> = if template.has_params {
+            None
+        } else {
+            Some(template.raw.as_str().into())
+        };
         self.routes.push(Route {
             method,
             template,
@@ -203,6 +218,9 @@ impl Router {
             handler: Box::new(move |req, ctx| handler(req, ctx).into_response()),
         });
         self.tree.insert(idx, &segs);
+        if let Some(k) = literal {
+            self.exact.entry(k).or_default().push(idx);
+        }
         Ok(self)
     }
 
@@ -403,18 +421,31 @@ impl Router {
     }
 
     fn dispatch(&self, req: &mut Request, ctx: &Context) -> Response {
+        let path = req.path;
+        let _match = crate::server::profile::start(crate::server::profile::HL_MATCH);
+
+        // 快路径：纯字面量路径一步查表，直接进 `attempt`。
+        // 省掉的是"沿树下行"这一整套——每层一次哈希、一次递归、一次闭包回调。
+        // 方法对不上时**必须回落树**：`POST /users/list` 可能被 `POST /users/{id}`
+        // 接住，直接回 405 就错了。这种回落还顺带保留原有的 405/OPTIONS 语义。
+        if !self.exact.is_empty() {
+            if let Some(idxs) = self.exact.get(path) {
+                let mut allowed = Vec::new();
+                if let Some(resp) = self.attempt(idxs, req, req.method, ctx, path, &mut allowed) {
+                    drop(_match);
+                    return resp;
+                }
+            }
+        }
+
         // 路径切段一次，之后全是沿树走。切段要借 `req.path`，而命中后要写
         // `req.params`——先把路径拷成局部 `String`，让两段借用各自独立。
         // 这条拷贝换掉的是"每请求扫 N 条候选"，值。
         // `req.path` 是 `&'a str`：这里只复制引用（8+8 字节），不产生字符串拷贝
-        let path = req.path;
         let trimmed = path.strip_prefix('/').unwrap_or(path);
 
         let mut allowed: Vec<Method> = Vec::new();
         let mut hit: Option<Response> = None;
-        // 计时区间只包住"沿树走 + 匹配"，attempt 里的 handler 单独记
-        // `HL_USER`，打印时再从这一段里减掉，避免同一段时间被数两遍。
-        let _match = crate::server::profile::start(crate::server::profile::HL_MATCH);
         Node::visit(&self.tree, trimmed, &mut |idxs| {
             match self.attempt(idxs, req, req.method, ctx, path, &mut allowed) {
                 Some(resp) => {
@@ -824,5 +855,43 @@ mod tests {
     #[test]
     fn bad_template_is_rejected_at_registration() {
         assert!(Router::new().get("no-slash", |_, _| Response::text("x")).is_err());
+    }
+
+    /// 纯字面量路径走快表，但语义必须和树一致：同一路径下字面量优先于参数。
+    #[test]
+    fn literal_path_wins_over_param_route() {
+        let r = Router::new()
+            .get("/users/list", |_, _| Response::text("list"))
+            .unwrap()
+            .get("/users/{id}", |_, _| Response::text("one"))
+            .unwrap();
+        assert_eq!(&call(&r, Method::Get, "/users/list").body[..], b"list");
+        assert_eq!(&call(&r, Method::Get, "/users/7").body[..], b"one");
+    }
+
+    /// 快表命中但方法不对，必须回落参数路由。
+    /// 直接回 405 是错的：`POST /users/list` 本该落到 `POST /users/{id}`。
+    #[test]
+    fn literal_method_miss_falls_back_to_param() {
+        let r = Router::new()
+            .get("/users/list", |_, _| Response::text("list"))
+            .unwrap()
+            .post("/users/{id}", |_, _| Response::text("created"))
+            .unwrap();
+        let resp = call(&r, Method::Post, "/users/list");
+        assert_eq!(resp.status, Status::OK);
+        assert_eq!(&resp.body[..], b"created");
+    }
+
+    /// 没有参数路由接住时，仍然回 405（Allow 头由原有逻辑给）。
+    #[test]
+    fn literal_method_miss_without_param_route_is_405() {
+        let r = Router::new()
+            .get("/users/list", |_, _| Response::text("list"))
+            .unwrap();
+        assert_eq!(
+            call(&r, Method::Post, "/users/list").status,
+            Status::METHOD_NOT_ALLOWED
+        );
     }
 }
