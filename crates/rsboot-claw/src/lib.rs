@@ -34,6 +34,7 @@
 //! println!("{:?}", stats);
 //! ```
 
+pub mod filter;
 pub mod frontier;
 pub mod html;
 pub mod http;
@@ -49,6 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub use filter::{Pattern, UrlFilter};
 pub use frontier::{Frontier, Item, Pop, Push};
 pub use html::{scan, Document, Link};
 pub use pipeline::{CollectSink, JsonlSink, Sink};
@@ -228,6 +230,8 @@ pub struct Stats {
     pub retries: usize,
     /// 中间件要求跳过的页数
     pub skipped: usize,
+    /// 被 URL 过滤规则挡在入队之前的链接数（省下的是整个请求）
+    pub skipped_filter: usize,
     /// 从断点日志恢复出的待抓条数（没开 checkpoint 就是 0）
     pub resumed: usize,
     /// 网络错误详情（每类一条，最多 32 条）
@@ -246,6 +250,7 @@ struct Counters {
     skipped_robots: usize,
     retries: usize,
     skipped: usize,
+    skipped_filter: usize,
     error_kinds: Vec<String>,
 }
 
@@ -284,6 +289,7 @@ pub struct Crawler {
     max_per_host: usize,
     avoid_duplicate_content: bool,
     priority_fn: Option<PriorityFn>,
+    filter: UrlFilter,
 }
 
 /// 给一条 URL 打分。见 [`Crawler::priority_fn`]。
@@ -310,6 +316,7 @@ impl Crawler {
             max_per_host: 0,
             avoid_duplicate_content: false,
             priority_fn: None,
+            filter: UrlFilter::new(),
         }
     }
 
@@ -342,6 +349,24 @@ impl Crawler {
         F: Fn(&Url) -> i32 + Send + Sync + 'static,
     {
         self.priority_fn = Some(Arc::new(f));
+        self
+    }
+
+    /// 加一条"允许"规则（通配：`*` 任意串、`?` 单字符）。调用过它就变成
+    /// 白名单语义——不在列表里的链接一律不入队。
+    ///
+    /// 匹配对象是 `path?query`，规则形如 `"/docs/*"`、`"/list?page=1"`。
+    pub fn allow(mut self, pattern: impl Into<String>) -> Self {
+        self.filter = self.filter.allow(pattern);
+        self
+    }
+
+    /// 加一条"拒绝"规则。deny 比 allow 优先（同时命中就拒）。
+    ///
+    /// 最常用的几条：`"*.pdf"`、`"*.zip"`、`"/cart/*"`、`"?page=*"`。
+    /// 被拒的链接**不会发请求**，所以这也是省流量的地方。
+    pub fn deny(mut self, pattern: impl Into<String>) -> Self {
+        self.filter = self.filter.deny(pattern);
         self
     }
 
@@ -489,6 +514,8 @@ impl Crawler {
             .unwrap()
             .set_max_per_host(self.max_per_host);
 
+        let counters = Mutex::new(Counters::default());
+
         // sitemap 要在开跑**之前**抓完：它是种子级的输入，跑起来之后再抓
         // 会让"种子为什么这么少"变得不可解释。
         let extra_seeds = if self.sitemap {
@@ -501,6 +528,10 @@ impl Crawler {
             let now = Instant::now();
             let mut f = frontier.lock().unwrap();
             for u in &extra_seeds {
+                if !self.filter.allowed(u) {
+                    counters.lock().unwrap().skipped_filter += 1;
+                    continue;
+                }
                 f.push(
                     Item {
                         url: u.clone(),
@@ -512,6 +543,10 @@ impl Crawler {
                 );
             }
             for (s, p) in &self.seeds {
+                if !self.filter.allowed(s) {
+                    counters.lock().unwrap().skipped_filter += 1;
+                    continue;
+                }
                 f.push(
                     Item {
                         url: s.clone(),
@@ -524,7 +559,6 @@ impl Crawler {
             }
         }
 
-        let counters = Mutex::new(Counters::default());
         let seen_content: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
         let robots_cache: Mutex<HashMap<String, Arc<Robots>>> = Mutex::new(HashMap::new());
         let fetched = AtomicUsize::new(0);
@@ -691,6 +725,10 @@ impl Crawler {
                                 let now = Instant::now();
                                 let mut f = frontier.lock().unwrap();
                                 for u in page.internal_links() {
+                                    if !cfg.filter.allowed(&u) {
+                                        counters.lock().unwrap().skipped_filter += 1;
+                                        continue;
+                                    }
                                     let priority = cfg.priority_for(&u);
                                     f.push(
                                         Item {
@@ -727,6 +765,10 @@ impl Crawler {
                             {
                                 continue;
                             }
+                            if !cfg.filter.allowed(&u) {
+                                counters.lock().unwrap().skipped_filter += 1;
+                                continue;
+                            }
                             let priority = cfg.priority_for(&u);
                             f.push(
                                 Item {
@@ -759,6 +801,7 @@ impl Crawler {
             too_deep: deep,
             retries: c.retries,
             skipped: c.skipped,
+            skipped_filter: c.skipped_filter,
             resumed,
             error_kinds: c.error_kinds,
             pages_per_sec: if elapsed.as_secs_f64() > 0.0 {

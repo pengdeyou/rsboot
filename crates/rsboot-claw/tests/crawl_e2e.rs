@@ -568,6 +568,51 @@ fn priority_fn_reorders_the_queue() {
     );
 }
 
+/// 被规则拒掉的链接**不发请求**：服务端那几路一次都不该被打到。
+#[test]
+fn deny_rules_stop_links_before_they_are_fetched() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let hits: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let router = Router::new()
+        .get("/", |_, _| {
+            Response::html(
+                r#"<html><body>
+                <a href="/keep/1">k</a><a href="/files/a.pdf">p</a>
+                <a href="/files/b.zip">z</a><a href="/drop">d</a>
+                </body></html>"#,
+            )
+        })
+        .unwrap()
+        .get("/keep/{n}", |req, _| {
+            let n = req.param("n").unwrap_or("0").to_string();
+            Response::html(format!("<html><body>keep{n}</body></html>"))
+        })
+        .unwrap()
+        .get("/drop", |_, _| Response::html("<html><body>drop</body></html>"))
+        .unwrap()
+        .get("/files/{name}", move |_, _| {
+            h.fetch_add(1, Ordering::SeqCst);
+            Response::text("binary-ish")
+        })
+        .unwrap();
+    let (addr, stop) = serve_at(addr, router);
+
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(1)
+        .workers(2)
+        .deny("*.pdf")
+        .deny("*.zip")
+        .run(follow_internal);
+    stop.store(true, Ordering::Relaxed);
+
+    assert_eq!(stats.errors, 0, "{:?}", stats.error_kinds);
+    assert_eq!(stats.pages, 3, "只该抓首页 + keep + drop：{stats:?}");
+    assert_eq!(stats.skipped_filter, 2, "{stats:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "被拒的链接不该发请求");
+}
+
 #[test]
 fn unreachable_host_is_an_error_not_a_hang() {
     let port = free_port();

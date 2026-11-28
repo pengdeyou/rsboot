@@ -3,7 +3,7 @@
 零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端全在仓库里。
 
 ```
-cargo test -p rsboot-claw          # 68 项（54 单测 + 13 e2e + 1 doctest）
+cargo test -p rsboot-claw          # 75 项（60 单测 + 14 e2e + 1 doctest）
 ```
 
 ## 快速开始
@@ -22,6 +22,7 @@ let stats = Crawler::new()
     .delay(Duration::from_millis(200))
     .max_per_host(4)         // 同一个站同时最多 4 发（默认 0 = 不限）
     .priority_fn(|u| if u.path.starts_with("/list") { 10 } else { 0 })  // 列表页先抓
+    .deny("*.pdf").deny("*.zip").deny("*?page=*")   // 拒掉的链接不发请求
     .max_pages(1000)
     .sitemap(true)           // 先抓 robots 的 Sitemap: + /sitemap.xml 当种子
     .sink(sink.clone())      // 旁路落盘，和"下一步抓什么"解耦
@@ -74,6 +75,9 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **per-host 并发**：`.max_per_host(n)` 限"同时几发"，和 `delay` 限的"隔多久"是两件事。不设时 `workers(8)` 会对同一个站同时开 8 发——对人家不够客气，自己也被一个站占满。名额在拿到任务时占、由 `Drop` 归还，handler panic 也还。
 - **内容去重**：`.avoid_duplicate_content(true)` 按正文算 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次（镜像站、`?page=1` 空壳页、导航菜单撑大的页）。命中页仍然抽站内链接继续走——不抽等于把下游砍了。理论上有碰撞，后果是"少交一页"，不会把两页混成一页。
 - **深度**：只按"距种子几跳"算，不猜路径层级。
+- **URL 过滤**：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象是 `path?query`。
+
+  只看两个字符：`*`（任意串，可跨 `/`）。是**整串**匹配不是子串包含——"任意前缀的分页"要写 `"*?page=*"`，写成 `"?page=*"` 是不匹配的（`?` 是查询分隔符，不能兼作通配符，一开始支持过，撞上真实写法就删了）。`deny` 优先；`allow` 非空即白名单。被拒的链接**不入队、不发请求**，所以这也是省流量和对方负载的地方。
 - **优先级**：`.priority_fn(|u| …)` 给 URL 打分，同站内大的先抓、同分保持入队顺序（FIFO）。跨站**不比较**——按 host 轮转是礼貌的一部分，让高分站插队会把慢站饿死。种子也能带分（`.seed_with(url, p)`）。为什么用 `Fn(&Url)` 而不是让 handler 返回 `(url, priority)`：handler 签名是 v0.1 定下的，而"哪类 URL 更要紧"通常只看地址本身。
 - **重定向**：最多 5 跳，`Page::url` 是最终地址，相对链接按最终地址解析。
 - **keep-alive**：每个工作线程一个 `Client`，per-host 一条连接复用；复用到已被对端关掉的连接会自动重连一次（这是真实世界最常见的坑）。
@@ -121,4 +125,4 @@ router.get("/crawl/start", |_, _| {
 
 - `url` / `html` / `robots` / `frontier`：纯逻辑单测，含等价写法去重、最长匹配、通配符、`$` 锚定、慢站不阻塞快站。
 - `http`：用真 `TcpListener` 起假服务器，覆盖 chunked、短读、keep-alive 复用、复用死连接重试、重定向成环、body 上限。
-- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、断点续爬（中断 → 恢复 → 再跑一遍应零抓取）、`max_per_host` 之下的并发峰值（服务端自己数，见"踩过的坑"）、内容重复页被跳过后链接仍然继续走、`priority_fn` 能把"先详情后列表"的链接顺序翻过来、连不上时不挂死。
+- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、断点续爬（中断 → 恢复 → 再跑一遍应零抓取）、`max_per_host` 之下的并发峰值（服务端自己数，见"踩过的坑"）、内容重复页被跳过后链接仍然继续走、`priority_fn` 能把"先详情后列表"的链接顺序翻过来、`deny` 掉的 `.pdf`/`.zip` 一次请求都没发出去、连不上时不挂死。

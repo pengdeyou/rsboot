@@ -16,7 +16,7 @@
 | 性能 | 4 worker / 客户端 4 线程 p16：rsboot 999.4k，actix-web 4 1033.2k，**落后 3.27%**，胜场 1:19 |
 | 流式 | `Response::stream` + `ChunkSink` + chunked 写回；HTTP/1.0 降级为"写完即断" |
 | 模板 | `{extends}` / `{block}` / `{assign}` / `{if}` / `{foreach}`，编译期展开继承 |
-| 测试 | `cargo test --workspace` 435 passed |
+| 测试 | `cargo test --workspace` 442 passed |
 
 任何性能项必须走 `ab5.sh` 两批反序（AB / BA 各 10 轮 × 8s），噪声底 **±0.35%**；单批同向才算收益，两批反向即噪声。
 
@@ -175,6 +175,7 @@ v0.1 的定位是"能独立跑起来、礼貌、可测"，架构 fork Scrapy 的
 - [x] v0.5 per-host 并发：`.max_per_host(n)` 限"同时几发"（`delay` 限的是"隔多久"），名额由 `Drop` 归还，handler panic 也还。顺手修掉一个真 bug：worker 见到 `Empty` 就退出，但队列常空在"还有几发在路上、抓完会推新链接"的那一刻——单站场景下并发会退化成 1，尾部整段丢掉；现在只有"队列没活 **且** 在飞为 0"才报 `Empty`
 - [x] v0.5 内容去重：`.avoid_duplicate_content(true)`，正文 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次；命中页仍抽站内链接继续走。碰撞后果是"少交一页"，不会混页
 - [x] v0.6 优先级调度：`.priority_fn(|u| …)` 给 URL 打分，同站内大的先抓、同分保持 FIFO；`.seed_with(url, p)` 给种子带分。跨站**不比较**——按 host 轮转是礼貌的一部分，让高分站插队会饿死慢站。为什么不改 handler 签名为 `-> Vec<(String, i32)>`：v0.1 定的签名，而"哪类 URL 要紧"通常只看地址本身
+- [x] v0.7 URL 过滤：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象 `path?query`，`*` 是唯一通配符、整串匹配、deny 优先、allow 非空即白名单。被拒的链接不入队不发请求。**`?` 不能兼作通配符**：一开始支持过"任意单字符"，撞上真实写法 `"?page=*"` 会静默不匹配，直接删掉
 - [ ] v0.2 HTTPS：作为**可选 feature**（`tls`，引 rustls），默认关闭以守住零依赖；不做就在 `Error::UnsupportedScheme` 上让调用方决定
 - 不做：JS 渲染（要 headless browser）、gzip 解压（请求侧直接 `identity`）、分布式调度（单机爬虫不做分布式协调）
 
