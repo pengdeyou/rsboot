@@ -613,6 +613,60 @@ fn deny_rules_stop_links_before_they_are_fetched() {
     assert_eq!(hits.load(Ordering::SeqCst), 0, "被拒的链接不该发请求");
 }
 
+/// 会话 cookie：先 `/login` 拿到 `Set-Cookie`，后面的 `/private` 才放行。
+/// 关掉 jar 时必须 403——否则这个测试只是在证明"服务端没在看 cookie"。
+#[test]
+fn session_cookie_is_carried_between_requests() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let authed: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let a = authed.clone();
+    let router = Router::new()
+        .get("/", |_, _| Response::html(r#"<html><body><a href="/login">go</a></body></html>"#))
+        .unwrap()
+        .get("/login", |_, _| {
+            Response::html(r#"<html><body><a href="/private">p</a></body></html>"#)
+                .with_header("Set-Cookie", "sid=abc123; Path=/; HttpOnly")
+        })
+        .unwrap()
+        .get("/private", move |req, _| {
+            let ok = req
+                .header("cookie")
+                .map(|c| c.contains("sid=abc123"))
+                .unwrap_or(false);
+            if ok {
+                a.fetch_add(1, Ordering::SeqCst);
+                Response::html("<html><body>secret</body></html>")
+            } else {
+                Response::new(Status::FORBIDDEN)
+            }
+        })
+        .unwrap();
+    let (addr, stop) = serve_at(addr, router);
+
+    let sink = Arc::new(CollectSink::new());
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(2)
+        .workers(1) // 单 worker 才有确定的"先 login 后 private"
+        .sink(sink.clone())
+        .run(follow_internal);
+
+    assert_eq!(stats.errors, 0, "{:?}", stats.error_kinds);
+    assert_eq!(stats.pages, 3, "{stats:?}");
+    assert_eq!(
+        authed.load(Ordering::SeqCst),
+        1,
+        "private 必须带着 sid 才放行（403 也会被当成抓到的页，所以还要数命中）"
+    );
+    let pages = sink.pages();
+    let private = pages
+        .iter()
+        .find(|p| p.url.path == "/private")
+        .expect("private 应该被抓到");
+    assert_eq!(private.status, 200, "带上 cookie 之后应当是 200");
+    stop.store(true, Ordering::Relaxed);
+}
+
 #[test]
 fn unreachable_host_is_an_error_not_a_hang() {
     let port = free_port();

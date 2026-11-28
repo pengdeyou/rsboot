@@ -11,8 +11,9 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use crate::cookies::Jar;
 use crate::url::Url;
 
 /// 出错种类。爬虫对错误的态度是"记一笔、跳过、继续"，所以这里只需要能分类。
@@ -196,6 +197,8 @@ pub struct Client {
     /// 累计建立的连接数，用来确认 keep-alive 真的生效了
     connects: usize,
     proxy: Option<Proxy>,
+    /// 会话 cookie。`None` = 无状态（`cookie_jar(false)`）
+    jar: Option<Jar>,
 }
 
 impl Client {
@@ -208,6 +211,7 @@ impl Client {
             pool: HashMap::new(),
             connects: 0,
             proxy: None,
+            jar: Some(Jar::new()),
         }
     }
 
@@ -231,6 +235,20 @@ impl Client {
     pub fn max_body_bytes(mut self, n: usize) -> Self {
         self.max_body = n;
         self
+    }
+
+    /// 开/关会话 cookie（默认开）。关掉会清空已有 cookie。
+    ///
+    /// 关掉的场景：目标站对 cookie 敏感、或者你就是要一个每个请求都等价于
+    /// "第一次访问"的爬虫。想要固定登录态就别用这个，直接
+    /// `StaticHeaders` 带一个 `Cookie: …` 更直接。
+    pub fn cookie_jar(mut self, on: bool) -> Self {
+        self.jar = if on { Some(Jar::new()) } else { None };
+        self
+    }
+
+    pub fn jar(&self) -> Option<&Jar> {
+        self.jar.as_ref()
     }
 
     pub fn connects(&self) -> usize {
@@ -284,6 +302,7 @@ impl Client {
                 if keep {
                     self.pool.insert(key, reader);
                 }
+                self.capture_cookies(url, &headers);
                 Ok(Response {
                     status,
                     headers,
@@ -298,6 +317,7 @@ impl Client {
                 if keep {
                     self.pool.insert(key, fresh);
                 }
+                self.capture_cookies(url, &headers);
                 Ok(Response {
                     status,
                     headers,
@@ -306,6 +326,12 @@ impl Client {
                 })
             }
             Err(e) => Err(e),
+        }
+    }
+
+    fn capture_cookies(&mut self, url: &Url, headers: &[(String, String)]) {
+        if let Some(jar) = self.jar.as_mut() {
+            jar.store_headers(&url.host, headers, SystemTime::now());
         }
     }
 
@@ -390,12 +416,26 @@ impl Client {
             .and_then(|p| p.auth.as_ref())
             .map(|a| format!("Proxy-Authorization: {a}\r\n"))
             .unwrap_or_default();
+        // 显式给了 `Cookie` 头就以调用方为准（那是"固定身份"的用法），
+        // 否则用 jar 里匹配到的。两条 cookie 头同时发出去没有意义。
+        let cookie_line = if extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+            String::new()
+        } else {
+            match &self.jar {
+                Some(j) => j
+                    .header_for(&url.host, &url.path, url.scheme == "https", SystemTime::now())
+                    .map(|c| format!("Cookie: {c}\r\n"))
+                    .unwrap_or_default(),
+                None => String::new(),
+            }
+        };
         let req = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Encoding: identity\r\n{}{}Connection: keep-alive\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Encoding: identity\r\n{}{}{}Connection: keep-alive\r\n\r\n",
             target,
             url.host_header(),
             ua,
             proxy_auth,
+            cookie_line,
             extra_lines
         );
         {

@@ -3,7 +3,7 @@
 零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端全在仓库里。
 
 ```
-cargo test -p rsboot-claw          # 75 项（60 单测 + 14 e2e + 1 doctest）
+cargo test -p rsboot-claw          # 85 项（69 单测 + 15 e2e + 1 doctest）
 ```
 
 ## 快速开始
@@ -75,6 +75,7 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **per-host 并发**：`.max_per_host(n)` 限"同时几发"，和 `delay` 限的"隔多久"是两件事。不设时 `workers(8)` 会对同一个站同时开 8 发——对人家不够客气，自己也被一个站占满。名额在拿到任务时占、由 `Drop` 归还，handler panic 也还。
 - **内容去重**：`.avoid_duplicate_content(true)` 按正文算 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次（镜像站、`?page=1` 空壳页、导航菜单撑大的页）。命中页仍然抽站内链接继续走——不抽等于把下游砍了。理论上有碰撞，后果是"少交一页"，不会把两页混成一页。
 - **深度**：只按"距种子几跳"算，不猜路径层级。
+- **会话 cookie**：默认开，per-host 的 jar，`Set-Cookie` 收、下次请求带。认 `Domain` / `Path` / `Secure` / `Max-Age` / `Expires`（RFC 1123 日期手写解析），`HttpOnly` 只记录（不跑 JS，没实际作用）。域名校验是双向的——别人想给 `a.com` 塞 cookie 不收，`a.com` 的 `Domain=.a.com` 才能往子域走。`Client::cookie_jar(false)` 回到无状态。每个 worker 一个 jar，不会出现两个 worker 共享半份登录态。
 - **URL 过滤**：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象是 `path?query`。
 
   只看两个字符：`*`（任意串，可跨 `/`）。是**整串**匹配不是子串包含——"任意前缀的分页"要写 `"*?page=*"`，写成 `"?page=*"` 是不匹配的（`?` 是查询分隔符，不能兼作通配符，一开始支持过，撞上真实写法就删了）。`deny` 优先；`allow` 非空即白名单。被拒的链接**不入队、不发请求**，所以这也是省流量和对方负载的地方。
@@ -97,7 +98,7 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **分布式调度**：单机爬虫，不做跨机器的 URL 分配和去重共识。断点续爬是单机维度的（见上），两件事别混。
 - **`sitemap.xml.gz`**：解 gzip 要引库，遇到这种只能跳过（`.sitemap(true)` 静默忽略非 200 的分片）。
 - **`CONNECT` 隧道（https 代理）**：那是给 TLS 用的，claw 不做 TLS，所以只支持明文 http 代理。
-- **cookie / 登录态**：需要的话在 handler 外面自己维护，v0.1 的 `Client` 没有 cookie jar。
+- **`SameSite` / CSP / 存储分区**：那是浏览器语义，爬虫没有跨站上下文，忽略。
 
 ## 和 rsboot 一起用
 
@@ -125,4 +126,4 @@ router.get("/crawl/start", |_, _| {
 
 - `url` / `html` / `robots` / `frontier`：纯逻辑单测，含等价写法去重、最长匹配、通配符、`$` 锚定、慢站不阻塞快站。
 - `http`：用真 `TcpListener` 起假服务器，覆盖 chunked、短读、keep-alive 复用、复用死连接重试、重定向成环、body 上限。
-- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、断点续爬（中断 → 恢复 → 再跑一遍应零抓取）、`max_per_host` 之下的并发峰值（服务端自己数，见"踩过的坑"）、内容重复页被跳过后链接仍然继续走、`priority_fn` 能把"先详情后列表"的链接顺序翻过来、`deny` 掉的 `.pdf`/`.zip` 一次请求都没发出去、连不上时不挂死。
+- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、断点续爬（中断 → 恢复 → 再跑一遍应零抓取）、`max_per_host` 之下的并发峰值（服务端自己数，见"踩过的坑"）、内容重复页被跳过后链接仍然继续走、`priority_fn` 能把"先详情后列表"的链接顺序翻过来、`deny` 掉的 `.pdf`/`.zip` 一次请求都没发出去、会话 cookie 真的被后续请求带上（关掉 jar 就 403）、连不上时不挂死。

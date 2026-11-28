@@ -34,6 +34,7 @@
 //! println!("{:?}", stats);
 //! ```
 
+pub mod cookies;
 pub mod filter;
 pub mod frontier;
 pub mod html;
@@ -50,6 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub use cookies::{Cookie, Jar};
 pub use filter::{Pattern, UrlFilter};
 pub use frontier::{Frontier, Item, Pop, Push};
 pub use html::{scan, Document, Link};
@@ -290,6 +292,7 @@ pub struct Crawler {
     avoid_duplicate_content: bool,
     priority_fn: Option<PriorityFn>,
     filter: UrlFilter,
+    cookie_jar: bool,
 }
 
 /// 给一条 URL 打分。见 [`Crawler::priority_fn`]。
@@ -317,6 +320,7 @@ impl Crawler {
             avoid_duplicate_content: false,
             priority_fn: None,
             filter: UrlFilter::new(),
+            cookie_jar: true,
         }
     }
 
@@ -349,6 +353,16 @@ impl Crawler {
         F: Fn(&Url) -> i32 + Send + Sync + 'static,
     {
         self.priority_fn = Some(Arc::new(f));
+        self
+    }
+
+    /// 维护会话 cookie（默认开）。关掉等于每个请求都是"第一次访问"，
+    /// 目标站要 session 才能走的地方都会 403/302。
+    ///
+    /// 每个 worker 一个 `Client`，也就一个 jar——两个 worker 不会共享
+    /// 半份登录态。固定身份请用 `StaticHeaders` 带 `Cookie: …`。
+    pub fn cookie_jar(mut self, on: bool) -> Self {
+        self.cookie_jar = on;
         self
     }
 
@@ -572,6 +586,9 @@ impl Crawler {
                         .user_agent(cfg.user_agent.clone())
                         .timeout(cfg.timeout)
                         .max_body_bytes(cfg.max_body_bytes);
+                    if !cfg.cookie_jar {
+                        client = client.cookie_jar(false);
+                    }
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             break;
