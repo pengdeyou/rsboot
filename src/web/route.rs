@@ -569,12 +569,12 @@ mod tests {
             .unwrap();
         let ok = call(&r, Method::Get, "/ping");
         assert_eq!(ok.status, Status::OK);
-        assert_eq!(&ok.body[..], "{\"code\":\"OK\",\"message\":\"ok\",\"data\":null}".as_bytes());
+        assert_eq!(&ok.body[..], "{\"code\":200,\"message\":\"ok\"}".as_bytes());
         let bad = call(&r, Method::Get, "/boom");
         assert_eq!(bad.status, Status::BAD_REQUEST);
         assert_eq!(
             &bad.body[..],
-            "{\"code\":\"BAD_REQUEST\",\"message\":\"库存不足\",\"data\":null}".as_bytes()
+            "{\"code\":400,\"message\":\"库存不足\"}".as_bytes()
         );
     }
 
@@ -589,9 +589,9 @@ mod tests {
         let resp = call(&r, Method::Get, "/x");
         assert_eq!(resp.status, Status::BAD_REQUEST);
         let body = String::from_utf8(resp.body).unwrap();
-        assert!(body.contains(r#""code":"BAD_REQUEST""#), "{body}");
+        assert!(body.contains(r#""code":400"#), "{body}");
         assert!(body.contains("库存不足"), "{body}");
-        assert!(body.contains(r#""data":null"#), "{body}");
+        assert!(!body.contains(r#""data""#), "没有数据就该省掉这个字段：{body}");
     }
 
     /// 200 条路由挂在同一前缀下的分派成本。命中最后一个 = 最坏情况。

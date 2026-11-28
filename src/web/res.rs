@@ -8,9 +8,9 @@
 //! use rsboot::web::res::Res;
 //!
 //! # fn demo(items: Vec<u32>) {
-//! let ok = Res::success("ok");          // {"code":"OK","message":"ok","data":null}
-//! let list = Res::data(items);          // {"code":"OK","message":"success","data":[...]}
-//! let bad = Res::fail("库存不足");       // 400 + {"code":"BAD_REQUEST","message":"库存不足","data":null}
+//! let ok = Res::success("ok");          // {"code":200,"message":"ok"}
+//! let list = Res::data(items);          // {"code":200,"message":"success","data":[...]}
+//! let bad = Res::fail("库存不足");       // 400 + {"code":400,"message":"库存不足"}
 //! # std::hint::black_box((ok, list, bad));
 //! # }
 //! ```
@@ -49,26 +49,26 @@ use crate::web::response::Response;
 pub struct Res;
 
 impl Res {
-    /// 成功，`data` 为 `null`：`{"code":"OK","message":"<你给的文案>","data":null}`
+    /// 成功，只有提示语：`{"code":200,"message":"<你给的文案>"}`（不写 `data` 字段）
     pub fn success(message: impl Into<String>) -> Response {
         let msg = message.into();
-        match envelope::serialize("OK", &msg, None::<&()>, None) {
+        match envelope::serialize(200, &msg, None::<&()>, None) {
             Ok(bytes) => Response::json_owned(bytes, Status::OK),
             Err(_) => encode_failed(),
         }
     }
 
-    /// 成功 + 数据：`{"code":"OK","message":"success","data":<序列化结果>}`
+    /// 成功 + 数据：`{"code":200,"message":"success","data":<序列化结果>}`
     ///
     /// `data` 直接流式写进同一个缓冲，不建 `serde_json::Value` 中间树。
     pub fn data<T: Serialize>(value: T) -> Response {
-        match envelope::serialize("OK", "success", Some(&value), None) {
+        match envelope::serialize(200, "success", Some(&value), None) {
             Ok(bytes) => Response::json_owned(bytes, Status::OK),
             Err(_) => encode_failed(),
         }
     }
 
-    /// 失败，默认 `400`：`{"code":"BAD_REQUEST","message":"<你给的文案>","data":null}`
+    /// 失败，默认 `400`：`{"code":400,"message":"<你给的文案>"}`
     ///
     /// 直接返回 `Response`，所以 `-> Response` 签名的 handler 一行就能返回。
     pub fn fail(message: impl Into<String>) -> Response {
@@ -97,7 +97,7 @@ impl Res {
 /// 序列化本身失败（只有内存耗尽这类极端情况），给最小可用的 500。
 fn encode_failed() -> Response {
     Response::json_owned(
-        br#"{"code":"INTERNAL_ERROR","message":"internal error","data":null}"#.to_vec(),
+        br#"{"code":500,"message":"internal error"}"#.to_vec(),
         Status::INTERNAL_SERVER_ERROR,
     )
 }
@@ -107,10 +107,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn success_has_null_data() {
+    fn success_has_no_data_field() {
         let r = Res::success("ok");
         assert_eq!(r.status, Status::OK);
-        assert_eq!(&r.body[..], br#"{"code":"OK","message":"ok","data":null}"#);
+        assert_eq!(&r.body[..], br#"{"code":200,"message":"ok"}"#);
         assert_eq!(
             r.headers.get("content-type"),
             Some("application/json; charset=utf-8")
@@ -122,7 +122,7 @@ mod tests {
         let r = Res::data(serde_json::json!({"n": 1, "ok": true}));
         assert_eq!(
             &r.body[..],
-            br#"{"code":"OK","message":"success","data":{"n":1,"ok":true}}"#
+            br#"{"code":200,"message":"success","data":{"n":1,"ok":true}}"#
         );
     }
 
@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(r.status, Status::BAD_REQUEST);
         assert_eq!(
             &r.body[..],
-            "{\"code\":\"BAD_REQUEST\",\"message\":\"库存不足\",\"data\":null}".as_bytes()
+            "{\"code\":400,\"message\":\"库存不足\"}".as_bytes()
         );
     }
 

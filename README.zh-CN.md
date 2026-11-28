@@ -167,10 +167,10 @@ rsboot 把问题拆成两层：**连接层事件驱动，请求层跑有栈协�
 
 | 调用 | 返回 | 状态码 | 响应体 |
 |---|---|---|---|
-| `Res::success("ok")` | `Response` | 200 | `{"code":"OK","message":"ok","data":null}` |
-| `Res::data(payload)` | `Response` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
-| `Res::fail("库存不足")` | `Response` | 400 | `{"code":"BAD_REQUEST","message":"库存不足","data":null}` |
-| `Res::fail_with(Status::CONFLICT, "...")` | `Response` | 按给定 | 同形状，`code` 由状态码推导 |
+| `Res::success("ok")` | `Response` | 200 | `{"code":200,"message":"ok"}` |
+| `Res::data(payload)` | `Response` | 200 | `{"code":200,"message":"success","data":<payload>}` |
+| `Res::fail("库存不足")` | `Response` | 400 | `{"code":400,"message":"库存不足"}` |
+| `Res::fail_with(Status::CONFLICT, "...")` | `Response` | 按给定 | 同形状，`code` 就是状态码 |
 | `Res::err("...")` | `ApiError` | 400 | 同上形状，供 `Err(...)` / `?` |
 | `Res::err_with(status, "...")` | `ApiError` | 按给定 | 同上 |
 
@@ -201,8 +201,10 @@ fn detail(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
 }
 ```
 
-三点值得知道：
+四点值得知道：
 
+- `code` 是 **HTTP 状态码数字**（200 / 400 / 404 / 500），不是另一套字符串业务码。语义本来就由状态码承载，再发明一套码只会让两套码打架。
+- 没有数据就不写 `data` 字段，而不是写 `null`——`{"code":200,"message":"ok"}` 一句提示就够，客户端判断"有没有 `data`"比判断"`data` 是不是 null"少一层分支。
 - `fail` 和 `err` 是两个名字，因为 Rust 一个函数只有一个返回类型：`fail` 返回 `Response`（可直接 `return`），`err` 返回 `ApiError`（能放进 `Err(...)`）。同一件事，配合两种 handler 签名。
 - 这几种调用**一定**是统一形状，不依赖 `http.envelope` 开关。你显式要来的形状，不该被全局开关再改一遍。
 - `data` 直接序列化进同一个缓冲（中间不建 `serde_json::Value` 树），字段顺序与 `http.envelope` 产出的逐字节一致，所以打开那个开关不会改变这些响应的任何一个字节。

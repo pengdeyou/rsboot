@@ -168,10 +168,10 @@ The correlating profile, for anyone who wants to attack the remaining 3 %: two s
 
 | Call | Returns | Status | Body |
 |---|---|---|---|
-| `Res::success("ok")` | `Response` | 200 | `{"code":"OK","message":"ok","data":null}` |
-| `Res::data(payload)` | `Response` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
-| `Res::fail("out of stock")` | `Response` | 400 | `{"code":"BAD_REQUEST","message":"out of stock","data":null}` |
-| `Res::fail_with(Status::CONFLICT, "...")` | `Response` | as given | same shape, `code` derived from the status |
+| `Res::success("ok")` | `Response` | 200 | `{"code":200,"message":"ok"}` |
+| `Res::data(payload)` | `Response` | 200 | `{"code":200,"message":"success","data":<payload>}` |
+| `Res::fail("out of stock")` | `Response` | 400 | `{"code":400,"message":"out of stock"}` |
+| `Res::fail_with(Status::CONFLICT, "...")` | `Response` | as given | same shape, `code` is the status |
 | `Res::err("...")` | `ApiError` | 400 | same shape, for `Err(...)` / `?` |
 | `Res::err_with(status, "...")` | `ApiError` | as given | same as above |
 
@@ -202,8 +202,10 @@ fn detail(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
 }
 ```
 
-Three things worth knowing:
+Four things worth knowing:
 
+- `code` is the **numeric HTTP status** (200 / 400 / 404 / 500), not a second string code space. The status already carries the meaning; inventing another code just gives you two codes to reconcile.
+- No `data` field when there is no data — not `data: null`. `{"code":200,"message":"ok"}` is enough, and clients branch on "is `data` present" instead of "is `data` null".
 - `fail` and `err` are two names because a Rust function has exactly one return type: `fail` returns `Response` (can be returned directly), `err` returns `ApiError` (fits `Err(...)`). Same payload, matched to two handler signatures.
 - For all of these the wrapper is **unconditional** — it does not depend on `http.envelope`. A shape you asked for explicitly should not be reshaped by a global switch.
 - `data` serialises into the same buffer (no `serde_json::Value` tree in between), and the field order is byte-identical to what `http.envelope` produces, so turning that switch on does not change a single byte of these responses.
