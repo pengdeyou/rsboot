@@ -12,7 +12,7 @@
 |---|---|
 | 核心 | HTTP/1.1，thread-per-core + 协程调度（`server::mn`），零第三方依赖，`src/` 约 16k 行 |
 | 核心已内建 | 路由（前缀树）、`Path<T>`/`Query<T>`/`Bearer`/`ApiKey` 提取器、统一 `Res`/`ApiError`/`exception`、CORS/限流/安全头/访问日志中间件、`service` 池+重试+熔断、MySQL 协程化驱动、`config` YAML+分层+**热加载 watcher**、`runtime` module/lifecycle+优雅停机、`web/openapi`(`RouteDoc` + `/openapi.json` + `/docs`)、`web/stats` 钩子 |
-| 扩展 crate | `rsboot-ops`、`rsboot-cookie`、`rsboot-form`、`rsboot-static`、`rsboot-view`、`rsboot-sse` |
+| 扩展 crate | `rsboot-ops`、`rsboot-cookie`、`rsboot-form`、`rsboot-static`、`rsboot-view`、`rsboot-sse`、`rsboot-claw` |
 | 性能 | 4 worker / 客户端 4 线程 p16：rsboot 999.4k，actix-web 4 1033.2k，**落后 3.27%**，胜场 1:19 |
 | 流式 | `Response::stream` + `ChunkSink` + chunked 写回；HTTP/1.0 降级为"写完即断" |
 | 模板 | `{extends}` / `{block}` / `{assign}` / `{if}` / `{foreach}`，编译期展开继承 |
@@ -155,6 +155,22 @@ Mac 本机交替 5 轮 A/B（加流式前后）落在 57k–73k QPS、同代码�
 - [ ] `rsboot-test`：`TestClient`（不起真实端口，直接喂字节进 `serve_once`）+ 断言宏 + 临时服务 helper
 - [ ] `examples/` 补齐：CRUD、SSE 推送、上传、模板站、WebSocket 聊天
 - [ ] `cargo rsboot new` 脚手架（独立 bin crate，模板内置）
+
+### 3.8 `rsboot-claw` 爬虫（v0.1 已落地）
+
+v0.1 的定位是"能独立跑起来、礼貌、可测"，架构 fork Scrapy 的分层（Scheduler / Downloader / Parser / Policy），但落到同步模型，不引 tokio。
+
+- [x] `frontier`：per-host 分桶的待抓队列、URL 归一化去重（`http://a.com` == `http://a.com/` == `:80`）、深度限制、per-host 限速（robots 的 `Crawl-delay` 会抬高该站）
+- [x] `http`：HTTP/1.1 GET、keep-alive 复用、复用死连接自动重连一次、`Content-Length`/`chunked`/读到 EOF 三种 body、3xx 跟随 ≤5 跳、body 上限
+- [x] `html`：一趟扫描不建树，链接 / `rel=nofollow` / `<base>` / `<title>` / `meta description` / `link rel=canonical` / `h1–h6` / 可见文本，跳过 `script`/`style`/注释
+- [x] `robots`（RFC 9309）：最长匹配、等长 Allow 胜、`*` 通配与 `$` 锚定、按 UA 前缀选组
+- [x] `Crawler`：`std::thread::scope` 多 worker 抢一把 `Mutex<Frontier>`，handler 同步调用，`Stats` 汇总（页数/字节/错误分类/robots 拦截/去重/超深）
+- [x] e2e：用 rsboot 自己起站点再爬它（robots 拦截、重定向归属、回环去重、`max_pages`、连不上不挂死）
+- [ ] v0.2 Middleware / Pipeline：请求前改写（UA 轮换、代理、重试策略）与结果后处理（去重入库、字段抽取）
+- [ ] v0.2 `sitemap.xml`：解析 `<urlset>` / `<sitemapindex>`，作为种子批量入队（`Robots::sitemaps` 已经解析出来，还没用上）
+- [ ] v0.2 checkpoint：`seen` 集合落盘（换掉内存 `HashSet`），支持中断续爬
+- [ ] v0.2 HTTPS：作为**可选 feature**（`tls`，引 rustls），默认关闭以守住零依赖；不做就在 `Error::UnsupportedScheme` 上让调用方决定
+- 不做：JS 渲染（要 headless browser）、gzip 解压（请求侧直接 `identity`）、分布式调度（单机爬虫不做分布式协调）
 
 ---
 

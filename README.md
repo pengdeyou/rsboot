@@ -260,6 +260,7 @@ so you never pay for what you do not use:
 | `rsboot-static` | static files: ETag / 304 / single-range 206 / traversal guard / index | none |
 | `rsboot-view` | Smarty-style templates: `{$x}`, `{if}`, `{foreach}`, `{include}`, pipe modifiers | `serde_json` |
 | `rsboot-sse` | Server-Sent Events: `Event` framing (multi-line `data`, `id`/`event` sanitising) + configurable heartbeat, built on the core `ChunkSink` | none |
+| `rsboot-claw` | crawler: per-host frontier + dedup + depth, RFC 9309 robots, zero-dep HTML scanner, HTTP/1.1 client with keep-alive | none |
 
 ```rust,ignore
 use rsboot_ops as ops;

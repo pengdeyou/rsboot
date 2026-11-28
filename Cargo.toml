@@ -44,6 +44,7 @@ members = [
     "crates/rsboot-static",
     "crates/rsboot-view",
     "crates/rsboot-sse",
+    "crates/rsboot-claw",
 ]
 # 压测用的对照程序各有自己的 Cargo.toml（要引 axum / actix），
 # 它们不是 workspace 成员：`cargo test --workspace` 不该被网络拉依赖拖住。

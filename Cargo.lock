@@ -729,6 +729,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsboot-claw"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "rsboot",
+]
+
+[[package]]
 name = "rsboot-cookie"
 version = "0.1.0-alpha.1"
 dependencies = [
