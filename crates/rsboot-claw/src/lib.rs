@@ -37,6 +37,7 @@
 pub mod frontier;
 pub mod html;
 pub mod http;
+pub mod middleware;
 pub mod pipeline;
 pub mod robots;
 pub mod sitemap;
@@ -51,6 +52,7 @@ pub use frontier::{Frontier, Item, Pop, Push};
 pub use html::{scan, Document, Link};
 pub use pipeline::{JsonlSink, Sink};
 pub use http::Client;
+pub use middleware::{Action, Middleware, RetryPolicy, RotateUserAgent, StaticHeaders};
 pub use robots::Robots;
 pub use sitemap::Sitemap;
 pub use url::Url;
@@ -184,6 +186,10 @@ pub struct Stats {
     pub duplicates: usize,
     /// 入队时因超深被丢的
     pub too_deep: usize,
+    /// 中间件要求重试的次数（含最后那次失败的尝试）
+    pub retries: usize,
+    /// 中间件要求跳过的页数
+    pub skipped: usize,
     /// 网络错误详情（每类一条，最多 32 条）
     pub error_kinds: Vec<String>,
     pub elapsed: Duration,
@@ -197,6 +203,8 @@ struct Counters {
     bytes: usize,
     errors: usize,
     skipped_robots: usize,
+    retries: usize,
+    skipped: usize,
     error_kinds: Vec<String>,
 }
 
@@ -229,6 +237,8 @@ pub struct Crawler {
     max_body_bytes: usize,
     sitemap: bool,
     sink: Option<Arc<dyn Sink>>,
+    middlewares: Vec<Arc<dyn Middleware>>,
+    retry_backoff: Duration,
 }
 
 impl Crawler {
@@ -246,6 +256,8 @@ impl Crawler {
             max_body_bytes: 4 * 1024 * 1024,
             sitemap: false,
             sink: None,
+            middlewares: Vec::new(),
+            retry_backoff: Duration::from_millis(200),
         }
     }
 
@@ -321,6 +333,21 @@ impl Crawler {
     /// 也不影响调度；它用来落盘/打点，多个 worker 共享一个。
     pub fn sink(mut self, s: Arc<dyn Sink>) -> Self {
         self.sink = Some(s);
+        self
+    }
+
+    /// 加一个中间件。按注册顺序串联：任一 `Skip` 就短路，任一 `Retry` 就重试。
+    ///
+    /// 重试有硬上限（[`Crawler::MAX_ATTEMPTS`]），中间件写错也不会拖成死循环。
+    pub fn middleware(mut self, m: Arc<dyn Middleware>) -> Self {
+        self.middlewares.push(m);
+        self
+    }
+
+    /// 重试的退避基数：第 n 次重试前睡 `n * base`（线性，不做指数——
+    /// 爬虫的重试窗口本来就短，指数退避只会让一次抓取拖到超时）。
+    pub fn retry_backoff(mut self, d: Duration) -> Self {
+        self.retry_backoff = d;
         self
     }
 
@@ -415,17 +442,78 @@ impl Crawler {
                             }
                         }
 
-                        let t0 = Instant::now();
-                        let resp = match client.get(&item.url) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                counters.lock().unwrap().note_error(&e);
-                                if let Some(sink) = &cfg.sink {
-                                    sink.on_error(&item.url, &e.to_string());
+                        // 一次抓取可能被中间件要求重试；这里是一个带硬上限的循环
+                        let mut headers: Vec<(String, String)> = Vec::new();
+                        let mut attempt = 0usize;
+                        let mut t0 = Instant::now();
+                        let resp = loop {
+                            headers.clear();
+                            let mut before = Action::Continue;
+                            for mw in &cfg.middlewares {
+                                match mw.before(&item.url, &mut headers, attempt) {
+                                    Action::Skip => {
+                                        before = Action::Skip;
+                                        break;
+                                    }
+                                    Action::Retry => before = Action::Retry,
+                                    Action::Continue => {}
                                 }
-                                continue;
+                            }
+                            if before == Action::Skip {
+                                counters.lock().unwrap().skipped += 1;
+                                break None;
+                            }
+
+                            t0 = Instant::now();
+                            match client.get_with(&item.url, &headers) {
+                                Ok(r) => {
+                                    let mut after = Action::Continue;
+                                    for mw in &cfg.middlewares {
+                                        match mw.after(&item.url, r.status, attempt) {
+                                            Action::Skip => {
+                                                after = Action::Skip;
+                                                break;
+                                            }
+                                            Action::Retry => after = Action::Retry,
+                                            Action::Continue => {}
+                                        }
+                                    }
+                                    match after {
+                                        Action::Skip => {
+                                            counters.lock().unwrap().skipped += 1;
+                                            break None;
+                                        }
+                                        Action::Retry if attempt + 1 < Crawler::MAX_ATTEMPTS => {
+                                            counters.lock().unwrap().retries += 1;
+                                            attempt += 1;
+                                            std::thread::sleep(cfg.backoff_at(attempt));
+                                            continue;
+                                        }
+                                        _ => break Some(r),
+                                    }
+                                }
+                                Err(e) => {
+                                    let mut retry = false;
+                                    for mw in &cfg.middlewares {
+                                        if mw.on_error(&item.url, &e, attempt) == Action::Retry {
+                                            retry = true;
+                                        }
+                                    }
+                                    if retry && attempt + 1 < Crawler::MAX_ATTEMPTS {
+                                        counters.lock().unwrap().retries += 1;
+                                        attempt += 1;
+                                        std::thread::sleep(cfg.backoff_at(attempt));
+                                        continue;
+                                    }
+                                    counters.lock().unwrap().note_error(&e);
+                                    if let Some(sink) = &cfg.sink {
+                                        sink.on_error(&item.url, &e.to_string());
+                                    }
+                                    break None;
+                                }
                             }
                         };
+                        let Some(resp) = resp else { continue };
 
                         let doc = if resp.is_html() {
                             scan(&resp.text())
@@ -499,6 +587,8 @@ impl Crawler {
             skipped_robots: c.skipped_robots,
             duplicates: dups,
             too_deep: deep,
+            retries: c.retries,
+            skipped: c.skipped,
             error_kinds: c.error_kinds,
             pages_per_sec: if elapsed.as_secs_f64() > 0.0 {
                 c.pages as f64 / elapsed.as_secs_f64()
@@ -511,6 +601,14 @@ impl Crawler {
 }
 
 impl Crawler {
+    /// 一次抓取最多尝试几次（含首次）。这是**硬上限**：
+    /// 中间件说 `Retry` 也不能突破它，否则一个写错的中间件就能让 worker 卡死。
+    pub const MAX_ATTEMPTS: usize = 5;
+
+    fn backoff_at(&self, attempt: usize) -> Duration {
+        self.retry_backoff * attempt.max(1) as u32
+    }
+
     /// 抓 `robots.txt` 的 `Sitemap:` + `/sitemap.xml`，展开成种子。
     ///
     /// `sitemapindex` 往下走两层：真实站点的分片基本不会更深，

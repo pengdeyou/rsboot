@@ -155,9 +155,19 @@ impl Client {
 
     /// GET 一个地址，自动跟随 3xx。
     pub fn get(&mut self, url: &Url) -> Result<Response> {
+        self.get_with(url, &[])
+    }
+
+    /// 同 [`Client::get`]，但额外带一组请求头。
+    ///
+    /// `user-agent` 会**覆盖** Client 自己的 UA（不是追加，否则一次请求里
+    /// 出现两个 UA，服务端怎么取都算我们错）；`host` / `connection` /
+    /// `accept-encoding` 会被忽略——这三个由连接和协议层决定，让中间件改
+    /// 只会改出协议错误。其余头原样拼进请求。
+    pub fn get_with(&mut self, url: &Url, extra: &[(String, String)]) -> Result<Response> {
         let mut cur = url.clone();
         for _ in 0..=self.max_redirects {
-            let resp = self.get_once(&cur)?;
+            let resp = self.get_once(&cur, extra)?;
             if (300..400).contains(&resp.status) {
                 if let Some(loc) = resp.header("location") {
                     // 3xx 的 body 没用，也不再复用这条连接（不少服务端在 3xx 后关连接）
@@ -174,7 +184,7 @@ impl Client {
         Err(Error::TooManyRedirects(self.max_redirects))
     }
 
-    fn get_once(&mut self, url: &Url) -> Result<Response> {
+    fn get_once(&mut self, url: &Url, extra: &[(String, String)]) -> Result<Response> {
         if url.scheme != "http" {
             return Err(Error::UnsupportedScheme(url.scheme.clone()));
         }
@@ -185,7 +195,7 @@ impl Client {
             Some(r) => r,
             None => self.connect(url)?,
         };
-        match self.exchange(&mut reader, url) {
+        match self.exchange(&mut reader, url, extra) {
             Ok((status, headers, body, keep)) => {
                 if keep {
                     self.pool.insert(key, reader);
@@ -200,7 +210,7 @@ impl Client {
             Err(e) if reused && e.is_stale_connection() => {
                 // 复用到的连接可能已被对端悄悄关掉：重来一次，用新连接
                 let mut fresh = self.connect(url)?;
-                let (status, headers, body, keep) = self.exchange(&mut fresh, url)?;
+                let (status, headers, body, keep) = self.exchange(&mut fresh, url, extra)?;
                 if keep {
                     self.pool.insert(key, fresh);
                 }
@@ -249,12 +259,36 @@ impl Client {
         &mut self,
         reader: &mut BufReader<TcpStream>,
         url: &Url,
+        extra: &[(String, String)],
     ) -> Result<Exchange> {
+        let ua: String = extra
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| self.user_agent.clone());
+        let mut extra_lines = String::new();
+        for (k, v) in extra {
+            // 名字里带 CR/LF 的头会把请求切开（请求头注入），直接丢
+            if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+                continue;
+            }
+            if ["user-agent", "host", "connection", "accept-encoding"]
+                .iter()
+                .any(|h| k.eq_ignore_ascii_case(h))
+            {
+                continue;
+            }
+            extra_lines.push_str(k);
+            extra_lines.push_str(": ");
+            extra_lines.push_str(v);
+            extra_lines.push_str("\r\n");
+        }
         let req = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Encoding: identity\r\n{}Connection: keep-alive\r\n\r\n",
             url.request_target(),
             url.host_header(),
-            self.user_agent
+            ua,
+            extra_lines
         );
         {
             let s = reader.get_mut();
@@ -525,6 +559,47 @@ mod tests {
             Err(Error::BodyTooLarge { limit }) => assert_eq!(limit, 1024),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn extra_headers_override_ua_and_drop_reserved() {
+        let addr = serve(1, |req, _| {
+            let body = format!(
+                "ua={}|xtoken={}|host={}",
+                req.matches("User-Agent:").count(),
+                req.contains("X-Token: abc"),
+                req.contains("Host: ")
+            );
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        });
+        let mut c = Client::new().user_agent("default-agent");
+        let extra = vec![
+            ("User-Agent".to_string(), "rotated-agent".to_string()),
+            ("X-Token".to_string(), "abc".to_string()),
+            ("Host".to_string(), "evil.example".to_string()),
+        ];
+        let r = c.get_with(&url(&addr, "/"), &extra).unwrap();
+        assert_eq!(r.text(), "ua=1|xtoken=true|host=true", "UA 必须唯一且被覆盖");
+    }
+
+    #[test]
+    fn header_injection_is_blocked() {
+        let addr = serve(1, |req, _| {
+            let injected = req.contains("X-Evil");
+            let body = if injected { "LEAK" } else { "clean" };
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        });
+        let mut c = Client::new();
+        let extra = vec![("X-Bad".to_string(), "a\r\nX-Evil: 1".to_string())];
+        assert_eq!(c.get_with(&url(&addr, "/"), &extra).unwrap().text(), "clean");
     }
 
     #[test]

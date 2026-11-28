@@ -16,7 +16,7 @@
 | 性能 | 4 worker / 客户端 4 线程 p16：rsboot 999.4k，actix-web 4 1033.2k，**落后 3.27%**，胜场 1:19 |
 | 流式 | `Response::stream` + `ChunkSink` + chunked 写回；HTTP/1.0 降级为"写完即断" |
 | 模板 | `{extends}` / `{block}` / `{assign}` / `{if}` / `{foreach}`，编译期展开继承 |
-| 测试 | `cargo test --workspace` 415 passed |
+| 测试 | `cargo test --workspace` 423 passed |
 
 任何性能项必须走 `ab5.sh` 两批反序（AB / BA 各 10 轮 × 8s），噪声底 **±0.35%**；单批同向才算收益，两批反向即噪声。
 
@@ -168,7 +168,9 @@ v0.1 的定位是"能独立跑起来、礼貌、可测"，架构 fork Scrapy 的
 - [x] e2e：用 rsboot 自己起站点再爬它（robots 拦截、重定向归属、回环去重、`max_pages`、连不上不挂死）
 - [x] v0.2 `sitemap.xml`：`sitemap::parse` 解 `<urlset>` / `<sitemapindex>`；`.sitemap(true)` 把 robots 的 `Sitemap:` + `/sitemap.xml` 当种子，index 往下两层；`.xml.gz` 不支持（解 gzip 要引库）
 - [x] v0.2 Pipeline：`Sink` trait（`on_page` / `on_error`）+ `JsonlSink`（一行一页，手写 JSON 转义）+ `CollectSink`；`Crawler::sink(Arc<dyn Sink>)` 走旁路，不影响调度
-- [ ] v0.2 Middleware：请求前改写（UA 轮换 / 代理 / 重试策略）——Scrapy 分层里唯一还没落的一层
+- [x] v0.2 Middleware：`Middleware` trait 三钩子（`before` / `after` / `on_error`）返回 `Continue`/`Retry`/`Skip`；`RetryPolicy`（`408`/`429`/`5xx` + 网络错误）、`RotateUserAgent`（确定性轮转）、`StaticHeaders`。重试硬上限 5 次，退避由 `Crawler::retry_backoff` 统一控制
+- [x] `Client::get_with`：中间件能带额外请求头；`user-agent` 覆盖、`host`/`connection`/`accept-encoding` 忽略（否则改出协议错误）、含 CR/LF 的头直接丢（防请求头注入）
+- [ ] v0.3 代理：`CONNECT` 隧道或绝对 URI 请求行 + `407`，属于连接层，`Middleware` 改不了，需要改 `Client`
 - [ ] v0.2 checkpoint：`seen` 集合落盘（换掉内存 `HashSet`），支持中断续爬
 - [ ] v0.2 HTTPS：作为**可选 feature**（`tls`，引 rustls），默认关闭以守住零依赖；不做就在 `Error::UnsupportedScheme` 上让调用方决定
 - 不做：JS 渲染（要 headless browser）、gzip 解压（请求侧直接 `identity`）、分布式调度（单机爬虫不做分布式协调）

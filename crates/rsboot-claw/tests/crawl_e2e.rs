@@ -16,7 +16,111 @@ use rsboot::web::response::Response;
 use rsboot::web::route::Router;
 use rsboot::App;
 
-use rsboot_claw::{follow_internal, Crawler};
+use rsboot_claw::{follow_internal, Crawler, RetryPolicy, RotateUserAgent, StaticHeaders};
+
+#[test]
+fn retry_policy_recovers_from_5xx() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    let router = Router::new()
+        .get("/flaky", move |_, _| {
+            let n = h.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Response::new(Status::BAD_GATEWAY)
+            } else {
+                Response::text("ok")
+            }
+        })
+        .unwrap();
+    let (addr, stop) = serve_at(addr, router);
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/flaky"))
+        .max_depth(0)
+        .workers(1)
+        .retry_backoff(Duration::from_millis(5))
+        .middleware(Arc::new(RetryPolicy::new().retries(2)))
+        .run(|_| Vec::new());
+    stop.store(true, Ordering::Relaxed);
+
+    assert_eq!(stats.pages, 1, "重试应当把这一页救回来");
+    assert_eq!(stats.retries, 1);
+    assert_eq!(stats.errors, 0, "{:?}", stats.error_kinds);
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "服务端应当被打了两次");
+}
+
+#[test]
+fn middleware_headers_reach_the_server_and_ua_rotates() {
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec = seen.clone();
+    let addr = format!("127.0.0.1:{}", free_port());
+    let router = Router::new()
+        .get("/", |_, _| {
+            Response::html(r#"<a href="/p1">1</a><a href="/p2">2</a><a href="/p3">3</a>"#)
+        })
+        .unwrap()
+        .get("/p1", {
+            let rec = rec.clone();
+            move |req, _| {
+                rec.lock().unwrap().push(format!(
+                    "{}|{}",
+                    req.header("user-agent").unwrap_or("-"),
+                    req.header("accept-language").unwrap_or("-")
+                ));
+                Response::text("p1")
+            }
+        })
+        .unwrap()
+        .get("/p2", {
+            let rec = rec.clone();
+            move |req, _| {
+                rec.lock().unwrap().push(format!(
+                    "{}|{}",
+                    req.header("user-agent").unwrap_or("-"),
+                    req.header("accept-language").unwrap_or("-")
+                ));
+                Response::text("p2")
+            }
+        })
+        .unwrap()
+        .get("/p3", {
+            let rec = rec.clone();
+            move |req, _| {
+                rec.lock().unwrap().push(format!(
+                    "{}|{}",
+                    req.header("user-agent").unwrap_or("-"),
+                    req.header("accept-language").unwrap_or("-")
+                ));
+                Response::text("p3")
+            }
+        })
+        .unwrap();
+    let (addr, stop) = serve_at(addr, router);
+
+    Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(1)
+        .workers(1) // 单 worker：轮转顺序才是确定的
+        .middleware(Arc::new(RotateUserAgent::new(["claw-a", "claw-b"])))
+        .middleware(Arc::new(StaticHeaders::new([(
+            "Accept-Language",
+            "zh-CN",
+        )])))
+        .run(follow_internal);
+    stop.store(true, Ordering::Relaxed);
+
+    let got: Vec<String> = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(
+        got.iter().all(|l| l.ends_with("|zh-CN")),
+        "StaticHeaders 应当出现在每个请求里：{got:?}"
+    );
+    let uas: Vec<&str> = got.iter().map(|l| l.split('|').next().unwrap()).collect();
+    assert!(
+        uas.contains(&"claw-a") && uas.contains(&"claw-b"),
+        "UA 应当在轮转：{uas:?}"
+    );
+}
 
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
