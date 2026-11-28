@@ -16,6 +16,14 @@
 
 pub(crate) mod consts;
 pub mod aes;
+pub mod bignum;
 pub mod chacha;
+pub mod chain;
+pub mod handshake;
+pub mod der;
+pub mod ec;
+pub mod rsa;
 pub mod sha256;
+pub mod sha512;
 pub mod x25519;
+pub mod x509;

@@ -16,7 +16,12 @@ use std::time::{Duration, SystemTime};
 use crate::cookies::Jar;
 use crate::url::Url;
 
-pub type Conn = TcpStream;
+/// 连接可以是明文 `TcpStream`，也可以是 TLS 会话。
+/// 用 trait object 让 `BufReader` 与池的类型保持不变。
+pub trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+pub type Conn = Box<dyn ReadWrite + Send>;
 
 /// 出错种类。爬虫对错误的态度是"记一笔、跳过、继续"，所以这里只需要能分类。
 #[derive(Debug)]
@@ -24,8 +29,10 @@ pub enum Error {
     Io(std::io::Error),
     /// 响应头/状态行不合语法
     Protocol(String),
-    /// `https` 需要 TLS，本 crate 明确不支持
+    /// 不支持的 scheme（目前只剩 `ftp://` 之类）
     UnsupportedScheme(String),
+    /// TLS 握手或记录层失败
+    Tls(String),
     /// 响应体超过上限
     BodyTooLarge { limit: usize },
     /// 重定向超过上限
@@ -39,7 +46,8 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Protocol(m) => write!(f, "protocol: {m}"),
-            Error::UnsupportedScheme(s) => write!(f, "unsupported scheme: {s} (claw 只做 http)"),
+            Error::UnsupportedScheme(s) => write!(f, "unsupported scheme: {s}"),
+            Error::Tls(m) => write!(f, "tls: {m}"),
             Error::BodyTooLarge { limit } => write!(f, "body too large (> {limit} bytes)"),
             Error::TooManyRedirects(n) => write!(f, "too many redirects (> {n})"),
             Error::Connect(m) => write!(f, "connect: {m}"),
@@ -201,6 +209,8 @@ pub struct Client {
     proxy: Option<Proxy>,
     /// 会话 cookie。`None` = 无状态（`cookie_jar(false)`）
     jar: Option<Jar>,
+    /// 信任根。`None` = 首次 https 时从系统 bundle 加载并缓存。
+    roots: Option<Vec<crate::tls::x509::Cert>>,
 }
 
 impl Client {
@@ -214,7 +224,14 @@ impl Client {
             connects: 0,
             proxy: None,
             jar: Some(Jar::new()),
+            roots: None,
         }
+    }
+
+    /// 显式指定信任根（测试或私有 CA 用）。
+    pub fn trust_roots(mut self, roots: Vec<crate::tls::x509::Cert>) -> Self {
+        self.roots = Some(roots);
+        self
     }
 
     /// 走代理。传 `None` 等于直连。
@@ -289,7 +306,7 @@ impl Client {
     }
 
     fn get_once(&mut self, url: &Url, extra: &[(String, String)]) -> Result<Response> {
-        if url.scheme != "http" {
+        if url.scheme != "http" && url.scheme != "https" {
             return Err(Error::UnsupportedScheme(url.scheme.clone()));
         }
         let key = self.pool_key(url);
@@ -386,17 +403,23 @@ impl Client {
         }))
     }
 
-    fn upgrade(&self, s: TcpStream, _url: &Url) -> Result<BufReader<Conn>> {
-        Ok(BufReader::new(s))
-    }
-
-    #[cfg(feature = "tls")]
-    fn upgrade(&self, s: TcpStream, url: &Url) -> Result<BufReader<Conn>> {
+    /// 明文直接用，https 现场握手。TLS 代码全部在本 crate 的 `tls::` 里，
+    /// 不引任何第三方 crate。
+    fn upgrade(&mut self, s: TcpStream, url: &Url) -> Result<BufReader<Conn>> {
         if url.scheme == "https" {
-            let tls = crate::tls::wrap(s, &url.host)?;
-            return Ok(BufReader::new(Box::new(tls) as Box<dyn ReadWrite + Send>));
+            if self.roots.is_none() {
+                let r = crate::tls::x509::system_roots()
+                    .map_err(|e| Error::Tls(e.to_string()))?;
+                self.roots = Some(r);
+            }
+            // 借用冲突：先把根取出来，握手完放回（失败时也放回）
+            let roots = self.roots.take().unwrap_or_default();
+            let res = crate::tls::handshake::TlsStream::handshake(s, &url.host, Some(&roots))
+                .map_err(|e| Error::Tls(e.to_string()));
+            self.roots = Some(roots);
+            return Ok(BufReader::new(Box::new(res?)));
         }
-        Ok(BufReader::new(Box::new(s) as Box<dyn ReadWrite + Send>))
+        Ok(BufReader::new(Box::new(s)))
     }
 
     /// 发请求、读响应。返回 `(状态, 头, body, 连接是否可复用)`。
@@ -831,11 +854,18 @@ mod tests {
     }
 
     #[test]
-    fn https_is_rejected_clearly() {
+    fn unknown_scheme_is_rejected_clearly() {
+        // https 现在是走自研 TLS 的（要联网，不进单测）；这里只测白名单本身
         let mut c = Client::new();
-        let u = Url::parse("https://example.com/").unwrap();
+        let u = Url {
+            scheme: "ftp".to_string(),
+            host: "example.com".to_string(),
+            port: None,
+            path: "/".to_string(),
+            query: None,
+        };
         match c.get(&u) {
-            Err(Error::UnsupportedScheme(s)) => assert_eq!(s, "https"),
+            Err(Error::UnsupportedScheme(s)) => assert_eq!(s, "ftp"),
             other => panic!("{other:?}"),
         }
     }

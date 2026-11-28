@@ -16,7 +16,7 @@
 | 性能 | 4 worker / 客户端 4 线程 p16：rsboot 999.4k，actix-web 4 1033.2k，**落后 3.27%**，胜场 1:19 |
 | 流式 | `Response::stream` + `ChunkSink` + chunked 写回；HTTP/1.0 降级为"写完即断" |
 | 模板 | `{extends}` / `{block}` / `{assign}` / `{if}` / `{foreach}`，编译期展开继承 |
-| 测试 | `cargo test --workspace` 452 passed |
+| 测试 | `cargo test --workspace` 535 passed |
 
 任何性能项必须走 `ab5.sh` 两批反序（AB / BA 各 10 轮 × 8s），噪声底 **±0.35%**；单批同向才算收益，两批反向即噪声。
 
@@ -177,7 +177,11 @@ v0.1 的定位是"能独立跑起来、礼貌、可测"，架构 fork Scrapy 的
 - [x] v0.6 优先级调度：`.priority_fn(|u| …)` 给 URL 打分，同站内大的先抓、同分保持 FIFO；`.seed_with(url, p)` 给种子带分。跨站**不比较**——按 host 轮转是礼貌的一部分，让高分站插队会饿死慢站。为什么不改 handler 签名为 `-> Vec<(String, i32)>`：v0.1 定的签名，而"哪类 URL 要紧"通常只看地址本身
 - [x] v0.7 URL 过滤：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象 `path?query`，`*` 是唯一通配符、整串匹配、deny 优先、allow 非空即白名单。被拒的链接不入队不发请求。**`?` 不能兼作通配符**：一开始支持过"任意单字符"，撞上真实写法 `"?page=*"` 会静默不匹配，直接删掉
 - [x] v0.8 会话 cookie：`cookies` 模块（per-host jar，RFC 6265 里真正会被爬虫撞上的部分：`Domain`/`Path`/`Secure`/`Max-Age`/`Expires`，RFC 1123 日期手写解析，`days_from_civil` 处理闰年）。域名校验双向——别人给本域塞 cookie 不收；`Path` 前缀匹配要求后紧跟 `/`（`/docs` 匹配 `/docs/x`，不匹配 `/docsomething`）；`Secure` 在 http 下不发。默认开，每 worker 一个 jar。**Headers 里的显式 `Cookie` 优先**，两条 cookie 头同时发没有意义
-- [x] v0.9 HTTPS：作为**可选 feature**（`tls`，引 `rustls` + `webpki-roots`），`default = []` 以守住零依赖。根证书用 `webpki-roots`（Mozilla 根编进二进制）不读系统 store——否则同一个站在不同机器上能不能爬取决于系统配置；证书校验必开。`Conn` 在无 feature 时仍是 `TcpStream`（不为用不到的功能付 dyn 开销）；`pool_key` 带 scheme，否则明文连接会被复用给 https 请求；https 走明文代理需 `CONNECT` 隧道，明确报错
+- [x] ~~v0.9 HTTPS 走可选 `tls` feature（`rustls` + `webpki-roots`）~~ 已放弃：开了这个 feature 就不是零依赖了，与 "fork 架构不 fork 代码" 的定位冲突
+- [x] v1.0 HTTPS 自研 TLS 1.3（零依赖）：`src/tls/` 手写 x25519、ChaCha20-Poly1305、AES-128/256-GCM、SHA-256/384/512、HMAC/HKDF、DER/X.509、RSA（PKCS#1 v1.5 + PSS）、ECDSA（P-256/SHA-256、P-384/SHA-384）、Montgomery 大数、链校验、握手状态机。根证书读系统 bundle（`SSL_CERT_FILE` 或常见路径），另留 `trust_roots()` 注入私有 CA
+- [x] v1.0 链校验的两个真实世界坑：① 服务端发来的根常是「被旧根交叉签过」的形态（`SSL.com TLS ECC Root CA 2022` ← `AAA Certificate Services`），而系统根里是自签形态 —— 只按名字取第一个签发者会走进死路，改成多路径 DFS；② 名字比较必须按 RFC 5280 比属性内容，不能比字节（同一 CN 在不同证书里可能一个是 PrintableString、一个是 UTF8String）
+- [x] v1.0 密码学调试方法论：密钥调度用 RFC 8448 §3 的 early/derived/handshake/s hs 中间值逐段核对，再和本地 `openssl s_server` 的 keylog 逐字节比对；`maskedDB` 左位检查必须在「异或解开前」做（写错位置会导致只在某些模数上失败，本地向量还测不出来）
+- 不做：TLS 1.2（只认 1.2 的站点直接回 alert 70）、P-521/Ed25519 证书（系统根里约 30% 是这两类，但真实站点 leaf/中间证书基本不用）、`CONNECT` 隧道（https 走明文代理还是明确报错）
 - 不做：JS 渲染（要 headless browser）、gzip 解压（请求侧直接 `identity`）、分布式调度（单机爬虫不做分布式协调）
 
 ---

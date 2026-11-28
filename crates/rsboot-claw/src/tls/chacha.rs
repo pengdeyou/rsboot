@@ -361,4 +361,5 @@ only one tip for the future, sunscreen would be it.";
         assert_eq!(ct.len(), 16);
         assert_eq!(open(&key, &nonce, b"aad", &ct).unwrap(), Vec::<u8>::new());
     }
+
 }

@@ -5,7 +5,7 @@
 `https://` 也能用，且**不靠任何第三方库**：TLS 1.3 的整套密码学（x25519、ChaCha20-Poly1305、AES-128-GCM、SHA-256/HMAC/HKDF、X.509 链校验）都在 `src/tls/` 里手写，每个原语都对过标准测试向量。
 
 ```
-cargo test -p rsboot-claw          # 103 项（87 单测 + 15 e2e + 1 doctest）
+cargo test -p rsboot-claw          # 167 项（151 单测 + 15 e2e + 1 doctest）
 ```
 
 ## 快速开始
@@ -77,12 +77,25 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **per-host 并发**：`.max_per_host(n)` 限"同时几发"，和 `delay` 限的"隔多久"是两件事。不设时 `workers(8)` 会对同一个站同时开 8 发——对人家不够客气，自己也被一个站占满。名额在拿到任务时占、由 `Drop` 归还，handler panic 也还。
 - **内容去重**：`.avoid_duplicate_content(true)` 按正文算 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次（镜像站、`?page=1` 空壳页、导航菜单撑大的页）。命中页仍然抽站内链接继续走——不抽等于把下游砍了。理论上有碰撞，后果是"少交一页"，不会把两页混成一页。
 - **深度**：只按"距种子几跳"算，不猜路径层级。
-- **TLS 1.3（自研，零依赖，进行中）**：不引 `rustls`——`src/tls/` 里是手写的
+- **TLS 1.3（自研，零依赖）**：不引 `rustls`——`src/tls/` 里全是手写的：
   x25519（RFC 7748 ladder）、ChaCha20-Poly1305（RFC 8439）、AES-128-GCM
-  （SP 800-38D）、SHA-256/HMAC/HKDF（FIPS 180-4 / RFC 5869）。每个原语都
-  在单测里对过官方测试向量（含与 OpenSSL 生成数据的对拍），不是"写完看着像"。
-  证书链与主机名**强制校验**，不提供跳过开关。当前进度：原语完成，
-  X.509 解析、RSA/ECDSA 验签、握手状态机在下一批提交里接上。
+  （SP 800-38D）、AES-256-GCM、SHA-256/SHA-384/SHA-512/HMAC/HKDF
+  （FIPS 180-4 / RFC 5869）、DER/X.509 解析、RSA（PKCS#1 v1.5 与 PSS）、
+  ECDSA（P-256/SHA-256、P-384/SHA-384）、大数 Montgomery 乘法、证书链校验、
+  握手状态机。每个原语都在单测里对过官方测试向量（含与 OpenSSL 生成数据的
+  对拍），密钥调度用 RFC 8448 §3 的中间值逐段核对，并和本地 `openssl s_server`
+  的 keylog 逐字节比对过。
+
+  证书链与主机名**强制校验**，不提供跳过开关。链校验按**多路径 DFS**：服务端发来的
+  `SSL.com TLS ECC Root CA 2022` 常是「被 AAA Certificate Services 交叉签过」的形态，
+  而系统根里躺的是自签形态，只按名字取第一个签发者会走进走不通的那条分支；
+  名字比较按 RFC 5280 只比属性内容，不比字节（`CN=AAA Certificate Services`
+  在不同证书里可能一个是 PrintableString、一个是 UTF8String）。
+
+  实测 `examples/https.rs` 打通真实站点：`example.com`、`www.cloudflare.com`、
+  `www.rust-lang.org`、`github.com` 全部 HTTP 200（含 Chacha 与 AES-128 两套套件、
+  P-256/P-384/RSA-PSS 三种证书签名）。已知边界：不支持 TLS 1.2，遇到只认 1.2 的
+  站点只能用 `http://`（`www.baidu.com` 就是这类，服务端直接回 alert 70）。
 - **会话 cookie**：默认开，per-host 的 jar，`Set-Cookie` 收、下次请求带。认 `Domain` / `Path` / `Secure` / `Max-Age` / `Expires`（RFC 1123 日期手写解析），`HttpOnly` 只记录（不跑 JS，没实际作用）。域名校验是双向的——别人想给 `a.com` 塞 cookie 不收，`a.com` 的 `Domain=.a.com` 才能往子域走。`Client::cookie_jar(false)` 回到无状态。每个 worker 一个 jar，不会出现两个 worker 共享半份登录态。
 - **URL 过滤**：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象是 `path?query`。
 
