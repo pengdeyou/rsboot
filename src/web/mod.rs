@@ -3,6 +3,7 @@
 //! 这一层**不许** use `runtime::App`，路由与 handler 只认 `&Context`。
 //! 这样路由表可以在没有 App 的情况下单独测试（`TestClient` 就是这么来的）。
 
+pub mod code;
 pub mod envelope;
 pub mod exception;
 pub mod error;

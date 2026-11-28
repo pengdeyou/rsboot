@@ -93,7 +93,7 @@ pub fn error(err: &ApiError, req: Option<&Request>, on: bool) -> Response {
         return err.to_response();
     }
     let trace = req.and_then(|r| r.request_id());
-    let code = err.status.0;
+    let code = err.code;
 
     // 只有校验失败才需要 `fields` 这棵树（本身是罕见路径，建树无妨）。
     // 其余错误 `data` 就是 null，直接写字面量，不经过任何中间结构。
@@ -139,7 +139,7 @@ fn fallback_500() -> Response {
 /// 现在只分配一次，字段顺序与旧实现逐字节一致（`code` → `message` →
 /// `data` → `trace_id`）。
 pub(crate) fn serialize<D: Serialize>(
-    code: u16,
+    code: u32,
     message: &str,
     data: Option<&D>,
     trace: Option<&str>,
@@ -148,7 +148,7 @@ pub(crate) fn serialize<D: Serialize>(
     let mut buf = Vec::with_capacity(128);
     buf.push(b'{');
     buf.extend_from_slice(br#""code":"#);
-    push_u16(&mut buf, code);
+    push_u32(&mut buf, code);
     buf.extend_from_slice(br#","message":"#);
     serde_json::to_writer(&mut buf, message)?;
     if let Some(d) = data {
@@ -166,12 +166,12 @@ pub(crate) fn serialize<D: Serialize>(
 }
 
 /// 手写整数写入：状态码只有 3 位，比走 `serde_json` 的整数路径少一层。
-fn push_u16(buf: &mut Vec<u8>, mut n: u16) {
+fn push_u32(buf: &mut Vec<u8>, mut n: u32) {
     if n == 0 {
         buf.push(b'0');
         return;
     }
-    let mut digits = [0u8; 5];
+    let mut digits = [0u8; 10];
     let mut i = digits.len();
     while n > 0 {
         i -= 1;
@@ -218,7 +218,7 @@ mod tests {
         let r = error(&e, Some(&req(Some("t1"))), true);
         assert_eq!(r.status, Status::NOT_FOUND, "状态码必须保留");
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-        assert_eq!(v["code"], 404);
+        assert_eq!(v["code"], 4040);
         assert_eq!(v["message"], "没有这个用户");
         assert_eq!(v["trace_id"], "t1");
     }
@@ -229,7 +229,7 @@ mod tests {
         let r = error(&e, None, true);
         assert_eq!(r.status, Status::UNPROCESSABLE_ENTITY);
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-        assert_eq!(v["code"], 422);
+        assert_eq!(v["code"], 4220);
         assert_eq!(v["data"]["fields"][0]["loc"][0], "query");
         assert_eq!(v["data"]["fields"][0]["loc"][1], "limit");
     }

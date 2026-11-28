@@ -549,8 +549,11 @@ impl Conn {
     }
 }
 
+/// 协议层错误也走**统一响应体**：客户端只需一套解析逻辑，
+/// 400/413/414/431/501/505 这些早失败路径与 handler 的业务错误同形。
 fn write_error<W: Write>(out: &mut W, err: ApiError, close: bool) -> std::io::Result<()> {
-    write::write_response(out, &err.to_response(), close, false, None)
+    let resp = crate::web::envelope::error(&err, None, true);
+    write::write_response(out, &resp, close, false, None)
 }
 
 /// 读"请求行 + 头 + 空行"。

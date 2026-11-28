@@ -210,6 +210,42 @@ Four things worth knowing:
 - For all of these the wrapper is **unconditional** — it does not depend on `http.envelope`. A shape you asked for explicitly should not be reshaped by a global switch.
 - `data` serialises into the same buffer (no `serde_json::Value` tree in between), and the field order is byte-identical to what `http.envelope` produces, so turning that switch on does not change a single byte of these responses.
 
+## Error codes
+
+`code` is a 4-digit number: **the first 3 digits are the HTTP status, the last is the sub-code**. Gateways retry/cache/alert on the status; services branch on the sub-code. One table serves both, so you never maintain two code spaces and translate between them.
+
+| Code | Status | Meaning |
+|---|---|---|
+| `200` | 200 | success |
+| `4000` | 400 | bad request (generic) |
+| `4001`–`4009` | 400 | your business codes (`4001` out of stock, `4002` insufficient balance, …) |
+| `4010` | 401 | unauthenticated |
+| `4030` | 403 | forbidden |
+| `4040` | 404 | not found |
+| `4090` | 409 | conflict |
+| `4220` | 422 | validation failed |
+| `4290` | 429 | rate limited |
+| `5000` | 500 | service error (generic) |
+| `5001` | 500 | upstream / third-party service error |
+| `5002` | 500 | database error |
+| `5003` | 500 | timeout |
+| `5010` | 501 | method not implemented |
+| `5050` | 505 | unsupported HTTP version |
+
+`status_of` only reads the leading three digits, so longer codes still work: `5001` → 500, `4220` → 422, `200` → 200. The constants live in `rsboot::web::code`.
+
+```rust
+// Business errors: allocate your own 4xx codes
+Res::fail(4002, "insufficient balance");   // 400 {"code":4002,"message":"insufficient balance"}
+
+// Service errors: the 5xx segment
+Res::fail(5001, "upstream unavailable");   // 500 {"code":5001,"message":"upstream unavailable"}
+Err(Res::err(5002, "inventory service down"))
+ApiError::upstream("third-party timeout")  // same as code = 5001
+```
+
+**Early rejections in the protocol layer use the same shape.** 400 (malformed), 413 (body too large), 414 (request line too long), 431 (headers too large), 501 (unknown method) and 505 (unsupported version) are refused by the parser, but the body is still `{"code":<n>,"message":"..."}` with `connection: close` — clients do not need a second parser for errors that never reached a handler.
+
 ## Design highlights
 
 1. **No third-party runtime.** HTTP/1.1 parsing, keep-alive connection handling, `writev` batching, the poll loop and the M:N scheduler are all in-tree. The dependency list is serde-level, not tokio-level. Fewer moving parts, no version-lock to an async runtime's internals.

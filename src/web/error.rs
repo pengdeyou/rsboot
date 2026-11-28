@@ -17,6 +17,8 @@ use crate::web::response::Response;
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: Status,
+    /// 细化错误码：前 3 位是 HTTP 状态，后面是细分序号（见 [`code`](crate::web::code)）。
+    pub code: u32,
     /// 面向客户端的说明
     pub detail: String,
     /// `422` 时的位置：`("path", "id")` / `("query", "limit")` / `("body", "name")`
@@ -36,6 +38,7 @@ pub struct ApiError {
 impl ApiError {
     pub fn new(status: Status, detail: impl Into<String>) -> Self {
         Self {
+            code: status.0 as u32 * 10,
             status,
             detail: detail.into(),
             loc: None,
@@ -44,6 +47,31 @@ impl ApiError {
             request_id: None,
             always_wrap: false,
         }
+    }
+
+    /// 用细化码构造：HTTP 状态由码的前三位推出（`4002` → 400，`5001` → 500）。
+    ///
+    /// 业务码自行分配即可：`4001` 库存不足、`4002` 余额不足、`4003` 状态非法……
+    /// 只要落在外层对应的 4xx/5xx 段里，网关和客户端两边都读得懂。
+    pub fn with_code(code: u32, detail: impl Into<String>) -> Self {
+        let mut e = Self::new(crate::web::code::status_of(code), detail);
+        e.code = code;
+        e
+    }
+
+    /// 服务异常（`500` + `5000`）：逻辑 bug、依赖挂掉这类"服务端自己的问题"。
+    pub fn service(detail: impl Into<String>) -> Self {
+        Self::with_code(crate::web::code::INTERNAL, detail)
+    }
+
+    /// 下游 / 第三方服务异常（`500` + `5001`）。
+    pub fn upstream(detail: impl Into<String>) -> Self {
+        Self::with_code(crate::web::code::UPSTREAM, detail)
+    }
+
+    /// 数据库异常（`500` + `5002`）。
+    pub fn database(detail: impl Into<String>) -> Self {
+        Self::with_code(crate::web::code::DATABASE, detail)
     }
 
     pub fn bad_request(detail: impl Into<String>) -> Self {
@@ -61,6 +89,7 @@ impl ApiError {
     /// 校验失败：缺参数、类型不对、body 解析不了。
     pub fn validation(kind: &str, where_: &str, name: &str, msg: impl Into<String>) -> Self {
         Self {
+            code: crate::web::code::VALIDATION,
             status: Status::UNPROCESSABLE_ENTITY,
             // msg 就是给客户端看的那句话（对齐 FastAPI 的 `msg`）。
             // 早先这里只写 `where.name`，把真正的解析原因（`missing field `q``）
@@ -78,6 +107,7 @@ impl ApiError {
     /// `5xx`：客户端只看到笼统的话，真实原因进 `internal`（服务端日志）。
     pub fn internal(err: impl fmt::Display) -> Self {
         Self {
+            code: crate::web::code::INTERNAL,
             status: Status::INTERNAL_SERVER_ERROR,
             detail: "internal server error".to_string(),
             loc: None,
@@ -218,6 +248,21 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&e.to_response().body).unwrap();
         assert_eq!(body["request_id"], 17);
+    }
+
+    #[test]
+    fn code_carries_the_status_in_its_prefix() {
+        let e = ApiError::with_code(4002, "余额不足");
+        assert_eq!(e.status, Status::BAD_REQUEST);
+        assert_eq!(e.code, 4002);
+
+        let e = ApiError::service("库存服务挂了");
+        assert_eq!(e.status, Status::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.code, crate::web::code::INTERNAL);
+
+        let e = ApiError::database("db down");
+        assert_eq!(e.code, crate::web::code::DATABASE);
+        assert_eq!(e.status, Status::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

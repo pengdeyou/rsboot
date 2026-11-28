@@ -15,6 +15,7 @@
 //! | 头部总字节 > 8 KiB | 431 + 断开 | 防头部炸弹 |
 //! | 请求行（方法+路径）> 8 KiB | 414 + 断开 | 防超长 URL 打日志/打缓存 |
 //! | body > 上限 | 413 + **断开** | 不能"回 413 然后继续读"——残留字节会被当成下一个请求 |
+//! | 未知方法（`FOO /`） | 501 + 断开 | 405 表示"路径存在但方法不允许"，不认识的方法属于未实现 |
 //! | HTTP/1.1 缺 `Host` | 400 | 规范要求，且虚拟主机路由需要它 |
 //!
 //! 断开（而不是保持连接）是刻意的：一旦解析出现歧义，这条连接上后续字节的
@@ -139,7 +140,7 @@ pub fn parse_head_with<'a>(
 
     let method = Method::parse(method_raw).ok_or_else(|| {
         ParseError::new(
-            Status(405),
+            Status(501),
             format!("不支持的方法 `{method_raw}`"),
         )
     })?;
@@ -613,7 +614,7 @@ if-none-match: \"33a64df5\"\r\n\
     #[test]
     fn unknown_method_is_405() {
         let e = err("BREW /x HTTP/1.1\r\nHost: a\r\n");
-        assert_eq!(e.status, Status(405));
+        assert_eq!(e.status, Status(501), "未实现的方法回 501，不是 405");
     }
 
     #[test]

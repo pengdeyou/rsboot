@@ -565,7 +565,7 @@ mod tests {
         let r = Router::new()
             .get("/ping", |_, _| crate::web::res::Res::success("ok"))
             .unwrap()
-            .get("/boom", |_, _| crate::web::res::Res::fail("库存不足"))
+            .get("/boom", |_, _| crate::web::res::Res::fail_msg("库存不足"))
             .unwrap();
         let ok = call(&r, Method::Get, "/ping");
         assert_eq!(ok.status, Status::OK);
@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(bad.status, Status::BAD_REQUEST);
         assert_eq!(
             &bad.body[..],
-            "{\"code\":400,\"message\":\"库存不足\"}".as_bytes()
+            "{\"code\":4000,\"message\":\"库存不足\"}".as_bytes()
         );
     }
 
@@ -583,13 +583,13 @@ mod tests {
     fn res_fail_wraps_even_when_envelope_off() {
         let r = Router::new()
             .get("/x", |_, _| -> std::result::Result<Response, ApiError> {
-                Err(crate::web::res::Res::err("库存不足"))
+                Err(crate::web::res::Res::err_msg("库存不足"))
             })
             .unwrap();
         let resp = call(&r, Method::Get, "/x");
         assert_eq!(resp.status, Status::BAD_REQUEST);
         let body = String::from_utf8(resp.body).unwrap();
-        assert!(body.contains(r#""code":400"#), "{body}");
+        assert!(body.contains(r#""code":4000"#), "{body}");
         assert!(body.contains("库存不足"), "{body}");
         assert!(!body.contains(r#""data""#), "没有数据就该省掉这个字段：{body}");
     }

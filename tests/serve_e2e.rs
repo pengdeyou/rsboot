@@ -252,3 +252,51 @@ fn rate_limit_returns_429_with_retry_after() {
     stop.store(true, Ordering::Relaxed);
     handle.join().unwrap();
 }
+
+/// 协议层的早失败（还没走到 handler 就拒绝的请求）也必须回统一响应体：
+/// 客户端只需一套解析逻辑，`code` 的前三位就是 HTTP 状态。
+#[test]
+fn protocol_errors_use_the_unified_body() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = Arc::clone(&stop);
+    let a2 = addr.clone();
+
+    let handle = std::thread::spawn(move || {
+        let mut app = App::builder()
+            .config(Config::new())
+            .database("default", "sqlite://:memory:")
+            .build()
+            .unwrap();
+        let router = Router::new()
+            .get("/ping", |_, _| Response::text("pong"))
+            .unwrap();
+        app.serve_with(&a2, router, s2).unwrap();
+    });
+
+    // 未知方法：501 + 5010
+    let mut s = wait_ready(&addr);
+    let r = request(&mut s, "FOO /ping HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 501"), "{r}");
+    assert!(r.contains(r#""code":5010"#), "{r}");
+    assert!(r.contains("connection: close"), "解析失败必须断开连接：{r}");
+
+    // HTTP/1.1 缺 Host：400 + 4000
+    let mut s = wait_ready(&addr);
+    let r = request(&mut s, "GET /ping HTTP/1.1\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+    assert!(r.contains(r#""code":4000"#), "{r}");
+
+    // 超长请求行：414 + 4140
+    let mut s = wait_ready(&addr);
+    let long = format!(
+        "GET /{} HTTP/1.1\r\nHost: a\r\n\r\n",
+        "a".repeat(9 * 1024)
+    );
+    let r = request(&mut s, &long);
+    assert!(r.starts_with("HTTP/1.1 414"), "{r}");
+    assert!(r.contains(r#""code":4140"#), "{r}");
+
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+}
