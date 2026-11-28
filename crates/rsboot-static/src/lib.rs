@@ -291,12 +291,13 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
-            let n = std::process::id() as u64
-                + std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64;
-            let p = std::env::temp_dir().join(format!("rsboot-static-{n}"));
+            // pid + 进程内单调计数器：同一进程的多条测试线程各拿一个独立目录。
+            // 原先用 `pid + 当前纳秒`，macOS 上时钟粒度粗到会撞——两个测试算出
+            // 同一个目录，其中一个 Drop 时把另一个的目录删了，于是偶发 404。
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("rsboot-static-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p); // 上次崩溃可能留了残骸
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }

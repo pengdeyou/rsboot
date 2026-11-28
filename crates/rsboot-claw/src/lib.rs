@@ -43,6 +43,8 @@ pub mod middleware;
 pub mod pipeline;
 pub mod robots;
 pub mod sitemap;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod url;
 
 use std::collections::{HashMap, HashSet};

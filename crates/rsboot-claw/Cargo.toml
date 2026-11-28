@@ -7,8 +7,16 @@ license = "MIT OR Apache-2.0"
 description = "A zero-dependency web crawler for rsboot: frontier, dedup, robots.txt, rate limit."
 repository = "https://github.com/pengdeyou/rsboot"
 
-# 库本体零依赖：URL 解析、HTML 扫描、robots、去重、HTTP 客户端全部在仓库内。
+# 库本体零依赖：URL 解析、HTML 扫描、robots、去重、HTTP 客户端、cookie 全部在仓库内。
+# 唯一的例外是 `tls` feature：TLS 不可能手写，显式 opt-in 才引 rustls。
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[features]
+default = []
+tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 
 # e2e 用 rsboot 自己起一个被爬的站点——不引第三方 server。
 [dev-dependencies]

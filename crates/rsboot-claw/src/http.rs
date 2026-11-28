@@ -1,8 +1,8 @@
 //! 极简 HTTP/1.1 客户端。
 //!
 //! 只做爬虫需要的那半边：`GET`、keep-alive 复用、`Content-Length` / `chunked`
-//! / 读到 EOF 三种 body 形态、3xx 跟随。不做的：TLS、HTTP/2、gzip 解压、
-//! cookie、缓存。
+//! / 读到 EOF 三种 body 形态、3xx 跟随、cookie、可选 TLS（`tls` feature）。
+//! 不做的：HTTP/2、gzip 解压、缓存。
 //!
 //! 为什么不用现成的 client：rsboot 核心零第三方依赖，扩展 crate 也守这条线；
 //! 而爬虫对客户端的要求比一般 API 调用**更松**——不需要连接池并发安全，
@@ -15,6 +15,21 @@ use std::time::{Duration, SystemTime};
 
 use crate::cookies::Jar;
 use crate::url::Url;
+
+/// 一条连接的抽象。
+///
+/// 不开 `tls` feature 时就是 `TcpStream`——不为用不到的功能付一层 dyn 的开销。
+/// 开了之后 https 要装 rustls 流，两种具体类型只能统一成 trait 对象。
+#[cfg(not(feature = "tls"))]
+pub type Conn = TcpStream;
+
+#[cfg(feature = "tls")]
+pub trait ReadWrite: Read + Write {}
+#[cfg(feature = "tls")]
+impl<T: Read + Write> ReadWrite for T {}
+
+#[cfg(feature = "tls")]
+pub type Conn = Box<dyn ReadWrite + Send>;
 
 /// 出错种类。爬虫对错误的态度是"记一笔、跳过、继续"，所以这里只需要能分类。
 #[derive(Debug)]
@@ -37,7 +52,13 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Protocol(m) => write!(f, "protocol: {m}"),
-            Error::UnsupportedScheme(s) => write!(f, "unsupported scheme: {s} (claw 只做 http)"),
+            Error::UnsupportedScheme(s) => {
+                if cfg!(feature = "tls") {
+                    write!(f, "unsupported scheme: {s} (claw 只做 http/https)")
+                } else {
+                    write!(f, "unsupported scheme: {s} (claw 只做 http；要 https 请开 `tls` feature)")
+                }
+            }
             Error::BodyTooLarge { limit } => write!(f, "body too large (> {limit} bytes)"),
             Error::TooManyRedirects(n) => write!(f, "too many redirects (> {n})"),
             Error::Connect(m) => write!(f, "connect: {m}"),
@@ -193,7 +214,7 @@ pub struct Client {
     timeout: Duration,
     max_redirects: usize,
     max_body: usize,
-    pool: HashMap<String, BufReader<TcpStream>>,
+    pool: HashMap<String, BufReader<Conn>>,
     /// 累计建立的连接数，用来确认 keep-alive 真的生效了
     connects: usize,
     proxy: Option<Proxy>,
@@ -287,7 +308,8 @@ impl Client {
     }
 
     fn get_once(&mut self, url: &Url, extra: &[(String, String)]) -> Result<Response> {
-        if url.scheme != "http" {
+        let scheme_ok = url.scheme == "http" || (cfg!(feature = "tls") && url.scheme == "https");
+        if !scheme_ok {
             return Err(Error::UnsupportedScheme(url.scheme.clone()));
         }
         let key = self.pool_key(url);
@@ -342,13 +364,21 @@ impl Client {
 
     /// 池的键：有代理时还要带上代理地址——不然换了代理会复用旧连接。
     fn pool_key(&self, url: &Url) -> String {
+        // scheme 必须入键：`http://a.com` 与 `https://a.com:443` 是两条不同
+        // 的连接，共用一个槽位会把明文连接复用给 https 请求
         match &self.proxy {
-            Some(p) => format!("{}|{}", p.addr(), url.host_header()),
-            None => url.host_header(),
+            Some(p) => format!("{}|{}|{}", p.addr(), url.scheme, url.host_header()),
+            None => format!("{}|{}", url.scheme, url.host_header()),
         }
     }
 
-    fn connect(&mut self, url: &Url) -> Result<BufReader<TcpStream>> {
+    fn connect(&mut self, url: &Url) -> Result<BufReader<Conn>> {
+        // 明文代理承载不了 https：那需要 CONNECT 隧道，claw 不做
+        if url.scheme == "https" && self.proxy.is_some() {
+            return Err(Error::Protocol(
+                "https over a plain http proxy needs CONNECT, which claw does not do".into(),
+            ));
+        }
         let addr = match &self.proxy {
             Some(p) => p.addr(),
             None => format!("{}:{}", url.host, url.real_port()),
@@ -365,7 +395,7 @@ impl Client {
                     s.set_write_timeout(Some(self.timeout))?;
                     let _ = s.set_nodelay(true);
                     self.connects += 1;
-                    return Ok(BufReader::new(s));
+                    return self.upgrade(s, url);
                 }
                 Err(e) => last = Some(e),
             }
@@ -376,10 +406,25 @@ impl Client {
         }))
     }
 
+    /// 直连就是原样；`tls` feature 下 https 再包一层 TLS。
+    #[cfg(not(feature = "tls"))]
+    fn upgrade(&self, s: TcpStream, _url: &Url) -> Result<BufReader<Conn>> {
+        Ok(BufReader::new(s))
+    }
+
+    #[cfg(feature = "tls")]
+    fn upgrade(&self, s: TcpStream, url: &Url) -> Result<BufReader<Conn>> {
+        if url.scheme == "https" {
+            let tls = crate::tls::wrap(s, &url.host)?;
+            return Ok(BufReader::new(Box::new(tls) as Box<dyn ReadWrite + Send>));
+        }
+        Ok(BufReader::new(Box::new(s) as Box<dyn ReadWrite + Send>))
+    }
+
     /// 发请求、读响应。返回 `(状态, 头, body, 连接是否可复用)`。
     fn exchange(
         &mut self,
-        reader: &mut BufReader<TcpStream>,
+        reader: &mut BufReader<Conn>,
         url: &Url,
         extra: &[(String, String)],
     ) -> Result<Exchange> {
@@ -807,6 +852,8 @@ mod tests {
         assert!(req.contains("Proxy-Authorization: Basic dTpw"), "{req}");
     }
 
+    /// 只在没开 `tls` feature 时成立：开了之后 https 会真的去连。
+    #[cfg(not(feature = "tls"))]
     #[test]
     fn https_is_rejected_clearly() {
         let mut c = Client::new();

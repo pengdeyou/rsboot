@@ -1,9 +1,13 @@
 # rsboot-claw
 
-零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端全在仓库里。
+零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端、cookie jar、通配匹配全在仓库里。
+
+唯一的例外是 **可选** 的 `tls` feature（引 `rustls`）：TLS 不可能手写，而默认 `default = []`，不用 TLS 的人依赖图里一个字节也不会多。
 
 ```
 cargo test -p rsboot-claw          # 85 项（69 单测 + 15 e2e + 1 doctest）
+cargo test -p rsboot-claw --features tls            # 再加 TLS 相关项
+cargo test -p rsboot-claw --features tls --test tls_e2e -- --ignored   # 真站点（要外网）
 ```
 
 ## 快速开始
@@ -75,6 +79,7 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **per-host 并发**：`.max_per_host(n)` 限"同时几发"，和 `delay` 限的"隔多久"是两件事。不设时 `workers(8)` 会对同一个站同时开 8 发——对人家不够客气，自己也被一个站占满。名额在拿到任务时占、由 `Drop` 归还，handler panic 也还。
 - **内容去重**：`.avoid_duplicate_content(true)` 按正文算 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次（镜像站、`?page=1` 空壳页、导航菜单撑大的页）。命中页仍然抽站内链接继续走——不抽等于把下游砍了。理论上有碰撞，后果是"少交一页"，不会把两页混成一页。
 - **深度**：只按"距种子几跳"算，不猜路径层级。
+- **TLS（可选 feature）**：`features = ["tls"]` 之后 `https://` 直接可用，引 `rustls` + `webpki-roots`（Mozilla 根证书编进二进制，不读系统 store——否则同一个站在不同机器上能不能爬取决于运营系统的配置）。**默认关**，`default = []`，不给不用 TLS 的人引任何依赖。证书校验必须开：跳过校验等于把"对面是谁"交给 DNS 决定。连接池的键带 scheme，`http://a.com` 与 `https://a.com` 不会共用一个槽位。https 走明文代理需要 `CONNECT` 隧道，那个不做，会明确报错。
 - **会话 cookie**：默认开，per-host 的 jar，`Set-Cookie` 收、下次请求带。认 `Domain` / `Path` / `Secure` / `Max-Age` / `Expires`（RFC 1123 日期手写解析），`HttpOnly` 只记录（不跑 JS，没实际作用）。域名校验是双向的——别人想给 `a.com` 塞 cookie 不收，`a.com` 的 `Domain=.a.com` 才能往子域走。`Client::cookie_jar(false)` 回到无状态。每个 worker 一个 jar，不会出现两个 worker 共享半份登录态。
 - **URL 过滤**：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象是 `path?query`。
 
@@ -92,12 +97,11 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 
 ## 明确不做
 
-- **HTTPS**：要 TLS 就得引 `rustls`/`native-tls`，和零依赖冲突。`https://` 会返回 `Error::UnsupportedScheme`，调用方自己决定跳过还是报错。真需要 HTTPS，在这个 crate 外面套一层支持 TLS 的 Downloader 即可——`Client` 的接口只有一个 `get(&Url) -> Result<Response>`。
 - **gzip / brotli**：请求里发 `Accept-Encoding: identity`，服务端就不会压。
 - **JS 渲染**：不做 headless browser（那就是引 chromium 了）。
 - **分布式调度**：单机爬虫，不做跨机器的 URL 分配和去重共识。断点续爬是单机维度的（见上），两件事别混。
 - **`sitemap.xml.gz`**：解 gzip 要引库，遇到这种只能跳过（`.sitemap(true)` 静默忽略非 200 的分片）。
-- **`CONNECT` 隧道（https 代理）**：那是给 TLS 用的，claw 不做 TLS，所以只支持明文 http 代理。
+- **`CONNECT` 隧道（https 走明文代理）**：那需要在代理里开一条隧道。做了 `tls` feature 也不做它——多一条状态机不划算，先明确报错。
 - **`SameSite` / CSP / 存储分区**：那是浏览器语义，爬虫没有跨站上下文，忽略。
 
 ## 和 rsboot 一起用
