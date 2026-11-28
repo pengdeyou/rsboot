@@ -63,13 +63,36 @@ fn rsa_public(n_be: &[u8], e_be: &[u8], s: &[u8]) -> Option<Vec<u8>> {
     if s.len() > k {
         return None;
     }
-    let mont = Mont::new(n_be)?;
+    let mont = mont_for(n_be)?;
     // 大端补零到 k 字节（签名比模数短是允许的）
     let mut sb = vec![0u8; k];
     sb[k - s.len()..].copy_from_slice(s);
     let sm = mont.to_mont(&bignum::from_be(&sb));
     let em = mont.pow(&sm, e_be);
     Some(bignum::to_be(&mont.from_mont(&em), k))
+}
+
+thread_local! {
+    /// 模数 → Montgomery 上下文。`Mont::new` 里的 `R² mod n` 是一次 2^(128k) 的
+    /// 逐位长除法，2048 位模数要 ~100 µs —— 比一次验签本身还贵。同一个站点的证书
+    /// 一次握手要验两次（链 + CertificateVerify），按线程缓存后这笔开销归零。
+    static MONT_CACHE: std::cell::RefCell<Vec<(Vec<u8>, std::rc::Rc<Mont>)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+fn mont_for(n_be: &[u8]) -> Option<std::rc::Rc<Mont>> {
+    MONT_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some((_, m)) = c.iter().find(|(k, _)| k.as_slice() == n_be) {
+            return Some(m.clone());
+        }
+        let m = std::rc::Rc::new(Mont::new(n_be)?);
+        if c.len() >= 4 {
+            c.remove(0);
+        }
+        c.push((n_be.to_vec(), m.clone()));
+        Some(m)
+    })
 }
 
 /// PKCS#1 v1.5 + 任意 SHA-2 摘要（按 DigestInfo 前缀分派）。

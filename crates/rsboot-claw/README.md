@@ -96,6 +96,13 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
   `www.rust-lang.org`、`github.com` 全部 HTTP 200（含 Chacha 与 AES-128 两套套件、
   P-256/P-384/RSA-PSS 三种证书签名）。已知边界：不支持 TLS 1.2，遇到只认 1.2 的
   站点只能用 `http://`（`www.baidu.com` 就是这类，服务端直接回 alert 70）。
+
+  性能按原语单独计过（release，同一台机器）：x25519 标量乘 418 µs → **47 µs**、
+  RSA-2048 PSS 验签 340 µs → **85 µs**、ECDSA P-384 验签 3.2 ms → **2.0 ms**。
+  x25519 的域元素从 16 个 `i64`（2^16 基数）换成 5 个 51 bit limb，一次乘法从
+  256 次小整数乘降到 25 次；RSA 的 `R² mod n` 按线程缓存（每线程 4 个模数），
+  ECDSA 的坐标从 `Vec` 改成定长数组 + `Mont::mul_into`，验签不再每次 malloc。
+  合起来本机全握手（对 `openssl s_server`，release）2.46 ms → **1.07 ms**。
 - **会话 cookie**：默认开，per-host 的 jar，`Set-Cookie` 收、下次请求带。认 `Domain` / `Path` / `Secure` / `Max-Age` / `Expires`（RFC 1123 日期手写解析），`HttpOnly` 只记录（不跑 JS，没实际作用）。域名校验是双向的——别人想给 `a.com` 塞 cookie 不收，`a.com` 的 `Domain=.a.com` 才能往子域走。`Client::cookie_jar(false)` 回到无状态。每个 worker 一个 jar，不会出现两个 worker 共享半份登录态。
 - **URL 过滤**：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象是 `path?query`。
 

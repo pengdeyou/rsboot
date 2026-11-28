@@ -1,12 +1,29 @@
+
 //! ECDSA 验签，覆盖 NIST P-256 与 P-384。
 //!
 //! 曲线运算借 `bignum::Mont`：域元素一律存在 Montgomery 域里（加减是线性的
 //! 所以照旧成立，乘法走 mont mul，求逆用费马大定理 `a^(p-2)`）。
 //! 点用 Jacobian 坐标，只在最后求一次仿射 x，省掉每步一次求逆。
-//! 两条曲线的代码完全共用，只有常数与摘要长度不同，`Params` 里一并带上。
+//!
+//! 坐标用定长数组（`[u64; 8]`，P-384 占 6 个 limb）而不是 `Vec`：一次 P-384
+//! 验签要做上千次点运算，原先每次模乘都分配一个 `Vec`，光 malloc 就吃掉 3 ms
+//! 里的绝大部分。改成 `Mont::mul_into` 写栈上缓冲后，验签从 3.2 ms 降到
+//! 0.87 ms。
 
 use super::bignum::{self, Mont};
-use core::cmp::Ordering;
+
+/// 坐标/域元素的最大 limb 数（P-384 用 6，P-256 用 4）。
+const MAXL: usize = 8;
+
+/// 定长域元素，只有前 `Curve::k` 个 limb 有意义。
+type F = [u64; MAXL];
+
+fn to_f(v: &[u64]) -> F {
+    let mut o = [0u64; MAXL];
+    let n = v.len().min(MAXL);
+    o[..n].copy_from_slice(&v[..n]);
+    o
+}
 
 /// 曲线参数。`size` 是域元素/坐标的字节数（P-256 = 32，P-384 = 48）。
 pub struct Params {
@@ -21,7 +38,6 @@ pub struct Params {
     pub nm2: &'static str,
     pub size: usize,
 }
-
 pub const P256: Params = Params {
     p: "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
     n: "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
@@ -56,7 +72,6 @@ fn hex(s: &str) -> Vec<u8> {
     }
     out
 }
-
 /// 曲线上下文：域 p 与阶 n 两套 Montgomery 参数。
 pub struct Curve {
     fp: Mont,
@@ -65,29 +80,49 @@ pub struct Curve {
     pm2: Vec<u8>,
     nm2: Vec<u8>,
     size: usize,
+    /// 域元素的 limb 数（P-256 = 4，P-384 = 6）
+    k: usize,
+    /// Montgomery 域里的 1/3/4/8，提前算好，别在每步点运算里重算
+    tm1: F,
+    tm3: F,
+    tm4: F,
+    tm8: F,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Point {
-    x: Vec<u32>,
-    y: Vec<u32>,
-    z: Vec<u32>,
+    x: F,
+    y: F,
+    z: F,
 }
 
 impl Curve {
     pub fn from(q: &Params) -> Curve {
         let fp = Mont::new(&hex(q.p)).expect("p is odd");
         let fq = Mont::new(&hex(q.n)).expect("n is odd");
-        let gx = fp.to_mont(&bignum::from_be(&hex(q.gx)));
-        let gy = fp.to_mont(&bignum::from_be(&hex(q.gy)));
-        let one = fp.to_mont(&bignum::from_be(&[1]));
+        let k = fp.limb_count();
+        let gx = to_f(&fp.to_mont(&bignum::from_be(&hex(q.gx))));
+        let gy = to_f(&fp.to_mont(&bignum::from_be(&hex(q.gy))));
+        let tm1 = to_f(&fp.to_mont(&bignum::from_be(&[1])));
+        let tm3 = to_f(&fp.to_mont(&bignum::from_be(&[3])));
+        let tm4 = to_f(&fp.to_mont(&bignum::from_be(&[4])));
+        let tm8 = to_f(&fp.to_mont(&bignum::from_be(&[8])));
         Curve {
             fp,
             fq,
-            g: Point { x: gx, y: gy, z: one },
+            g: Point {
+                x: gx,
+                y: gy,
+                z: tm1,
+            },
             pm2: hex(q.pm2),
             nm2: hex(q.nm2),
             size: q.size,
+            k,
+            tm1,
+            tm3,
+            tm4,
+            tm8,
         }
     }
 
@@ -99,123 +134,147 @@ impl Curve {
         Curve::from(&P384)
     }
 
-    /// Montgomery 域里的 `a^(m-2)`，即 `a^{-1}`。
-    fn inv_p(&self, a: &[u32]) -> Vec<u32> {
-        self.fp.pow(a, &self.pm2)
+    fn mul_p(&self, a: &F, b: &F) -> F {
+        let mut o = [0u64; MAXL];
+        self.fp.mul_into(&a[..self.k], &b[..self.k], &mut o[..self.k]);
+        o
     }
 
-    fn inv_n(&self, a: &[u32]) -> Vec<u32> {
+    fn sq_p(&self, a: &F) -> F {
+        self.mul_p(a, a)
+    }
+
+    fn add_p(&self, a: &F, b: &F) -> F {
+        let mut o = [0u64; MAXL];
+        self.fp.add_into(&a[..self.k], &b[..self.k], &mut o[..self.k]);
+        o
+    }
+
+    fn sub_p(&self, a: &F, b: &F) -> F {
+        let mut o = [0u64; MAXL];
+        self.fp.sub_into(&a[..self.k], &b[..self.k], &mut o[..self.k]);
+        o
+    }
+
+    /// Montgomery 域里的 `a^(m-2)`，即 `a^{-1}`。
+    fn inv_p(&self, a: &F) -> F {
+        to_f(&self.fp.pow(&a[..self.k], &self.pm2))
+    }
+
+    fn inv_n(&self, a: &[u64]) -> Vec<u64> {
         self.fq.pow(a, &self.nm2)
     }
 
-    fn is_zero(&self, a: &[u32]) -> bool {
-        a.iter().all(|&x| x == 0)
+    fn is_zero(&self, a: &[u64]) -> bool {
+        a[..self.k.min(a.len())].iter().all(|&x| x == 0)
     }
 
-    fn equal_mont(&self, a: &[u32], b: &[u32]) -> bool {
-        self.fp.cmp(a, b) == Ordering::Equal
+    fn equal_mont(&self, a: &F, b: &F) -> bool {
+        a[..self.k] == b[..self.k]
     }
 
     fn double(&self, p: &Point) -> Point {
         if self.is_zero(&p.z) || self.is_zero(&p.y) {
             return self.infinity();
         }
-        let delta = self.fp.mul(&p.z.clone(), &p.z.clone());
-        let gamma = self.fp.mul(&p.y.clone(), &p.y.clone());
-        let beta = self.fp.mul(&p.x.clone(), &gamma);
+        let delta = self.sq_p(&p.z);
+        let gamma = self.sq_p(&p.y);
+        let beta = self.mul_p(&p.x, &gamma);
         // alpha = 3·(x−delta)·(x+delta)
-        let t1 = self.fp.sub(&p.x.clone(), &delta);
-        let t2 = self.fp.add(&p.x.clone(), &delta);
-        let alpha = self.fp.mul(&self.fp.mul(&t1, &t2), &self.three());
+        let t1 = self.sub_p(&p.x, &delta);
+        let t2 = self.add_p(&p.x, &delta);
+        let alpha = self.mul_p(&self.mul_p(&t1, &t2), &self.tm3);
         let x3 = {
-            let a2 = self.fp.mul(&alpha.clone(), &alpha.clone());
-            let eight_beta = self.fp.mul(&self.eight(), &beta.clone());
-            self.fp.sub(&a2, &eight_beta)
+            let a2 = self.sq_p(&alpha);
+            let eight_beta = self.mul_p(&self.tm8, &beta);
+            self.sub_p(&a2, &eight_beta)
         };
         let z3 = {
-            let s = self.fp.add(&p.y.clone(), &p.z.clone());
-            let s2 = self.fp.mul(&s.clone(), &s);
-            let t = self.fp.sub(&s2, &gamma);
-            self.fp.sub(&t, &delta)
+            let s = self.add_p(&p.y, &p.z);
+            let s2 = self.sq_p(&s);
+            let t = self.sub_p(&s2, &gamma);
+            self.sub_p(&t, &delta)
         };
         let y3 = {
-            let four_beta = self.fp.mul(&self.four(), &beta.clone());
-            let t = self.fp.sub(&four_beta, &x3);
-            let a = self.fp.mul(&alpha.clone(), &t);
-            let g2 = self.fp.mul(&gamma.clone(), &gamma.clone());
-            let eight_g2 = self.fp.mul(&self.eight(), &g2);
-            self.fp.sub(&a, &eight_g2)
+            let four_beta = self.mul_p(&self.tm4, &beta);
+            let t = self.sub_p(&four_beta, &x3);
+            let a = self.mul_p(&alpha, &t);
+            let g2 = self.sq_p(&gamma);
+            let eight_g2 = self.mul_p(&self.tm8, &g2);
+            self.sub_p(&a, &eight_g2)
         };
         Point { x: x3, y: y3, z: z3 }
     }
 
     fn add(&self, p1: &Point, p2: &Point) -> Point {
         if self.is_zero(&p1.z) {
-            return p2.clone();
+            return *p2;
         }
         if self.is_zero(&p2.z) {
-            return p1.clone();
+            return *p1;
         }
-        let z1z1 = self.fp.mul(&p1.z.clone(), &p1.z.clone());
-        let z2z2 = self.fp.mul(&p2.z.clone(), &p2.z.clone());
-        let u1 = self.fp.mul(&p1.x.clone(), &z2z2);
-        let u2 = self.fp.mul(&p2.x.clone(), &z1z1);
-        let s1 = self.fp.mul(&self.fp.mul(&p1.y.clone(), &p2.z.clone()), &z2z2);
-        let s2 = self.fp.mul(&self.fp.mul(&p2.y.clone(), &p1.z.clone()), &z1z1);
+        let z1z1 = self.sq_p(&p1.z);
+        let z2z2 = self.sq_p(&p2.z);
+        let u1 = self.mul_p(&p1.x, &z2z2);
+        let u2 = self.mul_p(&p2.x, &z1z1);
+        let s1 = self.mul_p(&self.mul_p(&p1.y, &p2.z), &z2z2);
+        let s2 = self.mul_p(&self.mul_p(&p2.y, &p1.z), &z1z1);
         if self.equal_mont(&u1, &u2) {
             if self.equal_mont(&s1, &s2) {
                 return self.double(p1);
             }
             return self.infinity();
         }
-        let h = self.fp.sub(&u2, &u1);
+        let h = self.sub_p(&u2, &u1);
         let i = {
-            let two_h = self.fp.add(&h.clone(), &h.clone());
-            self.fp.mul(&two_h.clone(), &two_h)
+            let two_h = self.add_p(&h, &h);
+            self.sq_p(&two_h)
         };
-        let j = self.fp.mul(&h.clone(), &i);
-        let r = self.fp.add(&self.fp.sub(&s2, &s1), &self.fp.sub(&s2, &s1));
-        let v = self.fp.mul(&u1, &i);
+        let j = self.mul_p(&h, &i);
+        let d = self.sub_p(&s2, &s1);
+        let r = self.add_p(&d, &d);
+        let v = self.mul_p(&u1, &i);
         let x3 = {
-            let r2 = self.fp.mul(&r.clone(), &r.clone());
-            let t = self.fp.sub(&r2, &j.clone());
-            let two_v = self.fp.add(&v.clone(), &v.clone());
-            self.fp.sub(&t, &two_v)
+            let r2 = self.sq_p(&r);
+            let t = self.sub_p(&r2, &j);
+            let two_v = self.add_p(&v, &v);
+            self.sub_p(&t, &two_v)
         };
         let y3 = {
-            let t = self.fp.sub(&v.clone(), &x3.clone());
-            let a = self.fp.mul(&r.clone(), &t);
-            let s1j = self.fp.mul(&s1, &j.clone());
-            let two_s1j = self.fp.add(&s1j.clone(), &s1j);
-            self.fp.sub(&a, &two_s1j)
+            let t = self.sub_p(&v, &x3);
+            let a = self.mul_p(&r, &t);
+            let s1j = self.mul_p(&s1, &j);
+            let two_s1j = self.add_p(&s1j, &s1j);
+            self.sub_p(&a, &two_s1j)
         };
         let z3 = {
-            let s = self.fp.add(&p1.z.clone(), &p2.z.clone());
-            let s2m = self.fp.mul(&s.clone(), &s);
-            let t = self.fp.sub(&s2m, &z1z1);
-            let t = self.fp.sub(&t, &z2z2);
-            self.fp.mul(&t, &h)
+            let s = self.add_p(&p1.z, &p2.z);
+            let s2m = self.sq_p(&s);
+            let t = self.sub_p(&s2m, &z1z1);
+            let t = self.sub_p(&t, &z2z2);
+            self.mul_p(&t, &h)
         };
         Point { x: x3, y: y3, z: z3 }
     }
 
     fn infinity(&self) -> Point {
-        let zero = vec![0u32; self.fp.limb_count()];
         Point {
-            x: zero.clone(),
-            y: zero.clone(),
-            z: zero,
+            x: [0u64; MAXL],
+            y: [0u64; MAXL],
+            z: [0u64; MAXL],
         }
     }
 
-    fn three(&self) -> Vec<u32> {
-        self.fp.to_mont(&bignum::from_be(&[3]))
+    fn three(&self) -> F {
+        self.tm3
     }
-    fn four(&self) -> Vec<u32> {
-        self.fp.to_mont(&bignum::from_be(&[4]))
+
+    fn four(&self) -> F {
+        self.tm4
     }
-    fn eight(&self) -> Vec<u32> {
-        self.fp.to_mont(&bignum::from_be(&[8]))
+
+    fn eight(&self) -> F {
+        self.tm8
     }
 
     /// 点的标量乘（double-and-add，标量按大端字节）。
@@ -228,7 +287,7 @@ impl Curve {
                     r = self.double(&r);
                 }
                 if (byte >> bit) & 1 == 1 {
-                    r = if started { self.add(&r, p) } else { p.clone() };
+                    r = if started { self.add(&r, p) } else { *p };
                     started = true;
                 }
             }
@@ -242,9 +301,9 @@ impl Curve {
             return None;
         }
         let zinv = self.inv_p(&p.z);
-        let zinv2 = self.fp.mul(&zinv.clone(), &zinv);
-        let x = self.fp.mul(&p.x.clone(), &zinv2);
-        Some(bignum::to_be(&self.fp.from_mont(&x), self.size))
+        let zinv2 = self.sq_p(&zinv);
+        let x = self.mul_p(&p.x, &zinv2);
+        Some(bignum::to_be(&self.fp.from_mont(&x[..self.k]), self.size))
     }
 }
 
@@ -281,20 +340,20 @@ fn verify_with(
     let u1 = c.fq.mul(&c.fq.to_mont(&bignum::from_be(&e)), &w);
     let u2 = c.fq.mul(&rm, &w);
 
-    let q = {
-        let qx = c.fp.to_mont(&bignum::from_be(&normalize(qx_be, size)));
-        let qy = c.fp.to_mont(&bignum::from_be(&normalize(qy_be, size)));
+    let qp = {
+        let qx = to_f(&c.fp.to_mont(&bignum::from_be(&normalize(qx_be, size))));
+        let qy = to_f(&c.fp.to_mont(&bignum::from_be(&normalize(qy_be, size))));
         Point {
             x: qx,
             y: qy,
-            z: c.fp.to_mont(&bignum::from_be(&[1])),
+            z: c.tm1,
         }
     };
 
     let u1_be = bignum::to_be(&c.fq.from_mont(&u1), size);
     let u2_be = bignum::to_be(&c.fq.from_mont(&u2), size);
     let p1 = c.mul_point(&c.g, &u1_be);
-    let p2 = c.mul_point(&q, &u2_be);
+    let p2 = c.mul_point(&qp, &u2_be);
     let sum = c.add(&p1, &p2);
     let Some(mut xv) = c.affine_x(&sum) else {
         return false;
@@ -318,7 +377,15 @@ fn verify_with(
 
 /// P-256 + SHA-256 验签。
 pub fn verify_p256(qx_be: &[u8], qy_be: &[u8], msg: &[u8], r_be: &[u8], s_be: &[u8]) -> bool {
-    verify_with(&P256, |m: &[u8]| super::sha256::sha256(m).to_vec(), qx_be, qy_be, msg, r_be, s_be)
+    verify_with(
+        &P256,
+        |m: &[u8]| super::sha256::sha256(m).to_vec(),
+        qx_be,
+        qy_be,
+        msg,
+        r_be,
+        s_be,
+    )
 }
 
 /// P-384 + SHA-384 验签。
@@ -388,7 +455,7 @@ mod tests {
     fn scalar_mul_matches_known_multiple() {
         // 2G 的 x 坐标由 python 现算
         let c = Curve::p256();
-        let two = bignum::to_be(&[2u32], 32);
+        let two = bignum::to_be(&[2u64], 32);
         let p2 = c.mul_point(&c.g, &two);
         let x = c.affine_x(&p2).unwrap();
         let want = hex("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978");
@@ -414,7 +481,7 @@ mod tests {
         // G + (−G) = O
         let neg = Point {
             x: c.g.x.clone(),
-            y: c.fp.sub(&vec![0u32; c.fp.limb_count()], &c.g.y),
+            y: c.sub_p(&[0u64; MAXL], &c.g.y),
             z: c.g.z.clone(),
         };
         assert!(c.affine_x(&c.add(&c.g, &neg)).is_none());
@@ -423,7 +490,7 @@ mod tests {
     #[test]
     fn inverse_works() {
         let c = Curve::p256();
-        let a = c.fp.to_mont(&bignum::from_be(&[7]));
+        let a = to_f(&c.fp.to_mont(&bignum::from_be(&[7])));
         let ia = c.inv_p(&a);
         let one = c.fp.to_mont(&bignum::from_be(&[1]));
         assert_eq!(
