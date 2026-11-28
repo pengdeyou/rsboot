@@ -25,6 +25,9 @@ pub struct Item {
     pub depth: u32,
     /// 从哪个页面发现它
     pub referer: Option<String>,
+    /// 站内优先级，大的先抓（同分按入队顺序，FIFO）。
+    /// 跨站不比较——按 host 轮转是礼貌的一部分，抢占会饿死慢站。
+    pub priority: i32,
 }
 
 /// `push` 的结果。重复和超深都要能区分出来，统计里是两栏。
@@ -119,6 +122,18 @@ impl Journal {
     }
 }
 
+/// 按优先级插入：大的在前，同分排在已存在的同分项之后（FIFO）。
+///
+/// 桶内是 `VecDeque`，插入是 O(n)。桶的大小是"这个站这一层还没抓的链接"，
+/// 通常是几十到几百——比每次 `pop` 都重排要便宜得多，而且顺序稳定可测。
+fn insert_by_priority(items: &mut VecDeque<Item>, item: Item) {
+    let pos = items
+        .iter()
+        .position(|it| it.priority < item.priority)
+        .unwrap_or(items.len());
+    items.insert(pos, item);
+}
+
 /// 见 `module docs`。
 pub struct Frontier {
     buckets: HashMap<Box<str>, Bucket>,
@@ -179,6 +194,9 @@ impl Frontier {
                         url,
                         depth,
                         referer: Some("checkpoint".to_string()),
+                        // WAL 里没记优先级：恢复时一律按默认值，反正日志是给
+                        // "接着抓"用的，不是给"重新排序"用的
+                        priority: 0,
                     },
                     now,
                 );
@@ -196,7 +214,7 @@ impl Frontier {
             delay: None,
             inflight: 0,
         });
-        b.items.push_back(item);
+        insert_by_priority(&mut b.items, item);
         self.len += 1;
         if !self.ready.contains(&host) {
             self.ready.push_back(host);
@@ -225,7 +243,7 @@ impl Frontier {
         if let Some(j) = &mut self.journal {
             j.note_pushed(item.depth, &key_str);
         }
-        b.items.push_back(item);
+        insert_by_priority(&mut b.items, item);
         self.len += 1;
         // 冷却中的站也排进 ready：`pop` 会检查时间并跳过，靠"只在能抓时重复排"
         // 会漏掉"排进去后才发现没到点"的那一轮。
@@ -367,6 +385,14 @@ mod tests {
             url: Url::parse(u).unwrap(),
             depth,
             referer: None,
+            priority: 0,
+        }
+    }
+
+    fn prio_item(u: &str, depth: u32, p: i32) -> Item {
+        Item {
+            priority: p,
+            ..item(u, depth)
         }
     }
 
@@ -533,6 +559,43 @@ mod tests {
         assert!(matches!(f.pop(now), Pop::Wait(_)));
         f.release("a.com");
         assert_eq!(f.pop(now), Pop::Empty);
+    }
+
+    #[test]
+    fn higher_priority_pops_first_within_a_host() {
+        let now = Instant::now();
+        let mut f = Frontier::new(3, None);
+        f.push(prio_item("http://a.com/low", 0, 0), now);
+        f.push(prio_item("http://a.com/high", 0, 10), now);
+        f.push(prio_item("http://a.com/mid", 0, 5), now);
+        // 同分的两个：先后顺序不能被打乱
+        f.push(prio_item("http://a.com/mid2", 0, 5), now);
+
+        let mut order = Vec::new();
+        while let Pop::Ready(it) = f.pop(now) {
+            order.push(it.url.path.clone());
+            f.release("a.com");
+        }
+        assert_eq!(order, ["/high", "/mid", "/mid2", "/low"]);
+    }
+
+    #[test]
+    fn priority_does_not_span_hosts() {
+        // 跨站仍是轮转：不能因为 A 站优先级高就把 B 站饿死
+        let now = Instant::now();
+        let mut f = Frontier::new(3, None);
+        f.push(prio_item("http://a.com/0", 0, 100), now);
+        f.push(prio_item("http://b.com/0", 0, 0), now);
+        let first = f.pop(now);
+        assert!(matches!(first, Pop::Ready(_)));
+        let first_host = match first {
+            Pop::Ready(i) => i.url.host,
+            _ => unreachable!(),
+        };
+        match f.pop(now) {
+            Pop::Ready(it) => assert_ne!(it.url.host, first_host, "应当换站，而不是继续抓同站"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

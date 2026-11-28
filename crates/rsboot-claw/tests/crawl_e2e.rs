@@ -16,7 +16,7 @@ use rsboot::web::response::Response;
 use rsboot::web::route::Router;
 use rsboot::App;
 
-use rsboot_claw::{follow_internal, Crawler, RetryPolicy, RotateUserAgent, StaticHeaders};
+use rsboot_claw::{follow_internal, CollectSink, Crawler, RetryPolicy, RotateUserAgent, StaticHeaders};
 
 #[test]
 fn retry_policy_recovers_from_5xx() {
@@ -520,6 +520,52 @@ fn duplicate_content_is_skipped_but_links_still_followed() {
     assert_eq!(seen.load(Ordering::Relaxed), 5, "handler 只见 5 次");
     // 两个 deep 都该被抓到：内容重复那页的链接不能丢
     assert!(stats.bytes > 0);
+}
+
+/// 优先级决定**站内**的抓取顺序：列表页先于详情页，和链接在页面里出现的先后无关。
+#[test]
+fn priority_fn_reorders_the_queue() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let router = Router::new()
+        .get("/", |_, _| {
+            // 故意先写详情、再写列表：优先级要能把它翻过来
+            Response::html(
+                r#"<html><body>
+                <a href="/detail/1">d1</a><a href="/list/1">l1</a>
+                <a href="/detail/2">d2</a><a href="/list/2">l2</a>
+                </body></html>"#,
+            )
+        })
+        .unwrap()
+        .get("/list/{n}", |req, _| {
+            let n = req.param("n").unwrap_or("0").to_string();
+            Response::html(format!("<html><body>列表{n}</body></html>"))
+        })
+        .unwrap()
+        .get("/detail/{n}", |req, _| {
+            let n = req.param("n").unwrap_or("0").to_string();
+            Response::html(format!("<html><body>详情{n}</body></html>"))
+        })
+        .unwrap();
+    let (addr, stop) = serve_at(addr, router);
+
+    let sink = Arc::new(CollectSink::new());
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(1)
+        .workers(1) // 单 worker 才能断言顺序；多 worker 下顺序本来就不确定
+        .priority_fn(|u| if u.path.starts_with("/list") { 10 } else { 0 })
+        .sink(sink.clone())
+        .run(follow_internal);
+    stop.store(true, Ordering::Relaxed);
+
+    assert_eq!(stats.errors, 0, "{:?}", stats.error_kinds);
+    let order: Vec<String> = sink.pages().iter().map(|p| p.url.path.clone()).collect();
+    assert_eq!(
+        order,
+        ["/", "/list/1", "/list/2", "/detail/1", "/detail/2"],
+        "{stats:?}"
+    );
 }
 
 #[test]

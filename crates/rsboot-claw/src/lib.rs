@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 pub use frontier::{Frontier, Item, Pop, Push};
 pub use html::{scan, Document, Link};
-pub use pipeline::{JsonlSink, Sink};
+pub use pipeline::{CollectSink, JsonlSink, Sink};
 pub use http::Client;
 pub use middleware::{Action, Middleware, RetryPolicy, RotateUserAgent, StaticHeaders};
 pub use robots::Robots;
@@ -266,7 +266,7 @@ impl Counters {
 /// 爬虫配置。所有方法都 consume self 返回 self，可以链式写。
 #[derive(Clone)]
 pub struct Crawler {
-    seeds: Vec<Url>,
+    seeds: Vec<(Url, i32)>,
     max_depth: u32,
     workers: usize,
     delay: Option<Duration>,
@@ -283,7 +283,11 @@ pub struct Crawler {
     checkpoint: Option<PathBuf>,
     max_per_host: usize,
     avoid_duplicate_content: bool,
+    priority_fn: Option<PriorityFn>,
 }
+
+/// 给一条 URL 打分。见 [`Crawler::priority_fn`]。
+type PriorityFn = Arc<dyn Fn(&Url) -> i32 + Send + Sync>;
 
 impl Crawler {
     pub fn new() -> Self {
@@ -305,17 +309,44 @@ impl Crawler {
             checkpoint: None,
             max_per_host: 0,
             avoid_duplicate_content: false,
+            priority_fn: None,
         }
     }
 
     /// 加一个种子。相对地址在这里没有意义，会直接 panic——
     /// 种子是用户手写的，静默丢掉比报错更难查。
-    pub fn seed(mut self, url: &str) -> Self {
+    pub fn seed(self, url: &str) -> Self {
+        self.seed_with(url, 0)
+    }
+
+    /// 带优先级的种子。同一条队列里大的先抓（只在同一个站内比较）。
+    ///
+    /// 典型用法：把首页/列表页给个正数、把"已知很深"的入口给负数，
+    /// 这样第一次 `run` 的抓取顺序更接近"先铺开再捞细"。
+    pub fn seed_with(mut self, url: &str, priority: i32) -> Self {
         match Url::parse(url) {
-            Some(u) => self.seeds.push(u),
+            Some(u) => self.seeds.push((u, priority)),
             None => panic!("seed must be an absolute http(s) URL: {url}"),
         }
         self
+    }
+
+    /// 按 URL 算入队优先级。抓到的每条链接、以及 sitemap 种子都过一遍它。
+    ///
+    /// 为什么是 `Fn(&Url)` 而不是让 handler 返回 `(url, priority)`：handler 的签名
+    /// 是 v0.1 就定下的 `Fn(&Page) -> Vec<String>`，改它会动到所有已写好的调用方。
+    /// 而"哪类 URL 更要紧"通常只看地址本身（`/list` vs `/detail`、有没有 `?page=`），
+    /// 不需要看页面内容。
+    pub fn priority_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Url) -> i32 + Send + Sync + 'static,
+    {
+        self.priority_fn = Some(Arc::new(f));
+        self
+    }
+
+    fn priority_for(&self, u: &Url) -> i32 {
+        self.priority_fn.as_ref().map_or(0, |f| f(u))
     }
 
     pub fn max_depth(mut self, d: u32) -> Self {
@@ -475,16 +506,18 @@ impl Crawler {
                         url: u.clone(),
                         depth: 0,
                         referer: Some("sitemap".to_string()),
+                        priority: self.priority_for(u),
                     },
                     now,
                 );
             }
-            for s in &self.seeds {
+            for (s, p) in &self.seeds {
                 f.push(
                     Item {
                         url: s.clone(),
                         depth: 0,
                         referer: None,
+                        priority: *p,
                     },
                     now,
                 );
@@ -658,11 +691,13 @@ impl Crawler {
                                 let now = Instant::now();
                                 let mut f = frontier.lock().unwrap();
                                 for u in page.internal_links() {
+                                    let priority = cfg.priority_for(&u);
                                     f.push(
                                         Item {
                                             url: u,
                                             depth: item.depth + 1,
                                             referer: Some(page.url.to_string()),
+                                            priority,
                                         },
                                         now,
                                     );
@@ -692,11 +727,13 @@ impl Crawler {
                             {
                                 continue;
                             }
+                            let priority = cfg.priority_for(&u);
                             f.push(
                                 Item {
                                     url: u,
                                     depth: item.depth + 1,
                                     referer: Some(page.url.to_string()),
+                                    priority,
                                 },
                                 now,
                             );
@@ -755,7 +792,7 @@ impl Crawler {
             .max_body_bytes(self.max_body_bytes);
 
         for seed in &self.seeds {
-            let host = seed.host_header();
+            let host = seed.0.host_header();
             let mut queue: Vec<String> = Vec::new();
 
             if let Some(u) = Url::parse(&format!("http://{host}/robots.txt")) {
@@ -797,7 +834,7 @@ impl Crawler {
             let hosts: Vec<(String, u16)> = self
                 .seeds
                 .iter()
-                .map(|s| (s.host.clone(), s.real_port()))
+                .map(|(s, _)| (s.host.clone(), s.real_port()))
                 .collect();
             out.retain(|u| hosts.iter().any(|(h, p)| *h == u.host && *p == u.real_port()));
         }
