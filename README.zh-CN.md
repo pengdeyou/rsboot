@@ -163,29 +163,18 @@ rsboot 把问题拆成两层：**连接层事件驱动，请求层跑有栈协�
 
 ## 统一响应
 
-`Res` 给出 JSON API 真正需要的三种形状，不用搭 builder 链：
+`Res` 给出 JSON API 真正需要的形状，一行一个，不用搭 builder 链，也不用 `Ok(...)`：
 
-| 调用 | 状态码 | 响应体 |
-|---|---|---|
-| `Res::success("ok")` | 200 | `{"code":"OK","message":"ok","data":null}` |
-| `Res::data(payload)` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
-| `Res::fail("库存不足")` | 400 | `{"code":"BAD_REQUEST","message":"库存不足","data":null}` |
-| `Res::fail_with(Status::CONFLICT, "...")` | 按给定 | 同形状，`code` 由状态码推导 |
+| 调用 | 返回 | 状态码 | 响应体 |
+|---|---|---|---|
+| `Res::success("ok")` | `Response` | 200 | `{"code":"OK","message":"ok","data":null}` |
+| `Res::data(payload)` | `Response` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
+| `Res::fail("库存不足")` | `Response` | 400 | `{"code":"BAD_REQUEST","message":"库存不足","data":null}` |
+| `Res::fail_with(Status::CONFLICT, "...")` | `Response` | 按给定 | 同形状，`code` 由状态码推导 |
+| `Res::err("...")` | `ApiError` | 400 | 同上形状，供 `Err(...)` / `?` |
+| `Res::err_with(status, "...")` | `ApiError` | 按给定 | 同上 |
 
-```rust
-fn list_orders(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
-    Ok(Res::data(orders))
-}
-
-fn take_one(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
-    if out_of_stock() {
-        return Err(Res::fail("库存不足"));
-    }
-    Ok(Res::success("ok"))
-}
-```
-
-**返回 `Response` 的 handler 不用写 `Ok(...)`。** 签名是 `-> Response` 时，成功和失败分支都能直接 `return`：
+最省心的写法是让 handler 直接返回 `Response`，成功失败都不用包 `Ok`：
 
 ```rust
 fn ping(_: &mut Request, _: &Context) -> Response {
@@ -194,17 +183,27 @@ fn ping(_: &mut Request, _: &Context) -> Response {
 
 fn detail(_: &mut Request, _: &Context) -> Response {
     if miss() {
-        return Res::fail_response("没有这条记录");   // 400 + 统一形状
+        return Res::fail("没有这条记录");   // 400 + 统一形状
     }
     Res::data(row)
 }
 ```
 
-这样就避免了"为了一个错误分支把整个 handler 改成 `Result<..>`"。
+需要 `?` 传播、或者要复用别的返回 `ApiError` 的调用时，才用 `Result` 签名，配 `Res::err`：
+
+```rust
+fn detail(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
+    let row = load_row()?;                       // ? 照常可用
+    if row.is_empty() {
+        return Err(Res::err("没有这条记录"));     // ApiError，能进 Err
+    }
+    Ok(Res::data(row))
+}
+```
 
 三点值得知道：
 
-- `fail` 返回 `ApiError`，`fail_response` 返回 `Response`——不是重复，是两种 handler 签名各要一种。
+- `fail` 和 `err` 是两个名字，因为 Rust 一个函数只有一个返回类型：`fail` 返回 `Response`（可直接 `return`），`err` 返回 `ApiError`（能放进 `Err(...)`）。同一件事，配合两种 handler 签名。
 - 这几种调用**一定**是统一形状，不依赖 `http.envelope` 开关。你显式要来的形状，不该被全局开关再改一遍。
 - `data` 直接序列化进同一个缓冲（中间不建 `serde_json::Value` 树），字段顺序与 `http.envelope` 产出的逐字节一致，所以打开那个开关不会改变这些响应的任何一个字节。
 

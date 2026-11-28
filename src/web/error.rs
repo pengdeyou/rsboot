@@ -88,7 +88,7 @@ impl ApiError {
         }
     }
 
-    /// 标记：无论全局开关如何，这条错误都按统一响应体输出（`Res::fail` 用）。
+    /// 标记：无论全局开关如何，这条错误都按统一响应体输出（`Res::err` / `Res::fail` 用）。
     pub(crate) fn always_wrapped(&mut self) {
         self.always_wrap = true;
     }

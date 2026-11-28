@@ -371,7 +371,7 @@ impl Router {
             return resp;
         }
         // 两条通路都要包：全局开关打开；或者这条错误自己要求过
-        // （`Res::fail` 显式要统一形状，不该被全局开关再关掉）。
+        // （`Res::fail` / `Res::err` 显式要统一形状，不该被全局开关再关掉）。
         let wrap = ctx.envelope_on()
             || resp
                 .api_error
@@ -565,7 +565,7 @@ mod tests {
         let r = Router::new()
             .get("/ping", |_, _| crate::web::res::Res::success("ok"))
             .unwrap()
-            .get("/boom", |_, _| crate::web::res::Res::fail_response("库存不足"))
+            .get("/boom", |_, _| crate::web::res::Res::fail("库存不足"))
             .unwrap();
         let ok = call(&r, Method::Get, "/ping");
         assert_eq!(ok.status, Status::OK);
@@ -578,12 +578,12 @@ mod tests {
         );
     }
 
-    /// `Res::fail` 造的错误必须在全局 envelope 关闭时也输出统一形状。
+    /// `Res::err` 造的错误必须在全局 envelope 关闭时也输出统一形状。
     #[test]
     fn res_fail_wraps_even_when_envelope_off() {
         let r = Router::new()
             .get("/x", |_, _| -> std::result::Result<Response, ApiError> {
-                Err(crate::web::res::Res::fail("库存不足"))
+                Err(crate::web::res::Res::err("库存不足"))
             })
             .unwrap();
         let resp = call(&r, Method::Get, "/x");

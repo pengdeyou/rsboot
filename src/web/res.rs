@@ -15,23 +15,26 @@
 //! # }
 //! ```
 //!
-//! handler 里就是：
+//! handler 里可以直接 return，不用 `Ok(...)`：
 //!
 //! ```ignore
-//! fn list(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
-//!     Ok(Res::data(items))
-//! }
-//!
-//! fn take(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
-//!     if out_of_stock { return Err(Res::fail("库存不足")); }
-//!     Ok(Res::success("ok"))
+//! fn take(_: &mut Request, _: &Context) -> Response {
+//!     if out_of_stock { return Res::fail("库存不足"); }
+//!     Res::success("ok")
 //! }
 //! ```
 //!
-//! ## 为什么 `fail` 返回 `ApiError` 而不是 `Response`
+//! 需要 `?` 传播或 `-> Result<..>` 签名时，用 `err` 系列，它返回
+//! [`ApiError`]，能放进 `Err(...)`：
 //!
-//! 因为它要能直接放进 `Err(...)`：`return Err(Res::fail("库存不足"))`。
-//! 它带 `always_wrap` 标记，出口处无条件按统一形状输出——用户显式要了
+//! ```ignore
+//! fn detail(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
+//!     if miss { return Err(Res::err("没有这条记录")); }
+//!     Ok(Res::data(row))
+//! }
+//! ```
+//!
+//! 两组都带 `always_wrap` 标记，出口处无条件按统一形状输出——用户显式要了
 //! 这个形状，就不该再被 `http.envelope` 的全局开关改写一次。
 
 use serde::Serialize;
@@ -41,7 +44,8 @@ use crate::web::error::ApiError;
 use crate::web::http::Status;
 use crate::web::response::Response;
 
-/// 统一响应的命名空间。用关联函数：`Res::success(...)`、`Res::data(...)`、`Res::fail(...)`。
+/// 统一响应的命名空间。用关联函数：`Res::success(...)`、`Res::data(...)`、`Res::fail(...)`；
+/// `-> Result<..>` 的 handler 用 `Res::err(...)`。
 pub struct Res;
 
 impl Res {
@@ -65,27 +69,25 @@ impl Res {
     }
 
     /// 失败，默认 `400`：`{"code":"BAD_REQUEST","message":"<你给的文案>","data":null}`
-    pub fn fail(message: impl Into<String>) -> ApiError {
+    ///
+    /// 直接返回 `Response`，所以 `-> Response` 签名的 handler 一行就能返回。
+    pub fn fail(message: impl Into<String>) -> Response {
         Self::fail_with(Status::BAD_REQUEST, message)
     }
 
-    /// 失败，但**直接返回 `Response`**：给 `-> Response` 的 handler 用。
-    ///
-    /// `Res::fail` 是给 `-> Result<..>` 的 handler 用的（能放进 `Err(..)`）；
-    /// 这两个不是重复，是两种签名各要一种。用这个就不必为了一个错误分支
-    /// 把整个 handler 改成 `Result`。
-    pub fn fail_response(message: impl Into<String>) -> Response {
-        Self::fail_response_with(Status::BAD_REQUEST, message)
-    }
-
-    /// 带状态码的版本，同上。
-    pub fn fail_response_with(status: Status, message: impl Into<String>) -> Response {
-        let err = Self::fail_with(status, message);
+    /// 带状态码的失败响应。`code` 由状态码推导，与 `envelope::error` 同一套映射。
+    pub fn fail_with(status: Status, message: impl Into<String>) -> Response {
+        let err = Self::err_with(status, message);
         envelope::error(&err, None, true)
     }
 
-    /// 指定状态码的失败。`code` 由状态码推导，与 `envelope::error` 同一套映射。
-    pub fn fail_with(status: Status, message: impl Into<String>) -> ApiError {
+    /// 失败，返回 [`ApiError`]：给 `-> Result<..>` 签名、要用 `Err(...)` 或 `?` 的 handler。
+    pub fn err(message: impl Into<String>) -> ApiError {
+        Self::err_with(Status::BAD_REQUEST, message)
+    }
+
+    /// 带状态码的版本，同上。
+    pub fn err_with(status: Status, message: impl Into<String>) -> ApiError {
         let mut err = ApiError::new(status, message);
         err.always_wrapped();
         err
@@ -125,15 +127,15 @@ mod tests {
     }
 
     #[test]
-    fn fail_is_400_and_wrapped() {
-        let e = Res::fail("库存不足");
+    fn err_is_400_and_wrapped() {
+        let e = Res::err("库存不足");
         assert_eq!(e.status, Status::BAD_REQUEST);
         assert!(e.always_wrap);
     }
 
     #[test]
-    fn fail_response_is_wrapped_body() {
-        let r = Res::fail_response("库存不足");
+    fn fail_is_400_and_wrapped_body() {
+        let r = Res::fail("库存不足");
         assert_eq!(r.status, Status::BAD_REQUEST);
         assert_eq!(
             &r.body[..],
@@ -142,8 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn fail_with_keeps_status() {
-        let e = Res::fail_with(Status::CONFLICT, "已经存在");
+    fn err_with_keeps_status() {
+        let e = Res::err_with(Status::CONFLICT, "已经存在");
         assert_eq!(e.status, Status::CONFLICT);
+    }
+
+    #[test]
+    fn fail_with_keeps_status() {
+        let r = Res::fail_with(Status::CONFLICT, "已经存在");
+        assert_eq!(r.status, Status::CONFLICT);
     }
 }

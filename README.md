@@ -164,29 +164,18 @@ The correlating profile, for anyone who wants to attack the remaining 3 %: two s
 
 ## Uniform responses
 
-`Res` gives the three shapes a JSON API actually needs, with no builder chain:
+`Res` gives the shapes a JSON API actually needs — one line each, no builder chain, no `Ok(...)`:
 
-| Call | Status | Body |
-|---|---|---|
-| `Res::success("ok")` | 200 | `{"code":"OK","message":"ok","data":null}` |
-| `Res::data(payload)` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
-| `Res::fail("out of stock")` | 400 | `{"code":"BAD_REQUEST","message":"out of stock","data":null}` |
-| `Res::fail_with(Status::CONFLICT, "...")` | as given | same shape, `code` derived from the status |
+| Call | Returns | Status | Body |
+|---|---|---|---|
+| `Res::success("ok")` | `Response` | 200 | `{"code":"OK","message":"ok","data":null}` |
+| `Res::data(payload)` | `Response` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
+| `Res::fail("out of stock")` | `Response` | 400 | `{"code":"BAD_REQUEST","message":"out of stock","data":null}` |
+| `Res::fail_with(Status::CONFLICT, "...")` | `Response` | as given | same shape, `code` derived from the status |
+| `Res::err("...")` | `ApiError` | 400 | same shape, for `Err(...)` / `?` |
+| `Res::err_with(status, "...")` | `ApiError` | as given | same as above |
 
-```rust
-fn list_orders(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
-    Ok(Res::data(orders))
-}
-
-fn take_one(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
-    if out_of_stock() {
-        return Err(Res::fail("out of stock"));
-    }
-    Ok(Res::success("ok"))
-}
-```
-
-**Handlers that return `Response` do not need `Ok(...)`.** With a `-> Response` signature both branches can just return:
+The low-ceremony form is a handler that returns `Response` — neither branch needs `Ok`:
 
 ```rust
 fn ping(_: &mut Request, _: &Context) -> Response {
@@ -195,18 +184,28 @@ fn ping(_: &mut Request, _: &Context) -> Response {
 
 fn detail(_: &mut Request, _: &Context) -> Response {
     if miss() {
-        return Res::fail_response("no such record");   // 400 + the same shape
+        return Res::fail("no such record");   // 400 + the same shape
     }
     Res::data(row)
 }
 ```
 
-No need to turn the whole handler into `Result<..>` just to report one error path.
+Use a `Result` signature plus `Res::err` only when you need `?` propagation or you are reusing calls that already return `ApiError`:
+
+```rust
+fn detail(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
+    let row = load_row()?;                        // ? works as usual
+    if row.is_empty() {
+        return Err(Res::err("no such record"));   // ApiError, fits Err
+    }
+    Ok(Res::data(row))
+}
+```
 
 Three things worth knowing:
 
-- `fail` returns an `ApiError`, `fail_response` returns a `Response` — not a duplicate: two handler signatures, one for each.
-- For these calls the wrapper is **unconditional** — it does not depend on `http.envelope`. A shape you asked for explicitly should not be reshaped by a global switch.
+- `fail` and `err` are two names because a Rust function has exactly one return type: `fail` returns `Response` (can be returned directly), `err` returns `ApiError` (fits `Err(...)`). Same payload, matched to two handler signatures.
+- For all of these the wrapper is **unconditional** — it does not depend on `http.envelope`. A shape you asked for explicitly should not be reshaped by a global switch.
 - `data` serialises into the same buffer (no `serde_json::Value` tree in between), and the field order is byte-identical to what `http.envelope` produces, so turning that switch on does not change a single byte of these responses.
 
 ## Design highlights
