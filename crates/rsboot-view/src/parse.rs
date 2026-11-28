@@ -85,6 +85,20 @@ pub enum Stmt {
     },
     /// `{literal}` 里原样输出。
     Literal(String),
+    /// `{extends "layout.tpl"}`：本模板只负责提供 `{block}` 覆盖，
+    /// 节点在编译期就被父模板展开掉了，渲染期不会见到它。
+    Extends(Expr),
+    /// `{block name="x"}…{/block}`。父模板里是**默认内容**，子模板里是**覆盖**；
+    /// 没有 `{extends}` 时它只是个透明的容器，渲染自己的 body。
+    Block {
+        name: String,
+        body: Vec<Stmt>,
+    },
+    /// `{assign var="x" value=$y}`：往当前（最内层）作用域写一个变量。
+    Assign {
+        name: String,
+        expr: Expr,
+    },
 }
 
 
@@ -246,6 +260,47 @@ impl<'a> P<'a> {
                 };
                 Ok(Stmt::Include(e))
             }
+            "extends" => {
+                // 只允许字面量：父模板名必须在编译期定下来，否则每次渲染
+                // 都得重新解析一整份模板，等于把引擎最贵的一步搬到热路径。
+                Ok(Stmt::Extends(parse_expr(rest, line)?))
+            }
+            "block" => {
+                let name = block_name(rest, line)?;
+                let (body, term) = self.nodes(&["/block"])?;
+                if term.is_none() {
+                    return Err(SyntaxError::new(line, "block 缺少 `{/block}`"));
+                }
+                Ok(Stmt::Block { name, body })
+            }
+            "assign" => {
+                let args = parse_args(rest, line)?;
+                let mut name = None;
+                let mut expr = None;
+                for (k, e) in args {
+                    match k.as_str() {
+                        "var" => match e {
+                            Expr::Lit(Value::String(s)) => name = Some(s),
+                            _ => {
+                                return Err(SyntaxError::new(
+                                    line,
+                                    "assign 的 `var` 需要字符串字面量",
+                                ))
+                            }
+                        },
+                        "value" => expr = Some(e),
+                        other => {
+                            return Err(SyntaxError::new(
+                                line,
+                                format!("assign 不认识的参数 `{other}`"),
+                            ))
+                        }
+                    }
+                }
+                let name = name.ok_or_else(|| SyntaxError::new(line, "assign 缺少 `var=`"))?;
+                let expr = expr.ok_or_else(|| SyntaxError::new(line, "assign 缺少 `value=`"))?;
+                Ok(Stmt::Assign { name, expr })
+            }
             "literal" => {
                 let end = self
                     .src
@@ -389,6 +444,24 @@ fn var_name(s: &str, line: usize) -> Result<String, SyntaxError> {
         .map(|x| x.trim().to_string())
         .filter(|x| !x.is_empty() && x.chars().all(|c| c.is_alphanumeric() || c == '_'))
         .ok_or_else(|| SyntaxError::new(line, "这里需要一个变量名（`$name`）"))
+}
+
+/// `{block name="content"}` 与 `{block "content"}` 两种写法都收。
+fn block_name(rest: &str, line: usize) -> Result<String, SyntaxError> {
+    let r = rest.trim();
+    let e = if r.starts_with("name") {
+        parse_args(r, line)?
+            .into_iter()
+            .find(|(k, _)| k == "name")
+            .map(|(_, e)| e)
+            .ok_or_else(|| SyntaxError::new(line, "block 需要 `name=\"…\"`"))?
+    } else {
+        parse_expr(r, line)?
+    };
+    match e {
+        Expr::Lit(Value::String(s)) => Ok(s),
+        _ => Err(SyntaxError::new(line, "block 的名字必须是字符串字面量")),
+    }
 }
 
 fn parse_args(s: &str, line: usize) -> Result<Vec<(String, Expr)>, SyntaxError> {

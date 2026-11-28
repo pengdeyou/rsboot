@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parse::Stmt;
+use parse::{Expr, Stmt};
 use serde_json::Value;
 
 /// 模板函数：参数按名字树传进来，返回要输出的值。
@@ -97,9 +97,22 @@ impl Error {
 /// 构造完就是只读的：所有模板在 `add` / `add_dir` 时编译一遍，
 /// 渲染期只查表，不需要锁。放进 `Arc` 就能跨 worker 共享。
 pub struct Engine {
+    /// 原始 AST：`add` 进来的样子，含 `{extends}` 与顶层 `{block}` 定义。
+    raw: HashMap<String, Arc<Src>>,
+    /// 展开后的 AST：`{extends}` 已换成父模板节点、`{block}` 已套上子模板的覆盖。
+    /// 渲染只看这一份，所以运行期既没有锁，也没有"父模板还没到"的中间态。
     templates: HashMap<String, Arc<Vec<Stmt>>>,
     funcs: HashMap<String, Func>,
     auto_escape: bool,
+}
+
+/// 一份模板拆出来的三件事。
+struct Src {
+    /// 没有 `{extends}` 时就是完整节点列表；有的话这份内容会被丢弃，
+    /// 只剩 `blocks` 起作用（Smarty 的语义：子模板除 block 外不输出）。
+    nodes: Vec<Stmt>,
+    extends: Option<String>,
+    blocks: HashMap<String, Vec<Stmt>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -121,6 +134,7 @@ impl Default for Engine {
 impl Engine {
     pub fn new() -> Self {
         Self {
+            raw: HashMap::new(),
             templates: HashMap::new(),
             funcs: HashMap::new(),
             auto_escape: true,
@@ -134,6 +148,10 @@ impl Engine {
     }
 
     /// 注册一份模板源码。
+    ///
+    /// 立刻展开一次，所以 `{extends}` 指向的父模板必须**已经**注册。
+    /// 顺序不好控制时（比如自定义加载顺序）用 [`Engine::add_dir`]，
+    /// 它先把目录里的模板全登记完，最后统一展开一次。
     pub fn add(mut self, name: impl Into<String>, src: &str) -> Result<Self, Error> {
         let name = name.into();
         let nodes = parse::parse(src).map_err(|e| Error {
@@ -141,7 +159,8 @@ impl Engine {
             line: e.line,
             msg: e.msg,
         })?;
-        self.templates.insert(name, Arc::new(nodes));
+        self.raw.insert(name.clone(), Arc::new(split_src(&name, nodes)?));
+        self.rebuild()?;
         Ok(self)
     }
 
@@ -157,14 +176,22 @@ impl Engine {
             line: 0,
             msg: format!("读取目录失败：{e}"),
         })?;
+        // 先全部登记，最后只展开一次：文件系统的遍历顺序不可控，
+        // 逐个 `add` 会因为"父模板还没读到"而误报。
         for (name, path) in files {
             let src = std::fs::read_to_string(&path).map_err(|e| Error {
                 template: name.clone(),
                 line: 0,
                 msg: format!("读取失败：{e}"),
             })?;
-            self = self.add(name, &src)?;
+            let nodes = parse::parse(&src).map_err(|e| Error {
+                template: name.clone(),
+                line: e.line,
+                msg: e.msg,
+            })?;
+            self.raw.insert(name.clone(), Arc::new(split_src(&name, nodes)?));
         }
+        self.rebuild()?;
         Ok(self)
     }
 
@@ -211,6 +238,154 @@ impl Engine {
     pub(crate) fn is_auto_escape(&self) -> bool {
         self.auto_escape
     }
+
+    /// 把所有模板重新展开一遍。
+    ///
+    /// 每 `add` 一次全量重建，看起来浪费，实际是几十个模板、毫秒级的事，
+    /// 换来的是"`add` 顺序无关"和"渲染期零 IO 零锁"。真要几百个模板，
+    /// 改成增量展开也只影响这一处。
+    fn rebuild(&mut self) -> Result<(), Error> {
+        let names: Vec<String> = self.raw.keys().cloned().collect();
+        let mut out = HashMap::with_capacity(names.len());
+        for name in names {
+            let mut stack = Vec::new();
+            let nodes = compose(&self.raw, &name, &mut stack)?;
+            out.insert(name, Arc::new(nodes));
+        }
+        self.templates = out;
+        Ok(())
+    }
+}
+
+/// 从解析结果里拆出 `{extends}` 与顶层 `{block}`。
+fn split_src(name: &str, nodes: Vec<Stmt>) -> Result<Src, Error> {
+    let mut extends = None;
+    for n in &nodes {
+        if let Stmt::Extends(e) = n {
+            if extends.is_some() {
+                return Err(Error {
+                    template: name.to_string(),
+                    line: 0,
+                    msg: "一个模板只能有一个 `{extends}`".to_string(),
+                });
+            }
+            match e {
+                Expr::Lit(Value::String(s)) => extends = Some(s.clone()),
+                _ => {
+                    return Err(Error {
+                        template: name.to_string(),
+                        line: 0,
+                        msg: "`{extends}` 的参数必须是字符串字面量".to_string(),
+                    })
+                }
+            }
+        }
+    }
+    if extends.is_none() {
+        // 没有继承：`{block}` 只是个透明容器，留在原位置照常渲染。
+        return Ok(Src {
+            nodes,
+            extends: None,
+            blocks: HashMap::new(),
+        });
+    }
+    let mut blocks = HashMap::new();
+    for n in &nodes {
+        if let Stmt::Block { name: bn, body } = n {
+            blocks.insert(bn.clone(), body.clone());
+        }
+    }
+    let body = nodes
+        .into_iter()
+        .filter(|n| !matches!(n, Stmt::Extends(_) | Stmt::Block { .. }))
+        .collect();
+    Ok(Src {
+        nodes: body,
+        extends,
+        blocks,
+    })
+}
+
+/// 递归展开一个模板。
+fn compose(
+    raw: &HashMap<String, Arc<Src>>,
+    name: &str,
+    stack: &mut Vec<String>,
+) -> Result<Vec<Stmt>, Error> {
+    let Some(src) = raw.get(name) else {
+        return Err(Error {
+            template: name.to_string(),
+            line: 0,
+            msg: "找不到模板".to_string(),
+        });
+    };
+    let Some(parent) = &src.extends else {
+        return Ok(src.nodes.clone());
+    };
+    if !raw.contains_key(parent) {
+        return Err(Error {
+            template: name.to_string(),
+            line: 0,
+            msg: format!("`{{extends}}` 的模板 `{parent}` 未注册"),
+        });
+    }
+    if stack.iter().any(|n| n == name) {
+        let mut chain = stack.join(" → ");
+        chain.push_str(" → ");
+        chain.push_str(name);
+        return Err(Error {
+            template: name.to_string(),
+            line: 0,
+            msg: format!("`{{extends}}` 成环：{chain}"),
+        });
+    }
+    stack.push(name.to_string());
+    let r = compose(raw, parent, stack);
+    stack.pop();
+    let parent_nodes = r?;
+    Ok(replace_blocks(&parent_nodes, &src.blocks))
+}
+
+/// 把父模板里的 `{block}` 换成子模板的版本；没被覆盖的保留默认内容。
+fn replace_blocks(nodes: &[Stmt], overrides: &HashMap<String, Vec<Stmt>>) -> Vec<Stmt> {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Stmt::Block { name, body } => match overrides.get(name) {
+                // 覆盖体不再递归替换：它里面若又写同名 block 会无限套娃。
+                Some(b) => Stmt::Block {
+                    name: name.clone(),
+                    body: b.clone(),
+                },
+                None => Stmt::Block {
+                    name: name.clone(),
+                    body: replace_blocks(body, overrides),
+                },
+            },
+            // 父模板的 block 可能藏在 if / foreach 里，也得进去换。
+            Stmt::If { arms, else_ } => Stmt::If {
+                arms: arms
+                    .iter()
+                    .map(|(c, b)| (c.clone(), replace_blocks(b, overrides)))
+                    .collect(),
+                else_: replace_blocks(else_, overrides),
+            },
+            Stmt::ForEach {
+                iter,
+                key,
+                val,
+                body,
+                else_,
+            } => Stmt::ForEach {
+                iter: iter.clone(),
+                key: key.clone(),
+                val: val.clone(),
+                body: replace_blocks(body, overrides),
+                else_: replace_blocks(else_, overrides),
+            },
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// 一份模板的渲染入口。
@@ -412,6 +587,78 @@ mod tests {
             e.render("b", &json!({"x": 1})).unwrap(),
             "<style>body { color: red }</style>1"
         );
+    }
+
+    // ---- 继承与 assign ----
+
+    fn layout() -> Engine {
+        Engine::new()
+            .add(
+                "layout",
+                "<html><head><title>{block name=\"title\"}默认标题{/block}</title></head>\
+                 <body>{block name=\"content\"}空{/block}</body></html>",
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn extends_overrides_blocks_and_keeps_defaults() {
+        let e = layout()
+            .add(
+                "page",
+                "{extends \"layout\"}page 里这段文字不输出\
+                 {block name=\"title\"}订单{/block}\
+                 {block name=\"content\"}<ul>{$n}</ul>{/block}",
+            )
+            .unwrap();
+        let out = e.render("page", &json!({"n": 3})).unwrap();
+        assert_eq!(
+            out,
+            "<html><head><title>订单</title></head><body><ul>3</ul></body></html>"
+        );
+    }
+
+    #[test]
+    fn parent_renders_its_own_defaults() {
+        let e = layout();
+        assert_eq!(
+            e.render("layout", &json!({})).unwrap(),
+            "<html><head><title>默认标题</title></head><body>空</body></html>"
+        );
+    }
+
+    #[test]
+    fn missing_parent_is_an_error() {
+        let e = engine().add("a", "{extends \"b\"}").unwrap_err();
+        assert!(e.msg.contains("未注册"), "{e}");
+    }
+
+    #[test]
+    fn extends_cycle_is_an_error() {
+        // 逐个 `add` 时环一定先撞上"未注册"，环检测只在 add_dir
+        // 全量登记后才有机会上场——这里正是那个场景。
+        let dir = std::env::temp_dir().join(format!("rsboot-view-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.tpl"), "{extends \"b.tpl\"}").unwrap();
+        std::fs::write(dir.join("b.tpl"), "{extends \"a.tpl\"}").unwrap();
+        let err = Engine::new().add_dir(&dir).unwrap_err();
+        assert!(err.msg.contains("成环"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extends_must_be_literal() {
+        let err = Engine::new().add("a", "{extends $tpl}").unwrap_err();
+        assert!(err.msg.contains("字面量"), "{err}");
+    }
+
+    #[test]
+    fn assign_writes_into_the_current_scope() {
+        let e = engine()
+            .add("a", "{assign var=\"total\" value=$a + $b}{$total}")
+            .unwrap();
+        assert_eq!(e.render("a", &json!({"a": 2, "b": 40})).unwrap(), "42");
     }
 
     #[test]

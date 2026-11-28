@@ -127,6 +127,20 @@ impl<'a> Rt<'a> {
                     self.depth -= 1;
                     r?;
                 }
+                // `{block}` 是个透明容器：继承已经在编译期展开完了，
+                // 渲染期它只是"把 body 原样跑一遍"。
+                Stmt::Block { body, .. } => self.exec(body, out)?,
+                // 写当前最内层作用域：`{foreach}` 里 assign 只影响这一轮迭代，
+                // 弹出就没了，这跟 PHP 里 for 循环内赋值不一样，但更不容易串味。
+                Stmt::Assign { name, expr } => {
+                    let v = self.eval(expr)?;
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope.insert(name.clone(), v);
+                    }
+                }
+                Stmt::Extends(_) => {
+                    return Err(self.err("内部错误：`{extends}` 没有在编译期展开"))
+                }
                 Stmt::Call { name, args } => {
                     let Some(f) = self.engine.lookup_func(name) else {
                         return Err(self.err(format!("没有注册函数 `{{{name}}}`")));
