@@ -31,16 +31,89 @@ pub fn write_response<W: Write>(
     close: bool,
     head_only: bool,
     trace: Option<&[u8]>,
+    chunked: bool,
 ) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(96 + resp.headers.len() * 32 + resp.body.len());
-    fill_head(&mut buf, resp, close, trace);
+    fill_head(&mut buf, resp, close, trace, chunked);
     if body_forbidden(resp) || head_only {
-        // 不写 body
+        out.write_all(&buf)?;
+    } else if let Some(stream) = &resp.stream {
+        // 头先落地：客户端拿到第一个字节就不再等 content-length，
+        // 后面哪怕算得慢，也不会在浏览器里转圈。
+        out.write_all(&buf)?;
+        let mut sink = WriterSink { out, chunked };
+        stream.send(&mut sink)?;
+        sink.finish()?;
     } else {
         buf.extend_from_slice(&resp.body);
+        out.write_all(&buf)?;
     }
-    out.write_all(&buf)?;
     out.flush()
+}
+
+/// 把一块数据编码成 chunked 帧（`<hex>\r\n…\r\n`），非 chunked 时原样写。
+fn write_chunk<W: Write>(out: &mut W, chunk: &[u8]) -> io::Result<()> {
+    if chunk.is_empty() {
+        // 空块就是终止信号，绝不能当数据发出去
+        return Ok(());
+    }
+    let mut head = [0u8; 24];
+    let n = chunk_head(&mut head, chunk.len());
+    out.write_all(&head[..n])?;
+    out.write_all(chunk)?;
+    out.write_all(b"\r\n")
+}
+
+/// 一个完整的分块头：`<十六进制长度>\r\n`。返回写进 `buf` 的字节数。
+///
+/// 比 `format!("{:x}\r\n")` 省一次分配——每块都要用，热路径上这就是
+/// "每块一次 malloc/free" 与"零分配"的区别。
+fn chunk_head(buf: &mut [u8; 24], v: usize) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rev = [0u8; 16];
+    let mut n = 0;
+    let mut x = v;
+    if x == 0 {
+        rev[0] = b'0';
+        n = 1;
+    } else {
+        while x > 0 {
+            rev[n] = HEX[x & 0xf];
+            n += 1;
+            x >>= 4;
+        }
+    }
+    for i in 0..n {
+        buf[i] = rev[n - 1 - i];
+    }
+    buf[n] = b'\r';
+    buf[n + 1] = b'\n';
+    n + 2
+}
+
+/// 泛型写出路径的块落点（没有 fd，走 `Write`）。
+struct WriterSink<'a, W: Write> {
+    out: &'a mut W,
+    chunked: bool,
+}
+
+impl<W: Write> WriterSink<'_, W> {
+    fn finish(self) -> io::Result<()> {
+        if self.chunked {
+            self.out.write_all(b"0\r\n\r\n")?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> crate::web::response::ChunkSink for WriterSink<'_, W> {
+    fn send(&mut self, chunk: &[u8]) -> io::Result<()> {
+        if self.chunked {
+            write_chunk(self.out, chunk)
+        } else {
+            self.out.write_all(chunk)
+        }
+    }
 }
 
 /// `204/304` 一律不允许带 body（RFC 7230）。
@@ -73,7 +146,13 @@ fn push_dec(buf: &mut Vec<u8>, mut v: u64) {
     buf.extend_from_slice(&tmp[i..]);
 }
 
-fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool, trace: Option<&[u8]>) {
+fn fill_head(
+    buf: &mut Vec<u8>,
+    resp: &Response,
+    close: bool,
+    trace: Option<&[u8]>,
+    chunked: bool,
+) {
     let status = resp.status;
 
     // 状态行
@@ -91,9 +170,15 @@ fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool, trace: Option<&[u8
     buf.extend_from_slice(SERVER.as_bytes());
     buf.extend_from_slice(b"\r\n");
     if !body_forbidden(resp) {
-        buf.extend_from_slice(b"content-length: ");
-        push_dec(buf, resp.body.len() as u64);
-        buf.extend_from_slice(b"\r\n");
+        if chunked {
+            // 长度未知，只能声明"边算边分块"。HTTP/1.0 没有 chunked，
+            // 那种情况下调用方会把 `chunked` 传 false，改由关闭连接界定 body。
+            buf.extend_from_slice(b"transfer-encoding: chunked\r\n");
+        } else {
+            buf.extend_from_slice(b"content-length: ");
+            push_dec(buf, resp.body.len() as u64);
+            buf.extend_from_slice(b"\r\n");
+        }
     }
     if close {
         buf.extend_from_slice(b"connection: close\r\n");
@@ -103,7 +188,10 @@ fn fill_head(buf: &mut Vec<u8>, resp: &Response, close: bool, trace: Option<&[u8
 
     for (name, value) in resp.headers.iter() {
         // 这几个由本层负责，业务侧设置会被覆盖成一致的值
-        if matches!(name, "content-length" | "connection" | "date" | "server") {
+        if matches!(
+            name,
+            "content-length" | "connection" | "date" | "server" | "transfer-encoding"
+        ) {
             continue;
         }
         // 再过一遍校验：value 里若混进 CRLF（比如来自用户数据）就丢弃
@@ -154,14 +242,32 @@ pub fn write_response_fd(
     head_only: bool,
     head: &mut Vec<u8>,
     trace: Option<&[u8]>,
+    chunked: bool,
 ) -> io::Result<()> {
     // `head` 由调用方按连接复用：这条路径每个请求都要走一次，新建 `Vec`
     // 就是每请求一次 malloc/free。容量只增不减，稳态下零分配。
     head.clear();
     head.reserve(96 + resp.headers.len() * 32);
     let _h = profile::start(profile::HEAD);
-    fill_head(head, resp, close, trace);
+    fill_head(head, resp, close, trace, chunked);
     drop(_h);
+
+    // 流式 body：头一次性写掉，剩下交给闭包。**这里必须先返回**，
+    // 不能落进下面的 writev 逻辑——那时 body 还是空的，会直接写个
+    // `content-length` 之外的空响应，客户端当场收到一个残缺的连接。
+    if let Some(stream) = &resp.stream {
+        if body_forbidden(resp) || head_only {
+            return write_all_fd(fd, head);
+        }
+        write_all_fd(fd, head)?;
+        let mut sink = FdSink {
+            fd,
+            chunked,
+            buf: Vec::with_capacity(512),
+        };
+        stream.send(&mut sink)?;
+        return sink.finish();
+    }
 
     let body: &[u8] = if head_only || body_forbidden(resp) {
         &[]
@@ -178,6 +284,44 @@ pub fn write_response_fd(
     };
     drop(_f);
     out
+}
+
+/// fd 路径的块落点。每块拼成一条缓冲再一次 `write`：chunked 帧由
+/// "长度头 + 数据 + CRLF"组成，分成三次 `write` 是三次系统调用。
+#[cfg(unix)]
+struct FdSink {
+    fd: std::os::raw::c_int,
+    chunked: bool,
+    buf: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl FdSink {
+    fn finish(self) -> io::Result<()> {
+        if self.chunked {
+            write_all_fd(self.fd, b"0\r\n\r\n")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl crate::web::response::ChunkSink for FdSink {
+    fn send(&mut self, chunk: &[u8]) -> io::Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if !self.chunked {
+            return write_all_fd(self.fd, chunk);
+        }
+        self.buf.clear();
+        let mut head = [0u8; 24];
+        let n = chunk_head(&mut head, chunk.len());
+        self.buf.extend_from_slice(&head[..n]);
+        self.buf.extend_from_slice(chunk);
+        self.buf.extend_from_slice(b"\r\n");
+        write_all_fd(self.fd, &self.buf)
+    }
 }
 
 #[cfg(unix)]
@@ -348,7 +492,8 @@ mod tests {
             got
         });
         let mut buf = Vec::new();
-        super::write_response_fd(c.as_raw_fd(), resp, close, head_only, &mut buf, None).unwrap();
+        super::write_response_fd(c.as_raw_fd(), resp, close, head_only, &mut buf, None, false)
+            .unwrap();
         drop(c);
         h.join().unwrap()
     }
@@ -367,7 +512,7 @@ mod tests {
         for _ in 0..n {
             buf.clear();
             buf.reserve(96 + heads * 32);
-            fill_head(&mut buf, &resp, false, None);
+            fill_head(&mut buf, &resp, false, None, false);
             std::hint::black_box(&buf);
         }
         let reuse = t.elapsed().as_nanos() as f64 / n as f64;
@@ -375,7 +520,7 @@ mod tests {
         let t = std::time::Instant::now();
         for _ in 0..n {
             let mut fresh: Vec<u8> = Vec::with_capacity(96 + heads * 32);
-            fill_head(&mut fresh, &resp, false, None);
+            fill_head(&mut fresh, &resp, false, None, false);
             std::hint::black_box(&fresh);
         }
         let fresh_ns = t.elapsed().as_nanos() as f64 / n as f64;
@@ -401,7 +546,7 @@ mod tests {
             let body = vec![b'x'; size];
             let resp = crate::web::response::Response::json(&body);
             let mut want = Vec::new();
-            super::write_response(&mut want, &resp, false, false, None).unwrap();
+            super::write_response(&mut want, &resp, false, false, None, false).unwrap();
             let got = drain_fd_path(&resp, false, false);
             assert_eq!(
                 got, want,
@@ -414,7 +559,7 @@ mod tests {
         // HEAD：不写 body，但必须保留 content-length
         let resp = crate::web::response::Response::json(&vec![b'y'; 20_000]);
         let mut want = Vec::new();
-        super::write_response(&mut want, &resp, true, true, None).unwrap();
+        super::write_response(&mut want, &resp, true, true, None, false).unwrap();
         let got = drain_fd_path(&resp, true, true);
         assert_eq!(got, want, "HEAD 响应两条路径不一致");
         assert!(
@@ -437,7 +582,7 @@ mod tests {
 
     fn render(resp: &Response, close: bool, head_only: bool) -> String {
         let mut buf = Vec::new();
-        write_response(&mut buf, resp, close, head_only, None).unwrap();
+        write_response(&mut buf, resp, close, head_only, None, false).unwrap();
         String::from_utf8(buf).unwrap()
     }
 

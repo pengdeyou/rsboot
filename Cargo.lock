@@ -753,6 +753,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsboot-sse"
+version = "0.1.0"
+dependencies = [
+ "rsboot",
+]
+
+[[package]]
 name = "rsboot-static"
 version = "0.1.0-alpha.1"
 dependencies = [

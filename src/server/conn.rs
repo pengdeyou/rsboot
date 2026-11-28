@@ -85,7 +85,7 @@ fn write_closing<W: Write>(out: &mut W) -> std::io::Result<()> {
     )
     .to_response();
     resp.headers.insert("retry-after", "1");
-    write::write_response(out, &resp, true, false, None)
+    write::write_response(out, &resp, true, false, None, false)
 }
 
 /// 一条连接的全部状态：socket、读缓冲、已处理请求数。
@@ -415,6 +415,7 @@ impl Conn {
             target,
             headers,
             close: keep_close,
+            version,
             ..
         } = parsed;
         let mut req = Request::new(method, target.path)
@@ -465,6 +466,10 @@ impl Conn {
         drop(_t);
         let _t = profile::start(profile::WRITE);
         let head_only = matches!(method, Method::Head);
+        // 只有 HTTP/1.1 有 chunked。HTTP/1.0 客户端拿到流时不能给
+        // `transfer-encoding`，只能"写完就断开"，让它靠 EOF 判断 body 结束。
+        let chunked = resp.stream.is_some() && version == 1;
+        let keep_close = keep_close || (resp.stream.is_some() && version == 0);
         // 热路径走 fd 直写：大 body 用 `writev` 省一次 memcpy 与大块分配。
         // 泛型版留给测试（它要能用 `Vec<u8>` 当输出）。
         // 先攒进 `out_buf`，由 `serve_once` 统一 flush：一条连接上排队的 N 个请求
@@ -477,7 +482,8 @@ impl Conn {
         // 缓冲里没有下一个请求（绝大多数长连接只发一个就等）→ 沿用原来的
         // `writev` 直写，一次系统调用、body 不复制，与引入合并写之前完全一致。
         // 只有确实排着队的连接才值得攒起来合并。
-        if resp.body.len() > BIG_BODY_BYTES
+        if resp.stream.is_some()
+            || resp.body.len() > BIG_BODY_BYTES
             || (self.reader.buffer().is_empty() && self.out_buf.is_empty())
         {
             self.flush_out()?;
@@ -491,6 +497,7 @@ impl Conn {
                     head_only,
                     &mut self.out_buf,
                     trace,
+                    chunked,
                 )?;
             }
             // `write_response_fd` 会把 head 留在 `out_buf` 里（它复用这块缓冲拼 head），
@@ -498,9 +505,16 @@ impl Conn {
             // 客户端按 content-length 继续往下读，整条连接的数据就错位了。
             self.out_buf.clear();
             #[cfg(not(unix))]
-            write::write_response(self.reader.get_mut(), &resp, keep_close, head_only, trace)?;
+            write::write_response(
+                self.reader.get_mut(),
+                &resp,
+                keep_close,
+                head_only,
+                trace,
+                chunked,
+            )?;
         } else {
-            write::write_response(&mut self.out_buf, &resp, keep_close, head_only, trace)?;
+            write::write_response(&mut self.out_buf, &resp, keep_close, head_only, trace, chunked)?;
         }
         drop(_t);
         profile::finish_request();
@@ -564,7 +578,7 @@ impl Conn {
 /// 400/413/414/431/501/505 这些早失败路径与 handler 的业务错误同形。
 fn write_error<W: Write>(out: &mut W, err: ApiError, close: bool) -> std::io::Result<()> {
     let resp = crate::web::envelope::error(&err, None, true);
-    write::write_response(out, &resp, close, false, None)
+    write::write_response(out, &resp, close, false, None, false)
 }
 
 /// 读"请求行 + 头 + 空行"。
