@@ -3,7 +3,7 @@
 零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端全在仓库里。
 
 ```
-cargo test -p rsboot-claw          # 61 项（50 单测 + 10 e2e + 1 doctest）
+cargo test -p rsboot-claw          # 65 项（52 单测 + 12 e2e + 1 doctest）
 ```
 
 ## 快速开始
@@ -20,6 +20,7 @@ let stats = Crawler::new()
     .workers(4)              // thread-per-core，和 rsboot 一个模型
     .obey_robots(true)       // 读 robots.txt，遵守 Crawl-delay
     .delay(Duration::from_millis(200))
+    .max_per_host(4)         // 同一个站同时最多 4 发（默认 0 = 不限）
     .max_pages(1000)
     .sitemap(true)           // 先抓 robots 的 Sitemap: + /sitemap.xml 当种子
     .sink(sink.clone())      // 旁路落盘，和"下一步抓什么"解耦
@@ -27,6 +28,7 @@ let stats = Crawler::new()
     .middleware(Arc::new(RetryPolicy::new().retries(2)))     // 5xx/429/网络错误重试
     .middleware(Arc::new(RotateUserAgent::new(["claw/1", "claw/2")))
     .checkpoint("crawl.wal")          // 断了接着爬：中断时队列里没抓的在里面
+    .avoid_duplicate_content(true)    // 正文一样的页只交付一次
     // .proxy(Proxy::parse("http://user:pass@10.0.0.1:3128"))
     .run(|page| {
         println!("{} {} {}", page.status, page.url, page.title);
@@ -68,6 +70,8 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 
 - **去重**：以 `scheme://host[:port]/path?query` 为键，`http://a.com` 与 `http://a.com/`、`:80` 与无端口都归一成同一个 key。
 - **礼貌**：`delay` 是 per-host 的；某站冷却时其它站照抓（这是按 host 分桶的唯一理由）。robots 的 `Crawl-delay` 会自动抬高该站的 delay。
+- **per-host 并发**：`.max_per_host(n)` 限"同时几发"，和 `delay` 限的"隔多久"是两件事。不设时 `workers(8)` 会对同一个站同时开 8 发——对人家不够客气，自己也被一个站占满。名额在拿到任务时占、由 `Drop` 归还，handler panic 也还。
+- **内容去重**：`.avoid_duplicate_content(true)` 按正文算 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次（镜像站、`?page=1` 空壳页、导航菜单撑大的页）。命中页仍然抽站内链接继续走——不抽等于把下游砍了。理论上有碰撞，后果是"少交一页"，不会把两页混成一页。
 - **深度**：只按"距种子几跳"算，不猜路径层级。
 - **重定向**：最多 5 跳，`Page::url` 是最终地址，相对链接按最终地址解析。
 - **keep-alive**：每个工作线程一个 `Client`，per-host 一条连接复用；复用到已被对端关掉的连接会自动重连一次（这是真实世界最常见的坑）。
@@ -105,8 +109,14 @@ router.get("/crawl/start", |_, _| {
 
 如果想边爬边写库，就在 handler 里调 rsbatis——这也是 handler 设计成同步的原因：不用在 async 上下文里"block_on"一个数据库调用。
 
+## 踩过的坑
+
+- **"队列空了"不等于"没活了"**：worker 看到 `Empty` 就退出，而队列可能正好空在"某几发还在路上、抓完会推新链接"的那一刻。单站场景下这会直接把并发退化成 1（只有抢到种子的那个 worker 活着），而且尾部整段丢掉。现在 `Empty` 只在"队列没活 **且** 没有任何在飞的请求"时才报，否则给一个 1 ms 的 `Wait`。
+- **每连接一条线程的假服务端才测得准并发**：rsboot 的服务端是一个 event loop 跑 handler，在 handler 里 `sleep` 会把整个服务端串起来，并发恒为 1 —— 拿它测"并发上限"会假通过。`tests/crawl_e2e.rs` 里那个 `threaded_serve` 就是为此写的。
+- **链接里的参数要真的插值**：一开始把链接写成 `/p/{n}` 字面量，8 个"不同"链接其实指向同一个 URL，表现成"入队判重 1 次 + 只抓到一页"，看着像 crawler 的 bug。rsboot 的参数路由是 `.get("/p/{n}")`，页面里的链接得由 handler 用 `req.param("n")` 拼出来。
+
 ## 测试
 
 - `url` / `html` / `robots` / `frontier`：纯逻辑单测，含等价写法去重、最长匹配、通配符、`$` 锚定、慢站不阻塞快站。
 - `http`：用真 `TcpListener` 起假服务器，覆盖 chunked、短读、keep-alive 复用、复用死连接重试、重定向成环、body 上限。
-- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、断点续爬（中断 → 恢复 → 再跑一遍应零抓取）、连不上时不挂死。
+- `tests/crawl_e2e.rs`：**用 rsboot 自己起一个站点**再爬它，验证 robots 拦截、重定向后的 URL 归属、回环页去重、`max_pages` 计数、sitemap 当种子、jsonl 行数、5xx 重试把页面救回来、UA 轮转与 `StaticHeaders` 真的写进了请求、断点续爬（中断 → 恢复 → 再跑一遍应零抓取）、`max_per_host` 之下的并发峰值（服务端自己数，见"踩过的坑"）、内容重复页被跳过后链接仍然继续走、连不上时不挂死。

@@ -16,7 +16,7 @@
 | 性能 | 4 worker / 客户端 4 线程 p16：rsboot 999.4k，actix-web 4 1033.2k，**落后 3.27%**，胜场 1:19 |
 | 流式 | `Response::stream` + `ChunkSink` + chunked 写回；HTTP/1.0 降级为"写完即断" |
 | 模板 | `{extends}` / `{block}` / `{assign}` / `{if}` / `{foreach}`，编译期展开继承 |
-| 测试 | `cargo test --workspace` 428 passed |
+| 测试 | `cargo test --workspace` 432 passed |
 
 任何性能项必须走 `ab5.sh` 两批反序（AB / BA 各 10 轮 × 8s），噪声底 **±0.35%**；单批同向才算收益，两批反向即噪声。
 
@@ -172,7 +172,8 @@ v0.1 的定位是"能独立跑起来、礼貌、可测"，架构 fork Scrapy 的
 - [x] `Client::get_with`：中间件能带额外请求头；`user-agent` 覆盖、`host`/`connection`/`accept-encoding` 忽略（否则改出协议错误）、含 CR/LF 的头直接丢（防请求头注入）
 - [x] v0.4 代理：明文 http 代理（absolute-form 请求行 + `Proxy-Authorization: Basic`，零依赖手写 base64）；池键带代理地址，换代理不复用旧连接。不做 `CONNECT` 隧道（那是给 TLS 的，claw 不做 TLS）
 - [x] v0.4 断点续爬：`.checkpoint("crawl.wal")`，WAL 记 `+ 深度 key` / `- key`；恢复时 `seen` 取所有 `+`、pending 取"有 `+` 无 `-`"按原序重放。**只记 `seen` 是错的**——中断时"已入队没抓"的 URL 会丢，而种子在 `seen` 里会让恢复后的队列直接空掉
-- [ ] v0.2 checkpoint：`seen` 集合落盘（换掉内存 `HashSet`），支持中断续爬
+- [x] v0.5 per-host 并发：`.max_per_host(n)` 限"同时几发"（`delay` 限的是"隔多久"），名额由 `Drop` 归还，handler panic 也还。顺手修掉一个真 bug：worker 见到 `Empty` 就退出，但队列常空在"还有几发在路上、抓完会推新链接"的那一刻——单站场景下并发会退化成 1，尾部整段丢掉；现在只有"队列没活 **且** 在飞为 0"才报 `Empty`
+- [x] v0.5 内容去重：`.avoid_duplicate_content(true)`，正文 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次；命中页仍抽站内链接继续走。碰撞后果是"少交一页"，不会混页
 - [ ] v0.2 HTTPS：作为**可选 feature**（`tls`，引 rustls），默认关闭以守住零依赖；不做就在 `Error::UnsupportedScheme` 上让调用方决定
 - 不做：JS 渲染（要 headless browser）、gzip 解压（请求侧直接 `identity`）、分布式调度（单机爬虫不做分布式协调）
 

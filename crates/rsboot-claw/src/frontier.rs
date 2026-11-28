@@ -39,9 +39,10 @@ pub enum Push {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pop {
     Ready(Item),
-    /// 队列非空，但所有站的限速窗口都没到。睡这么久再来。
+    /// 还轮不到你：要么所有站都在冷却，要么队列空了但还有别的 worker 在路上。
+    /// `Ready` 之后必须 `release`，否则这条会一直算"在路上"。
     Wait(Duration),
-    /// 真空了。
+    /// 真的空了：队列没活，也没有任何 worker 在飞。这时候退出是安全的。
     Empty,
 }
 
@@ -51,6 +52,8 @@ struct Bucket {
     next_at: Instant,
     /// 这个站自己的限速（robots.txt 的 `Crawl-delay`），没设就用全局
     delay: Option<Duration>,
+    /// 这个站正在被抓、还没归还的条数
+    inflight: usize,
 }
 
 /// 断点日志（WAL）。
@@ -127,6 +130,10 @@ pub struct Frontier {
     len: usize,
     dup: usize,
     too_deep: usize,
+    /// 每个站同时最多几个在飞；0 = 不限
+    max_per_host: usize,
+    /// 全部在飞的总数。用来区分"队列真空了"和"队列空但那几发还在路上"
+    inflight_total: usize,
     journal: Option<Journal>,
 }
 
@@ -141,6 +148,8 @@ impl Frontier {
             len: 0,
             dup: 0,
             too_deep: 0,
+            max_per_host: 0,
+            inflight_total: 0,
             journal: None,
         }
     }
@@ -185,6 +194,7 @@ impl Frontier {
             items: VecDeque::new(),
             next_at: now,
             delay: None,
+            inflight: 0,
         });
         b.items.push_back(item);
         self.len += 1;
@@ -210,6 +220,7 @@ impl Frontier {
             items: VecDeque::new(),
             next_at: now, // 新站立刻可抓
             delay: None,
+            inflight: 0,
         });
         if let Some(j) = &mut self.journal {
             j.note_pushed(item.depth, &key_str);
@@ -246,6 +257,12 @@ impl Frontier {
                 self.ready.push_back(host);
                 continue;
             }
+            // 这个站已经挤了这么多人，先让别人上；不能 return Empty——队列里还有活，
+            // 只是全在飞，worker 该睡一下再来
+            if self.max_per_host > 0 && bucket.inflight >= self.max_per_host {
+                self.ready.push_back(host);
+                continue;
+            }
             let item = match bucket.items.pop_front() {
                 Some(i) => i,
                 None => continue,
@@ -254,6 +271,8 @@ impl Frontier {
                 j.note_done(&item.url.key());
             }
             bucket.next_at = now + bucket.delay.or(self.delay).unwrap_or_default();
+            bucket.inflight += 1;
+            self.inflight_total += 1;
             if !bucket.items.is_empty() {
                 self.ready.push_back(host);
             }
@@ -263,9 +282,45 @@ impl Frontier {
         if self.len > 0 {
             // 有活但都在冷却：睡到最早那个
             Pop::Wait(min_wait.unwrap_or_else(|| Duration::from_millis(10)))
+        } else if self.inflight_total > 0 {
+            // 队列空，但还有别的 worker 在路上——它们抓完可能推新链接进来。
+            // 这时候报 `Empty` 会让 worker 全部提前退出，把尾部整段丢掉
+            Pop::Wait(Duration::from_millis(1))
         } else {
             Pop::Empty
         }
+    }
+
+    /// 一个任务抓完了，把在飞名额还回去。不还就等于这个站永久的并发上限 -1。
+    ///
+    /// 抓取路径里必须有个 Drop 兜底（handler panic 也要还），见 `lib.rs` 的 `Release`。
+    pub fn release(&mut self, host: &str) {
+        if let Some(b) = self.buckets.get_mut(host) {
+            if b.inflight > 0 {
+                b.inflight -= 1;
+                self.inflight_total -= 1;
+            }
+            if !b.items.is_empty() {
+                let host: Box<str> = host.into();
+                if !self.ready.contains(&host) {
+                    self.ready.push_back(host);
+                }
+            }
+        }
+    }
+
+    /// 每个站同时最多几个在飞。`0` = 不限（默认）。
+    ///
+    /// 和 `delay` 是两件事：`delay` 管"两次请求隔多久"，这个管"同时几发"。
+    /// 只限速不限并发时，4 个 worker 会同时向同一个站在 0 延迟下连开 4 发——
+    /// 对人家不算客气，自己这边也全卡在这一个站上。
+    pub fn set_max_per_host(&mut self, n: usize) {
+        self.max_per_host = n;
+    }
+
+    /// 某个站当前在飞的条数（测试用）。
+    pub fn in_flight(&self, host: &str) -> usize {
+        self.buckets.get(host).map_or(0, |b| b.inflight)
     }
 
     pub fn len(&self) -> usize {
@@ -345,7 +400,10 @@ mod tests {
         }
         for i in 0..3 {
             match f.pop(now) {
-                Pop::Ready(it) => assert_eq!(it.url.path, format!("/{i}")),
+                Pop::Ready(it) => {
+                    assert_eq!(it.url.path, format!("/{i}"));
+                    f.release("a.com");
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -417,6 +475,64 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_host_inflight_is_capped_but_not_empty() {
+        let now = Instant::now();
+        let mut f = Frontier::new(5, None);
+        f.set_max_per_host(2);
+        for i in 0..3 {
+            f.push(item(&format!("http://a.com/{i}"), 0), now);
+        }
+        for _ in 0..2 {
+            assert!(matches!(f.pop(now), Pop::Ready(_)));
+        }
+        // 这个站满了，但队列里还有一条没抓：必须是 Wait 而不是 Empty，
+        // 否则 worker 直接退出，整次抓取就丢了尾巴
+        match f.pop(now) {
+            Pop::Wait(d) => assert!(d <= Duration::from_millis(50)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(f.in_flight("a.com"), 2);
+
+        // 别的站不该被这个站的并发挡住
+        f.push(item("http://b.com/x", 0), now);
+        match f.pop(now) {
+            Pop::Ready(it) => {
+                assert_eq!(it.url.host, "b.com");
+                f.release("b.com");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // 还一个名额就能继续
+        f.release("a.com");
+        assert_eq!(f.in_flight("a.com"), 1);
+        match f.pop(now) {
+            Pop::Ready(it) => assert_eq!(it.url.host, "a.com"),
+            other => panic!("{other:?}"),
+        }
+        // 多发几次 release 不能下溢
+        for _ in 0..5 {
+            f.release("a.com");
+        }
+        assert_eq!(f.in_flight("a.com"), 0);
+        assert_eq!(f.pop(now), Pop::Empty);
+    }
+
+    /// 队列空了但有一发还在路上：这时候报 `Empty` 会让 idle 的 worker 提前退出，
+    /// 那一发抓回来推的新链接就没人接了。
+    #[test]
+    fn empty_queue_with_inflight_is_not_drained() {
+        let now = Instant::now();
+        let mut f = Frontier::new(1, None);
+        f.push(item("http://a.com/x", 0), now);
+        assert!(matches!(f.pop(now), Pop::Ready(_)));
+        assert_eq!(f.len(), 0);
+        assert!(matches!(f.pop(now), Pop::Wait(_)));
+        f.release("a.com");
+        assert_eq!(f.pop(now), Pop::Empty);
     }
 
     #[test]

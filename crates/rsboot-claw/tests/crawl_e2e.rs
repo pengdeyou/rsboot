@@ -6,7 +6,7 @@
 //!
 //! 顺便也是"扩展 crate 与 rsboot 能一起用"的证明：被爬的站点就是 rsboot 起的。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -384,6 +384,142 @@ fn checkpoint_resumes_after_interruption() {
     assert!(wal_text.lines().any(|l| l.starts_with("+ ")), "WAL 里要能直接看到进度");
     let _ = std::fs::remove_dir_all(&dir);
     stop.store(true, Ordering::Relaxed);
+}
+
+/// 服务端自己数并发峰值：`max_per_host(2)` 之下，同一个站不该同时被开 2 发以上。
+///
+/// 这里**不用 rsboot 起站点**：rsboot 的服务端是一个 event loop 上跑 handler，
+/// 在 handler 里 sleep 会把整个服务端串起来，并发永远是 1 —— 那样的测试
+/// 无论 crawler 有没有限并发都会通过，等于没测。所以用一个每连接一条线程的
+/// 极简服务端，才能真正看到"同时打到几发"。
+#[test]
+fn per_host_concurrency_is_capped() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let cur = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let (cur, peak, st) = (cur.clone(), peak.clone(), stop.clone());
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                if st.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(s) = s else { break };
+                let (c, p) = (cur.clone(), peak.clone());
+                std::thread::spawn(move || threaded_serve(s, c, p));
+            }
+        });
+    }
+
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(1)
+        .workers(8)
+        .max_per_host(2)
+        .run(follow_internal);
+    stop.store(true, Ordering::Relaxed);
+
+    assert_eq!(stats.errors, 0, "{:?}", stats.error_kinds);
+    assert_eq!(stats.pages, 9, "并发上限不能把队列堵死：{stats:?}");
+    assert!(
+        peak.load(Ordering::SeqCst) <= 2,
+        "同一个站同时最多 2 发，实测 {}",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
+/// 每连接一条线程的最小 HTTP/1.1 服务端：根页给 8 个链接，别的路径回 `ok`。
+fn threaded_serve(mut s: std::net::TcpStream, cur: Arc<AtomicUsize>, peak: Arc<AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Write};
+    let mut rd = BufReader::new(s.try_clone().unwrap());
+    loop {
+        let mut line = String::new();
+        if rd.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        loop {
+            let mut h = String::new();
+            if rd.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                break;
+            }
+        }
+        let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let n = cur.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(n, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        cur.fetch_sub(1, Ordering::SeqCst);
+
+        let body = if path == "/" {
+            let links: String = (0..8)
+                .map(|i| format!("<a href=\"/p/{i}\">p{i}</a>"))
+                .collect();
+            format!("<html><body>{links}</body></html>")
+        } else {
+            "ok".to_string()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        if s.write_all(resp.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+/// 正文一样的两页只交付一次，但两边各自的链接都要继续走。
+#[test]
+fn duplicate_content_is_skipped_but_links_still_followed() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let router = Router::new()
+        .get("/", |_, _| {
+            Response::html(
+                r#"<html><body>
+                <a href="/same/1">a</a><a href="/same/2">b</a><a href="/other">c</a>
+                </body></html>"#,
+            )
+        })
+        .unwrap()
+        .get("/same/{n}", |req, _| {
+            // 两个地址、同一段正文；链接不同（这才是镜像站的样子）
+            let n = req.param("n").unwrap_or("0").to_string();
+            Response::html(format!(
+                r#"<html><body>同一段正文<a href="/deep/{n}">next</a></body></html>"#
+            ))
+        })
+        .unwrap()
+        .get("/other", |_, _| Response::html("<html><body>别的正文</body></html>"))
+        .unwrap()
+        .get("/deep/{n}", |req, _| {
+            let n = req.param("n").unwrap_or("0").to_string();
+            Response::html(format!("<html><body>叶子{n}</body></html>"))
+        })
+        .unwrap();
+    let (addr, stop) = serve_at(addr, router);
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let cnt = seen.clone();
+    let stats = Crawler::new()
+        .seed(&format!("http://{addr}/"))
+        .max_depth(2)
+        .workers(4)
+        .avoid_duplicate_content(true)
+        .run(move |page| {
+            cnt.fetch_add(1, Ordering::Relaxed);
+            follow_internal(page)
+        });
+    stop.store(true, Ordering::Relaxed);
+
+    assert_eq!(stats.errors, 0, "{:?}", stats.error_kinds);
+    assert_eq!(stats.duplicates_content, 1, "{stats:?}");
+    // 首页 + 两个 same 里的一个 + /other + 两个 deep
+    assert_eq!(stats.pages, 5, "{stats:?}");
+    assert_eq!(seen.load(Ordering::Relaxed), 5, "handler 只见 5 次");
+    // 两个 deep 都该被抓到：内容重复那页的链接不能丢
+    assert!(stats.bytes > 0);
 }
 
 #[test]

@@ -43,7 +43,7 @@ pub mod robots;
 pub mod sitemap;
 pub mod url;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -173,6 +173,40 @@ pub fn json_string(s: &str) -> String {
     out
 }
 
+/// 抓取任务借走一个 per-host 并发名额，Drop 时归还。
+///
+/// 用 Drop 而不是在流程末尾手写一句 `release`：中间任何一步提前 `continue`、
+/// 或者用户的 handler panic 展开，都会走到 Drop。
+struct Release<'a> {
+    frontier: &'a Mutex<Frontier>,
+    host: Box<str>,
+}
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.frontier.lock().unwrap().release(&self.host);
+    }
+}
+
+/// 正文指纹：64 位 FNV-1a。
+///
+/// 为什么不引哈希库：这是零依赖 crate；而这里只需要"两次同样的文本给同样的数"，
+/// FNV 够用且够快（一个字节一轮 `xor` + 乘）。正文全空时用标题兜底，
+/// 否则所有图片页/空壳页会一起被判成同一页。
+fn content_fingerprint(page: &Page) -> u64 {
+    let text = if page.doc.text.is_empty() {
+        page.doc.title.as_str()
+    } else {
+        page.doc.text.as_str()
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in text.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// 一次 `run` 的汇总。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Stats {
@@ -183,8 +217,11 @@ pub struct Stats {
     pub errors: usize,
     /// 被 robots.txt 挡掉的
     pub skipped_robots: usize,
-    /// 入队时被判重的
+    /// 入队时被判重的（同一个 URL）
     pub duplicates: usize,
+    /// 抓到了但正文和之前某页一样的（开了 `avoid_duplicate_content` 才会计数）。
+    /// 这些页不算进 `pages`——它们没有交付出去
+    pub duplicates_content: usize,
     /// 入队时因超深被丢的
     pub too_deep: usize,
     /// 中间件要求重试的次数（含最后那次失败的尝试）
@@ -204,6 +241,7 @@ pub struct Stats {
 struct Counters {
     pages: usize,
     bytes: usize,
+    duplicates_content: usize,
     errors: usize,
     skipped_robots: usize,
     retries: usize,
@@ -243,6 +281,8 @@ pub struct Crawler {
     middlewares: Vec<Arc<dyn Middleware>>,
     retry_backoff: Duration,
     checkpoint: Option<PathBuf>,
+    max_per_host: usize,
+    avoid_duplicate_content: bool,
 }
 
 impl Crawler {
@@ -263,6 +303,8 @@ impl Crawler {
             middlewares: Vec::new(),
             retry_backoff: Duration::from_millis(200),
             checkpoint: None,
+            max_per_host: 0,
+            avoid_duplicate_content: false,
         }
     }
 
@@ -365,6 +407,30 @@ impl Crawler {
         self
     }
 
+    /// 同一个站同时最多几个请求在飞。默认 `0` = 不限（只受 `workers` 约束）。
+    ///
+    /// 和 `.delay()` 管的是两件事：`delay` 管"这个站两次请求隔多久"，这个管
+    /// "同时几发"。只限速不限并发时，`workers(8)` 会在 `delay=0` 下同时向
+    /// 同一个站开 8 发——对人家不够客气，而自己这边 8 个 worker 也全被
+    /// 这一个站占住。多个种子站时建议设成 2–4。
+    pub fn max_per_host(mut self, n: usize) -> Self {
+        self.max_per_host = n;
+        self
+    }
+
+    /// 正文指纹去重：不同 URL 但正文一样的页，只交付一次。
+    ///
+    /// 对付的是镜像站、分页参数只换 `?page=1` 的空壳页、以及导航菜单
+    /// 撑起来的"看起来不一样其实一样"的页。命中的页**仍然会抽取站内链接**
+    /// 继续往下走（不然等于把下游砍了），但不会进 sink、也不会调 handler。
+    ///
+    /// 指纹是 64 位 FNV-1a，理论上有碰撞——碰撞的结果是**少交一页**，
+    /// 不会把不同的页混成同一页，所以这个概率可以接受。
+    pub fn avoid_duplicate_content(mut self, yes: bool) -> Self {
+        self.avoid_duplicate_content = yes;
+        self
+    }
+
     /// 开跑。handler 在每个工作线程里被同步调用，返回要跟进的地址
     /// （相对地址按当前页面解析）。
     pub fn run<H>(self, handler: H) -> Stats
@@ -386,6 +452,11 @@ impl Crawler {
                 0,
             ),
         };
+
+        frontier
+            .lock()
+            .unwrap()
+            .set_max_per_host(self.max_per_host);
 
         // sitemap 要在开跑**之前**抓完：它是种子级的输入，跑起来之后再抓
         // 会让"种子为什么这么少"变得不可解释。
@@ -421,6 +492,7 @@ impl Crawler {
         }
 
         let counters = Mutex::new(Counters::default());
+        let seen_content: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
         let robots_cache: Mutex<HashMap<String, Arc<Robots>>> = Mutex::new(HashMap::new());
         let fetched = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
@@ -448,6 +520,13 @@ impl Crawler {
                                 }
                                 Pop::Empty => break,
                             }
+                        };
+
+                        // 拿到了这个任务就把该站的并发名额占住，抓完（或 panic 展开）
+                        // 由 Drop 归还。不归还的话这个站的并发上限会一路掉到 0
+                        let _slot = Release {
+                            frontier: &frontier,
+                            host: item.url.host_header().into_boxed_str(),
                         };
 
                         // 名额在开抓**之前**占：抓到才算数的话，4 个 worker 会各多抓一页
@@ -566,6 +645,32 @@ impl Crawler {
                             elapsed: t0.elapsed(),
                         };
 
+                        if cfg.avoid_duplicate_content {
+                            let fp = content_fingerprint(&page);
+                            if !seen_content.lock().unwrap().insert(fp) {
+                                {
+                                    let mut c = counters.lock().unwrap();
+                                    c.duplicates_content += 1;
+                                    c.bytes += resp.body.len();
+                                }
+                                // 内容一样不代表链接一样（镜像站往往是另一套导航），
+                                // 所以下游照走：只抽站内链接，不惊动 sink 和 handler
+                                let now = Instant::now();
+                                let mut f = frontier.lock().unwrap();
+                                for u in page.internal_links() {
+                                    f.push(
+                                        Item {
+                                            url: u,
+                                            depth: item.depth + 1,
+                                            referer: Some(page.url.to_string()),
+                                        },
+                                        now,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+
                         {
                             let mut c = counters.lock().unwrap();
                             c.pages += 1;
@@ -613,6 +718,7 @@ impl Crawler {
             errors: c.errors,
             skipped_robots: c.skipped_robots,
             duplicates: dups,
+            duplicates_content: c.duplicates_content,
             too_deep: deep,
             retries: c.retries,
             skipped: c.skipped,
