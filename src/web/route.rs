@@ -559,6 +559,25 @@ mod tests {
         r.handle(&mut req, &c)
     }
 
+    /// handler 直接返回 `Response` 时不需要 `Ok(..)`——成功与错误分支都能直接 return。
+    #[test]
+    fn handler_can_return_response_without_ok() {
+        let r = Router::new()
+            .get("/ping", |_, _| crate::web::res::Res::success("ok"))
+            .unwrap()
+            .get("/boom", |_, _| crate::web::res::Res::fail_response("库存不足"))
+            .unwrap();
+        let ok = call(&r, Method::Get, "/ping");
+        assert_eq!(ok.status, Status::OK);
+        assert_eq!(&ok.body[..], "{\"code\":\"OK\",\"message\":\"ok\",\"data\":null}".as_bytes());
+        let bad = call(&r, Method::Get, "/boom");
+        assert_eq!(bad.status, Status::BAD_REQUEST);
+        assert_eq!(
+            &bad.body[..],
+            "{\"code\":\"BAD_REQUEST\",\"message\":\"库存不足\",\"data\":null}".as_bytes()
+        );
+    }
+
     /// `Res::fail` 造的错误必须在全局 envelope 关闭时也输出统一形状。
     #[test]
     fn res_fail_wraps_even_when_envelope_off() {

@@ -69,6 +69,21 @@ impl Res {
         Self::fail_with(Status::BAD_REQUEST, message)
     }
 
+    /// 失败，但**直接返回 `Response`**：给 `-> Response` 的 handler 用。
+    ///
+    /// `Res::fail` 是给 `-> Result<..>` 的 handler 用的（能放进 `Err(..)`）；
+    /// 这两个不是重复，是两种签名各要一种。用这个就不必为了一个错误分支
+    /// 把整个 handler 改成 `Result`。
+    pub fn fail_response(message: impl Into<String>) -> Response {
+        Self::fail_response_with(Status::BAD_REQUEST, message)
+    }
+
+    /// 带状态码的版本，同上。
+    pub fn fail_response_with(status: Status, message: impl Into<String>) -> Response {
+        let err = Self::fail_with(status, message);
+        envelope::error(&err, None, true)
+    }
+
     /// 指定状态码的失败。`code` 由状态码推导，与 `envelope::error` 同一套映射。
     pub fn fail_with(status: Status, message: impl Into<String>) -> ApiError {
         let mut err = ApiError::new(status, message);
@@ -114,6 +129,16 @@ mod tests {
         let e = Res::fail("库存不足");
         assert_eq!(e.status, Status::BAD_REQUEST);
         assert!(e.always_wrap);
+    }
+
+    #[test]
+    fn fail_response_is_wrapped_body() {
+        let r = Res::fail_response("库存不足");
+        assert_eq!(r.status, Status::BAD_REQUEST);
+        assert_eq!(
+            &r.body[..],
+            "{\"code\":\"BAD_REQUEST\",\"message\":\"库存不足\",\"data\":null}".as_bytes()
+        );
     }
 
     #[test]

@@ -185,9 +185,26 @@ fn take_one(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
 }
 ```
 
+**返回 `Response` 的 handler 不用写 `Ok(...)`。** 签名是 `-> Response` 时，成功和失败分支都能直接 `return`：
+
+```rust
+fn ping(_: &mut Request, _: &Context) -> Response {
+    Res::success("ok")
+}
+
+fn detail(_: &mut Request, _: &Context) -> Response {
+    if miss() {
+        return Res::fail_response("没有这条记录");   // 400 + 统一形状
+    }
+    Res::data(row)
+}
+```
+
+这样就避免了"为了一个错误分支把整个 handler 改成 `Result<..>`"。
+
 三点值得知道：
 
-- `fail` 返回的是 `ApiError` 而不是 `Response`，所以能直接放进 `Err(...)`。
+- `fail` 返回 `ApiError`，`fail_response` 返回 `Response`——不是重复，是两种 handler 签名各要一种。
 - 这几种调用**一定**是统一形状，不依赖 `http.envelope` 开关。你显式要来的形状，不该被全局开关再改一遍。
 - `data` 直接序列化进同一个缓冲（中间不建 `serde_json::Value` 树），字段顺序与 `http.envelope` 产出的逐字节一致，所以打开那个开关不会改变这些响应的任何一个字节。
 
