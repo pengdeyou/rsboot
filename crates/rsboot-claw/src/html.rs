@@ -211,7 +211,7 @@ pub fn scan(html: &str) -> Document {
 }
 
 /// 取一个标签上某属性的值（属性名大小写不敏感）。
-fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub(crate) fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
     attrs
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -249,7 +249,7 @@ enum Cap {
 }
 
 /// 读标签名，返回 (名字, 名字之后的偏移)。
-fn read_name(b: &[u8], mut i: usize) -> (&str, usize) {
+pub(crate) fn read_name(b: &[u8], mut i: usize) -> (&str, usize) {
     let start = i;
     while i < b.len() {
         let c = b[i];
@@ -264,7 +264,7 @@ fn read_name(b: &[u8], mut i: usize) -> (&str, usize) {
 }
 
 /// 解析属性直到 `>`，返回 (属性表, `>` 之后的位置)。
-fn read_attrs(b: &[u8], mut i: usize) -> (Vec<(String, String)>, usize) {
+pub(crate) fn read_attrs(b: &[u8], mut i: usize) -> (Vec<(String, String)>, usize) {
     let mut out: Vec<(String, String)> = Vec::new();
     loop {
         while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') {
@@ -332,7 +332,7 @@ fn read_attrs(b: &[u8], mut i: usize) -> (Vec<(String, String)>, usize) {
     }
 }
 
-fn find(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     if from >= b.len() {
         return None;
     }
@@ -342,7 +342,7 @@ fn find(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|p| p + from)
 }
 
-fn find_ignore_case(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_ignore_case(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     if from >= b.len() || needle.len() > b.len() {
         return None;
     }

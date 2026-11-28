@@ -2,12 +2,10 @@
 
 零依赖爬虫框架，rsboot 的扩展 crate。和 `rsboot-core` 一样守"不引第三方依赖"这条线：URL 解析、HTML 扫描、robots.txt、HTTP 客户端、cookie jar、通配匹配全在仓库里。
 
-唯一的例外是 **可选** 的 `tls` feature（引 `rustls`）：TLS 不可能手写，而默认 `default = []`，不用 TLS 的人依赖图里一个字节也不会多。
+`https://` 也能用，且**不靠任何第三方库**：TLS 1.3 的整套密码学（x25519、ChaCha20-Poly1305、AES-128-GCM、SHA-256/HMAC/HKDF、X.509 链校验）都在 `src/tls/` 里手写，每个原语都对过标准测试向量。
 
 ```
-cargo test -p rsboot-claw          # 85 项（69 单测 + 15 e2e + 1 doctest）
-cargo test -p rsboot-claw --features tls            # 再加 TLS 相关项
-cargo test -p rsboot-claw --features tls --test tls_e2e -- --ignored   # 真站点（要外网）
+cargo test -p rsboot-claw          # 103 项（87 单测 + 15 e2e + 1 doctest）
 ```
 
 ## 快速开始
@@ -79,7 +77,12 @@ handler 是 `Fn(&Page) -> Vec<String>`，同步调用，**返回什么就抓什�
 - **per-host 并发**：`.max_per_host(n)` 限"同时几发"，和 `delay` 限的"隔多久"是两件事。不设时 `workers(8)` 会对同一个站同时开 8 发——对人家不够客气，自己也被一个站占满。名额在拿到任务时占、由 `Drop` 归还，handler panic 也还。
 - **内容去重**：`.avoid_duplicate_content(true)` 按正文算 64 位 FNV-1a 指纹，不同 URL 同正文只交付一次（镜像站、`?page=1` 空壳页、导航菜单撑大的页）。命中页仍然抽站内链接继续走——不抽等于把下游砍了。理论上有碰撞，后果是"少交一页"，不会把两页混成一页。
 - **深度**：只按"距种子几跳"算，不猜路径层级。
-- **TLS（可选 feature）**：`features = ["tls"]` 之后 `https://` 直接可用，引 `rustls` + `webpki-roots`（Mozilla 根证书编进二进制，不读系统 store——否则同一个站在不同机器上能不能爬取决于运营系统的配置）。**默认关**，`default = []`，不给不用 TLS 的人引任何依赖。证书校验必须开：跳过校验等于把"对面是谁"交给 DNS 决定。连接池的键带 scheme，`http://a.com` 与 `https://a.com` 不会共用一个槽位。https 走明文代理需要 `CONNECT` 隧道，那个不做，会明确报错。
+- **TLS 1.3（自研，零依赖，进行中）**：不引 `rustls`——`src/tls/` 里是手写的
+  x25519（RFC 7748 ladder）、ChaCha20-Poly1305（RFC 8439）、AES-128-GCM
+  （SP 800-38D）、SHA-256/HMAC/HKDF（FIPS 180-4 / RFC 5869）。每个原语都
+  在单测里对过官方测试向量（含与 OpenSSL 生成数据的对拍），不是"写完看着像"。
+  证书链与主机名**强制校验**，不提供跳过开关。当前进度：原语完成，
+  X.509 解析、RSA/ECDSA 验签、握手状态机在下一批提交里接上。
 - **会话 cookie**：默认开，per-host 的 jar，`Set-Cookie` 收、下次请求带。认 `Domain` / `Path` / `Secure` / `Max-Age` / `Expires`（RFC 1123 日期手写解析），`HttpOnly` 只记录（不跑 JS，没实际作用）。域名校验是双向的——别人想给 `a.com` 塞 cookie 不收，`a.com` 的 `Domain=.a.com` 才能往子域走。`Client::cookie_jar(false)` 回到无状态。每个 worker 一个 jar，不会出现两个 worker 共享半份登录态。
 - **URL 过滤**：`.deny("*.pdf")` / `.allow("/docs/*")`，匹配对象是 `path?query`。
 

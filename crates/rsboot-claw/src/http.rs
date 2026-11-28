@@ -16,20 +16,7 @@ use std::time::{Duration, SystemTime};
 use crate::cookies::Jar;
 use crate::url::Url;
 
-/// 一条连接的抽象。
-///
-/// 不开 `tls` feature 时就是 `TcpStream`——不为用不到的功能付一层 dyn 的开销。
-/// 开了之后 https 要装 rustls 流，两种具体类型只能统一成 trait 对象。
-#[cfg(not(feature = "tls"))]
 pub type Conn = TcpStream;
-
-#[cfg(feature = "tls")]
-pub trait ReadWrite: Read + Write {}
-#[cfg(feature = "tls")]
-impl<T: Read + Write> ReadWrite for T {}
-
-#[cfg(feature = "tls")]
-pub type Conn = Box<dyn ReadWrite + Send>;
 
 /// 出错种类。爬虫对错误的态度是"记一笔、跳过、继续"，所以这里只需要能分类。
 #[derive(Debug)]
@@ -52,13 +39,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Protocol(m) => write!(f, "protocol: {m}"),
-            Error::UnsupportedScheme(s) => {
-                if cfg!(feature = "tls") {
-                    write!(f, "unsupported scheme: {s} (claw 只做 http/https)")
-                } else {
-                    write!(f, "unsupported scheme: {s} (claw 只做 http；要 https 请开 `tls` feature)")
-                }
-            }
+            Error::UnsupportedScheme(s) => write!(f, "unsupported scheme: {s} (claw 只做 http)"),
             Error::BodyTooLarge { limit } => write!(f, "body too large (> {limit} bytes)"),
             Error::TooManyRedirects(n) => write!(f, "too many redirects (> {n})"),
             Error::Connect(m) => write!(f, "connect: {m}"),
@@ -308,8 +289,7 @@ impl Client {
     }
 
     fn get_once(&mut self, url: &Url, extra: &[(String, String)]) -> Result<Response> {
-        let scheme_ok = url.scheme == "http" || (cfg!(feature = "tls") && url.scheme == "https");
-        if !scheme_ok {
+        if url.scheme != "http" {
             return Err(Error::UnsupportedScheme(url.scheme.clone()));
         }
         let key = self.pool_key(url);
@@ -364,7 +344,7 @@ impl Client {
 
     /// 池的键：有代理时还要带上代理地址——不然换了代理会复用旧连接。
     fn pool_key(&self, url: &Url) -> String {
-        // scheme 必须入键：`http://a.com` 与 `https://a.com:443` 是两条不同
+        // scheme 入键：`http://a.com` 与 `https://a.com:443` 将来是两条不同
         // 的连接，共用一个槽位会把明文连接复用给 https 请求
         match &self.proxy {
             Some(p) => format!("{}|{}|{}", p.addr(), url.scheme, url.host_header()),
@@ -406,8 +386,6 @@ impl Client {
         }))
     }
 
-    /// 直连就是原样；`tls` feature 下 https 再包一层 TLS。
-    #[cfg(not(feature = "tls"))]
     fn upgrade(&self, s: TcpStream, _url: &Url) -> Result<BufReader<Conn>> {
         Ok(BufReader::new(s))
     }
@@ -852,8 +830,6 @@ mod tests {
         assert!(req.contains("Proxy-Authorization: Basic dTpw"), "{req}");
     }
 
-    /// 只在没开 `tls` feature 时成立：开了之后 https 会真的去连。
-    #[cfg(not(feature = "tls"))]
     #[test]
     fn https_is_rejected_clearly() {
         let mut c = Client::new();
