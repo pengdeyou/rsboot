@@ -54,7 +54,7 @@ pub use service::{
 pub use web::{
     Api, ApiError, ApiKey, ApiResult, Bearer, Envelope, FromRequest, IntoApiError, IntoResponse, Json,
     Method, Path, Query, Request,
-    ParamDoc, Response, RouteDoc, Router, Status,
+    ParamDoc, Res, Response, RouteDoc, Router, Status,
 };
 
 /// 版本号来自 Cargo.toml，供 `/health` 与启动日志展示。

@@ -27,6 +27,10 @@ pub struct ApiError {
     pub internal: Option<String>,
     /// 请求 id，便于在日志里定位
     pub request_id: Option<u64>,
+    /// 无论 `http.envelope` 开没开，这条错误都必须按统一响应体输出。
+    /// `res::fail` 造出来的错误会置为 `true`：用户显式要了统一形状，
+    /// 就不该被全局开关再改一次。
+    pub(crate) always_wrap: bool,
 }
 
 impl ApiError {
@@ -38,6 +42,7 @@ impl ApiError {
             kind: None,
             internal: None,
             request_id: None,
+            always_wrap: false,
         }
     }
 
@@ -66,6 +71,7 @@ impl ApiError {
             kind: Some(format!("{kind}_error")),
             internal: None,
             request_id: None,
+            always_wrap: false,
         }
     }
 
@@ -78,7 +84,13 @@ impl ApiError {
             kind: None,
             internal: Some(err.to_string()),
             request_id: None,
+            always_wrap: false,
         }
+    }
+
+    /// 标记：无论全局开关如何，这条错误都按统一响应体输出（`Res::fail` 用）。
+    pub(crate) fn always_wrapped(&mut self) {
+        self.always_wrap = true;
     }
 
     pub fn with_request_id(mut self, id: u64) -> Self {

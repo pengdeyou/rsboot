@@ -367,10 +367,18 @@ impl Router {
     /// 只能回裸 `{"detail":...}`——这就是"成功带 data、失败带 detail"的经典不一致。
     /// 所以在这里统一处理：凡是带着 `api_error` 原件的响应，按开关重写一次。
     fn finalize(&self, mut resp: Response, req: &Request, ctx: &Context) -> Response {
-        if !ctx.envelope_on() {
+        if resp.status.0 < 400 {
             return resp;
         }
-        if resp.status.0 < 400 {
+        // 两条通路都要包：全局开关打开；或者这条错误自己要求过
+        // （`Res::fail` 显式要统一形状，不该被全局开关再关掉）。
+        let wrap = ctx.envelope_on()
+            || resp
+                .api_error
+                .as_ref()
+                .map(|e| e.always_wrap)
+                .unwrap_or(false);
+        if !wrap {
             return resp;
         }
         let Some(err) = resp.api_error.take() else {
@@ -549,6 +557,22 @@ mod tests {
         let mut req = Request::new(method, path);
         let c = ctx();
         r.handle(&mut req, &c)
+    }
+
+    /// `Res::fail` 造的错误必须在全局 envelope 关闭时也输出统一形状。
+    #[test]
+    fn res_fail_wraps_even_when_envelope_off() {
+        let r = Router::new()
+            .get("/x", |_, _| -> std::result::Result<Response, ApiError> {
+                Err(crate::web::res::Res::fail("库存不足"))
+            })
+            .unwrap();
+        let resp = call(&r, Method::Get, "/x");
+        assert_eq!(resp.status, Status::BAD_REQUEST);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(r#""code":"BAD_REQUEST""#), "{body}");
+        assert!(body.contains("库存不足"), "{body}");
+        assert!(body.contains(r#""data":null"#), "{body}");
     }
 
     /// 200 条路由挂在同一前缀下的分派成本。命中最后一个 = 最坏情况。

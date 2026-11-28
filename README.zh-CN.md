@@ -161,6 +161,36 @@ rsboot 把问题拆成两层：**连接层事件驱动，请求层跑有栈协�
 
 给想继续追那 3 % 的人：剖面上两次系统调用占 70 %（5 µs 里的 3.5–4 µs），用户态只有约 1 µs（`parse` 275 ns、`build` 145、`handle` 555）。所以差距约 150 ns，只能在那三段里——但三次针对 `parse` 的结构性改动全部落在噪声内，说明那 275 ns 是每请求的固定动作（条目构造、`Vec` 记账、偏移入库、收尾校验），不是扫描宽度。下一步该做的是给 `handle` 自己加 1/64 采样，把 555 ns 拆成路由、上下文、用户 handler、响应构造四段，而不是再猜一次。
 
+## 统一响应
+
+`Res` 给出 JSON API 真正需要的三种形状，不用搭 builder 链：
+
+| 调用 | 状态码 | 响应体 |
+|---|---|---|
+| `Res::success("ok")` | 200 | `{"code":"OK","message":"ok","data":null}` |
+| `Res::data(payload)` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
+| `Res::fail("库存不足")` | 400 | `{"code":"BAD_REQUEST","message":"库存不足","data":null}` |
+| `Res::fail_with(Status::CONFLICT, "...")` | 按给定 | 同形状，`code` 由状态码推导 |
+
+```rust
+fn list_orders(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
+    Ok(Res::data(orders))
+}
+
+fn take_one(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
+    if out_of_stock() {
+        return Err(Res::fail("库存不足"));
+    }
+    Ok(Res::success("ok"))
+}
+```
+
+三点值得知道：
+
+- `fail` 返回的是 `ApiError` 而不是 `Response`，所以能直接放进 `Err(...)`。
+- 这几种调用**一定**是统一形状，不依赖 `http.envelope` 开关。你显式要来的形状，不该被全局开关再改一遍。
+- `data` 直接序列化进同一个缓冲（中间不建 `serde_json::Value` 树），字段顺序与 `http.envelope` 产出的逐字节一致，所以打开那个开关不会改变这些响应的任何一个字节。
+
 ## 设计亮点
 
 1. **零第三方运行时。** HTTP/1.1 解析、keep-alive 连接管理、`writev` 批量写、poll 循环、M:N 调度器全部在仓库内。依赖层级是 serde 级，不是 tokio 级。少一层活动部件，也不用把版本绑在某个异步运行时的内部实现上。

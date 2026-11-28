@@ -162,6 +162,36 @@ Kept here so nobody re-runs the same experiment expecting a win. Protocol as abo
 
 The correlating profile, for anyone who wants to attack the remaining 3 %: two syscalls are 70 % of a request (3.5–4 µs of 5 µs), userland is ~1 µs (`parse` 275 ns, `build` 145, `handle` 555). So the gap is ~150 ns and can only live in those three stages — but three structural attempts at `parse` have all landed inside the noise, which says the 275 ns is fixed per-request work (item construction, `Vec` bookkeeping, span pushes, closing validation), not scan width. The next honest step is to instrument `handle` itself at 1/64 sampling and split its 555 ns into routing, context, the user handler and response building, rather than guess again.
 
+## Uniform responses
+
+`Res` gives the three shapes a JSON API actually needs, with no builder chain:
+
+| Call | Status | Body |
+|---|---|---|
+| `Res::success("ok")` | 200 | `{"code":"OK","message":"ok","data":null}` |
+| `Res::data(payload)` | 200 | `{"code":"OK","message":"success","data":<payload>}` |
+| `Res::fail("out of stock")` | 400 | `{"code":"BAD_REQUEST","message":"out of stock","data":null}` |
+| `Res::fail_with(Status::CONFLICT, "...")` | as given | same shape, `code` derived from the status |
+
+```rust
+fn list_orders(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
+    Ok(Res::data(orders))
+}
+
+fn take_one(_: &mut Request, _: &Context) -> Result<Response, ApiError> {
+    if out_of_stock() {
+        return Err(Res::fail("out of stock"));
+    }
+    Ok(Res::success("ok"))
+}
+```
+
+Three things worth knowing:
+
+- `fail` returns an `ApiError`, not a `Response`, so it drops straight into `Err(...)`.
+- For these calls the wrapper is **unconditional** — it does not depend on `http.envelope`. A shape you asked for explicitly should not be reshaped by a global switch.
+- `data` serialises into the same buffer (no `serde_json::Value` tree in between), and the field order is byte-identical to what `http.envelope` produces, so turning that switch on does not change a single byte of these responses.
+
 ## Design highlights
 
 1. **No third-party runtime.** HTTP/1.1 parsing, keep-alive connection handling, `writev` batching, the poll loop and the M:N scheduler are all in-tree. The dependency list is serde-level, not tokio-level. Fewer moving parts, no version-lock to an async runtime's internals.

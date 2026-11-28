@@ -150,7 +150,7 @@ fn code_of(status: Status) -> &'static str {
 /// `Response::json_with` 再 `to_vec()` 一次：一个响应最多四次分配、三次遍历。
 /// 现在只分配一次，字段顺序与旧实现逐字节一致（`code` → `message` →
 /// `data` → `trace_id`）。
-fn serialize<D: Serialize>(
+pub(crate) fn serialize<D: Serialize>(
     code: &str,
     message: &str,
     data: Option<&D>,

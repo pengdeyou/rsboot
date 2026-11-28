@@ -13,6 +13,7 @@ pub mod openapi;
 pub mod middleware;
 pub mod path;
 pub mod request;
+pub mod res;
 pub mod response;
 pub mod route;
 
@@ -24,6 +25,7 @@ pub use http::{Headers, Method, Status};
 pub use json::Json;
 pub use path::PathTemplate;
 pub use request::Request;
+pub use res::Res;
 pub use response::{IntoResponse, Response};
 pub use middleware::{Cors, Middleware, RateLimit, RequestLog, SecurityHeaders};
 pub use openapi::{OpenApi, ParamDoc, RouteDoc};
